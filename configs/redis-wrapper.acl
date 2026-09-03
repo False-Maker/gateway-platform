@@ -1,0 +1,3 @@
+# Dedicated wrapper worker identity. Replace the placeholder secret at deploy time.
+# The key pattern excludes snapshots, gateway leases, credentials, and release streams.
+user wrapper-worker on >REPLACE_WITH_SECRET ~control:wrapper:* +ping +get +set +setnx +del +exists +xadd +xack +xclaim +xgroup|create +xpending +xreadgroup +eval +evalsha +multi +exec

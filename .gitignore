@@ -1,0 +1,17 @@
+# Build output
+/gwd
+/gwd.exe
+
+# Go workspace / local tooling
+/go.work
+/go.work.sum
+
+# Local environment overrides (may contain real credentials)
+.env
+.env.*
+*.local
+
+# Editor / OS noise
+.DS_Store
+.idea/
+.vscode/
