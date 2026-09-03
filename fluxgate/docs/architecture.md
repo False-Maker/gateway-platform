@@ -58,7 +58,7 @@ gateway 是纯执行器 —— 渠道的业务逻辑(client_id、refresh)全在 
 独立零依赖 Go module(仿 new-api 的 relaykit),放本仓库。
 - **P1 只实现一个方向**:OpenAI Chat Completions 非流式 JSON → 同形态 OpenAI-compatible 上游;保留 `model/messages` 中 P1 明确允许的字段,不接受客户端自带 `tenant/group/base_url`。
 - P1 `stream=true`、tool-call、thinking、multimodal 直接返回结构化 `unsupported_capability`,不得半转换后调用上游。
-- **当前本地切片**:OpenAI Chat、Anthropic Messages、OpenAI Responses 的非流式纯文本/标准 function tool 互转，以及 OpenAI Chat 入站到 Anthropic/Responses/Gemini 的纯文本 SSE 转换均有 fixture；非 OpenAI 入站的任意跨协议 streaming、多模态和真实 provider 协议仍 pending（详见 `docs/P3-STATUS.md`）。
+- **当前本地切片**:OpenAI Chat、Anthropic Messages、OpenAI Responses 的非流式纯文本/标准 function tool 互转，以及 OpenAI Chat 入站到 Anthropic/Responses/Gemini 的纯文本 SSE 转换均有 fixture；非 OpenAI 入站的任意跨协议 streaming、多模态和真实 provider 协议仍 pending（详见 `docs/EVIDENCE.md`）。
 - **硬约束:usage 字段不得丢**——按 token 计费依赖它(总览 §6.2)。usage 解析是**契约级**要求,不是实现细节,直接照 sub2api 实战:
   - **强制注入**:OpenAI Chat Completions 向上游强注 `stream_options.include_usage=true`(`openai_gateway_chat_completions_raw.go:384-391`),否则流式不吐 usage。取**最后一个** usage chunk(上游可能重发)。
   - **协议原生解析**:Anthropic 从 `message_start`/`message_delta` 累加;OpenAI /responses 从终止事件(`response.completed` 等)取;Gemini 每 chunk `usageMetadata`(注意 `promptTokenCount` 含 cache 而 Claude `input_tokens` 不含,别重复计)。

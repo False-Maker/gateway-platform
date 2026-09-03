@@ -1,4 +1,29 @@
-# P3 Status
+# 执行证据记录（EVIDENCE）
+
+> 本文只记录**已执行的命令、结果、验收证据和免责边界**。
+> **待办、计划、下一步一律写在 `docs/TODO.md`，不写在本文。**
+> 本文原名 `docs/P3-STATUS.md`，2026-09-03 拆分为证据（本文）与进度（`docs/TODO.md`）两份。
+>
+> 阅读规则：本文的每一条都是**对已发生事实的描述**。不要从本文推断"项目是否可以继续开发"——
+> 那个问题由 `docs/TODO.md` 和 `AGENTS.md` §0 回答。
+
+## 独立审核轮（2026-09-03，仅工程基线与文档，未改动代码）
+
+本轮不写业务代码，只处理版本控制缺失和文档结构问题。已执行并确认：
+
+- **`git init` 建立仓库**：此前项目**无有效版本控制**——上层 `d1/.git` 只含 `info/exclude`，
+  没有 HEAD/objects/refs，`git rev-parse` 在项目内报 `not a repository`。约 14,000 行代码
+  在无版本控制下迭代过，无历史可保留。已在项目根目录 `git init -b main` 并做基线 commit
+  （98 个文件），新增 `.gitignore`。未触碰上层坏壳。
+- **`-buildvcs=false` 不再必需**：仓库建立后 `go build ./cmd/gwd` 直接通过（退出码 0）。
+  本文下方历史记录中的该写法反映当时状态，现已过时。
+- **提交前基线验证**：`go vet ./...`、`go build ./cmd/gwd`、`go test -count=1 ./...`
+  全部退出码 0，21 个包通过。
+- **新增 `AGENTS.md`**：此前 P2/P3 两轮均记录"仓库当前没有 AGENTS.md"但未创建。
+- **文档拆分**：`docs/P3-STATUS.md` → 本文（证据）+ `docs/TODO.md`（进度）。
+
+本轮代码审核发现的结构性缺口已全部写入 `docs/TODO.md` §A，均为 `[no-cred]`。
+本轮没有执行真实 provider、PostgreSQL、Redis 或生产操作。
 
 ## 本轮复核与扩展（2026-09-03）
 
@@ -117,15 +142,30 @@
 - wrapper Redis 7.0.15 ACL/进程验收：本轮未创建临时 Redis，未重新执行；仅保留 2026-09-02 历史证据。
 - 其他真实 provider、未知 quota schema、多模态和非 OpenAI 入站任意跨协议 streaming：现有通用 profile 无法无损承载，或仍需要真实凭据才能定性，保持 pending。
 
-仍未完成：
+> 未完成项清单已迁出本文，见 `docs/TODO.md`。本文不再维护待办。
 
-- Codex/Claude/Gemini/Grok/Copilot/Antigravity/Kiro/Windsurf 的真实 provider OAuth/refresh、inference、usage 和 quota schema 对账是项目结束阶段的最终 admission gate；本轮只验证本地 fixture/provider adapter。当前整数 `QuotaInfo` 不承载 Antigravity 的小数 remaining fraction 或 Kiro 的精度字段，因此相关 quota 明确保持 missing。
-- Antigravity/Kiro/Windsurf 的真实协议 harness、Copilot 的 device authorization 端到端流程，以及 Grok/Gemini/Copilot/Windsurf 账号级 quota endpoint 仍未在无凭据环境中宣称完成。
-- 非 OpenAI 入站到其他协议的跨协议 streaming、Gemini/Kiro 等 provider 的真实协议与 quota adapter、多模态内容块。
-- quota 的真实用量扣减/调度、计费、协议控制台和部署切流。
+## 本轮结论（逐项，不做全局封顶）
 
-## 最终判断
+已由本轮命令证实：
 
-**P3 本地可验证部分已完成。** 本轮全量本地回归、race、vet 和 `-buildvcs=false` build 通过；临时 Redis 7.0.15 wrapper/ACL 仅保留 2026-09-02 历史通过证据，本轮未复现。真实 provider 测试统一安排在项目结束验收阶段；在该阶段完成前，P3 全量仍不能宣称完成：各 provider 的真实 OAuth、refresh、inference、quota、usage schema 仍 pending；这不构成真实 provider 或生产准入结论。
+- 本轮全量本地回归、`-race`、`go vet` 和 build 全部通过，退出码为 0。
+- 上述"已完成并有回归测试"各条，在本地 fixture 边界内成立。
 
-最高剩余风险是：真实 provider 服务端行为仍未验证，尤其无法确认真实额度/usage schema 与本地 adapter 的一致性。当前本地代码只对已审计 fixture 字段做严格转换；没有账号时不能证明 refresh token 生命周期、服务端拒绝条件、quota reset 语义和 usage 字段在真实服务端与 fixture 一致。多模态内容和非 OpenAI 入站的任意跨协议 streaming 仍不在当前实现边界内。
+明确**未**由本轮证实（不等于未完成，只等于本轮无证据）：
+
+- 任何真实 provider 的服务端行为：OAuth、refresh token 生命周期、inference、服务端拒绝条件、
+  quota reset 语义、usage 字段。本地代码只对已审计 fixture 字段做严格转换。
+- PostgreSQL 与真实 Redis 的本轮通过：均因环境变量未配置而严格 skipped。
+- 临时 Redis 7.0.15 wrapper/ACL：仅有 2026-09-02 历史证据，本轮未复现。
+
+以上任一条都**不构成**真实 provider 或生产准入结论。
+
+## 本轮最高剩余风险
+
+真实 provider 服务端行为仍未验证，尤其无法确认真实额度/usage schema 与本地 adapter 一致。
+没有账号时，无法证明 refresh token 生命周期、服务端拒绝条件、quota reset 语义和 usage 字段
+在真实服务端与 fixture 一致。
+
+**注意**：该风险的处置方式是把相关任务标为 `[live-gate]` 并推迟到结束验收阶段
+（见 `docs/TODO.md` §C），**不是**暂停其余开发。仓库内仍有大量不需要凭据的未完成工作，
+见 `docs/TODO.md` §A —— 其中包含若干使系统当前无法端到端运行的结构性缺口。
