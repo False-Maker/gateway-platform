@@ -12,7 +12,7 @@
 >
 > 当前状态：**A1-A5、B1、B2、B3 已完成，2026-09-06 审查修复、B2 多模态切片与 B3 quota 精度扩展已收口。** A5 的数据库实跑仍按可选 PostgreSQL 环境执行；缺少环境不等于缺少 provider 凭据，也不阻塞本地转换验证。
 >
-> **2026-09-10 复盘新增 A6、A7、A8（均 `[no-cred]`），并给 D1 定了解法。** 复盘发现设计文档要求但代码中不存在、且 TODO 从未列出的三个缺口：gateway 鉴权面/多 bucket、utls TLS profile、文档与代码漂移。D1、A6 已于 2026-09-10 完成。当前取任务顺序：**A7 → A8。** P4（B4）在 A6 之前不启动——没有 tenant 就没有可扣费主体。
+> **2026-09-10 复盘新增 A6、A7、A8（均 `[no-cred]`），并给 D1 定了解法。** 复盘发现设计文档要求但代码中不存在、且 TODO 从未列出的三个缺口：gateway 鉴权面/多 bucket、utls TLS profile、文档与代码漂移。D1、A6、A7 已于 2026-09-10 完成。当前取任务顺序：**A8。** P4（B4）在 A6 之前不启动——没有 tenant 就没有可扣费主体。
 
 ---
 
@@ -156,7 +156,13 @@ A5 `staging_only` 记录转正为 tenants 行（迁移侧后续任务）。
 
 ### A7 `[no-cred]` utls TLS profile 注册表缺失
 
-**状态：未开始（2026-09-10 新增）**
+**状态：已完成（2026-09-10）。** `internal/gateway/tlsprofile.go` 引入 `refraction-networking/utls v1.6.7`，
+注册表含 `codex_rustls`（Codex CLI rustls）与 `node24`（Claude Code / Node.js 24），均从 elucid-relay
+`codex_tls.go` 搬入；未知名字返回 `ErrUnknownTLSProfile` 且不拨号。非流式与流式上游 client 按 lease 的
+`TLSFingerprint` 建 transport；带 proxy 时自行发 CONNECT 隧道，指纹握手终止在源站。control 侧
+`CodexChatGPTProfile` 标 `codex_rustls`、Claude OAuth profile 标 `node24`，API-key profile 留空走标准
+crypto/tls。证据见 `docs/EVIDENCE.md`。**未做**：真实上游是否接受该指纹（C3/C5）、WebSocket 路径、
+指纹随官方客户端版本更新（D4）。
 
 **基线**
 - 总览 §5 把 `UpstreamProfile.TLSFingerprint` 定为两角色唯一深耦合点；fluxgate §5 有未勾选的

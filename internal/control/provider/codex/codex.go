@@ -80,5 +80,5 @@ func (p *Provider) RevokeOAuth(ctx context.Context, current contracts.TokenBundl
 }
 
 func (p *Provider) Profile(contracts.Account) contracts.UpstreamProfile {
-	return contracts.UpstreamProfile{BaseURL: p.Config.APIBaseURL, Protocol: "openai_responses", InferencePath: p.Config.InferencePath}
+	return contracts.UpstreamProfile{BaseURL: p.Config.APIBaseURL, Protocol: "openai_responses", InferencePath: p.Config.InferencePath, TLSFingerprint: p.Config.TLSFingerprint}
 }

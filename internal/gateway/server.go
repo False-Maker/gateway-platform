@@ -364,6 +364,10 @@ func (s *Server) handleProtocolStreaming(ctx context.Context, tenantID, group st
 	if err != nil {
 		return s.finishStreamingRelease(requestCtx, tenantID, requestID, attemptID, startedAt, lease, ChatCompletionRequest{Model: model}, 0, nil, false, true, err)
 	}
+	client, err = clientForTLSProfile(client, lease.Profile.TLSFingerprint)
+	if err != nil {
+		return s.finishStreamingRelease(requestCtx, tenantID, requestID, attemptID, startedAt, lease, ChatCompletionRequest{Model: model}, 0, nil, false, true, err)
+	}
 	response, err := client.Do(upstreamRequest)
 	if err != nil {
 		return s.finishStreamingRelease(requestCtx, tenantID, requestID, attemptID, startedAt, lease, ChatCompletionRequest{Model: model}, 0, nil, false, true, err)
@@ -1414,6 +1418,10 @@ func (s *Server) callUpstream(ctx context.Context, lease contracts.Lease, reques
 		client = http.DefaultClient
 	}
 	client, err = clientForProxy(client, lease.Profile.Proxy)
+	if err != nil {
+		return nil, 0, nil, true, 0, err
+	}
+	client, err = clientForTLSProfile(client, lease.Profile.TLSFingerprint)
 	if err != nil {
 		return nil, 0, nil, true, 0, err
 	}

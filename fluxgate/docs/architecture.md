@@ -75,7 +75,7 @@ gateway 是纯执行器 —— 渠道的业务逻辑(client_id、refresh)全在 
 - [x] P1:**请求内 failover 重试** + 本地冷却表:明确 HTTP 错误最多两次,仅首字节前;`network_error` 不自动重试
 - [x] P1:Release `XADD` 成功后才确认非流式请求,包含 tokens/model/account/tenant + **UsageSource + Partial**
 - [ ] P1 验收:按总览 §7.1 注入 `XADD`→`XACK` 间 control 崩溃、重复 event/attempt 重放、`attempt_started`→终态 Release 间 gateway 崩溃;分别断言至少一次投递、ledger 单行幂等和 synthetic `missing/partial` 终态回收
-- [ ] P0:TLS profile 注册表 + 一个 profile(codex_rustls)从 relay 搬入
+- [x] P0:TLS profile 注册表 + `codex_rustls` / `node24` 从 relay 搬入(`internal/gateway/tlsprofile.go`,未知名 fail-closed;真实上游接受度属 live-gate)
 - [x] P0:`protokit` module 接口与本地协议转换实现(usage 字段 + UsageSource 贯穿约束)
 - [x] P1:运行时限流(Redis 原子)骨架 + **按渠道读 `AccountLimits.DegradePolicy` 的降级分支**(§6,默认 fail_closed)
 

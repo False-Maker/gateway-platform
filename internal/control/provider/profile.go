@@ -41,6 +41,9 @@ type EndpointProfile struct {
 	InferencePath     string
 	QuotaPath         string
 	OAuthBetaHeader   string
+	// TLSFingerprint names a gateway ClientHello profile (internal/gateway
+	// tlsprofile.go). Empty means standard crypto/tls.
+	TLSFingerprint string
 }
 
 func CodexChatGPTProfile() EndpointProfile {
@@ -53,6 +56,7 @@ func CodexChatGPTProfile() EndpointProfile {
 		ClientID:          "app_EMoamEEZ73f0CkXaXp7hrann",
 		APIBaseURL:        "https://chatgpt.com/backend-api/codex",
 		InferencePath:     "/responses",
+		TLSFingerprint:    "codex_rustls",
 	}
 }
 
@@ -75,6 +79,7 @@ func ClaudeConsoleOAuthProfile() EndpointProfile {
 		APIBaseURL:        "https://api.anthropic.com",
 		InferencePath:     "/v1/messages",
 		OAuthBetaHeader:   "oauth-2025-04-20",
+		TLSFingerprint:    "node24",
 	}
 }
 

@@ -7,6 +7,39 @@
 > 阅读规则：本文的每一条都是**对已发生事实的描述**。不要从本文推断"项目是否可以继续开发"——
 > 那个问题由 `docs/TODO.md` 和 `AGENTS.md` §0 回答。
 
+## A7 utls TLS 指纹注册表（2026-09-10）
+
+本轮实现 `docs/TODO.md` A7。`go.mod` 新增 `github.com/refraction-networking/utls v1.6.7`（间接引入
+brotli、circl、klauspost/compress）。`internal/gateway/tlsprofile.go`：
+
+- 注册表 `codex_rustls`、`node24`，`ClientHelloSpec` 逐字段从
+  `elucid-relay/services/gateway-api/internal/httpserver/codex_tls.go` 搬入；`RegisterTLSProfile`/
+  `TLSProfiles` 可扩展。
+- `clientForTLSProfile`：空名返回原 client；未知名返回 `ErrUnknownTLSProfile`，不建 transport 不拨号；
+  已知名克隆 transport，设置 `DialTLSContext` 用 utls `HelloCustom` + `ApplyPreset` 握手，关闭 h2 协商
+  （两个 profile 均只宣告 http/1.1 或无 ALPN）。transport 带 proxy 时改为自建 CONNECT 隧道再在隧道内
+  做指纹握手，保证指纹终止在源站而非代理。
+- `server.go` 非流式 `callUpstream` 与流式路径均在 `clientForProxy` 之后接 `clientForTLSProfile`。
+- control：`EndpointProfile.TLSFingerprint` 字段；`CodexChatGPTProfile` = `codex_rustls`，Claude
+  Console/AI OAuth profile = `node24`；Codex/Claude `Profile()` 透传到 `UpstreamProfile`。API-key
+  profile 不设指纹。
+
+本轮实际执行并通过：
+
+- `go test -count=1 ./internal/gateway -run 'TLS|Profile'`：本地 `httptest` TLS 服务器通过
+  `GetConfigForClient` 记录真实 ClientHello 并断言——`codex_rustls` 的 31 个 cipher suite 顺序、10 条
+  curve（含 x448 0x001e）、3 个 point format、20 个 signature scheme、无 ALPN、TLS1.3 优先；`node24`
+  的 18 个 cipher suite、ALPN 仅 `http/1.1`、3 curve、9 signature scheme；两者与 Go 默认 hello 可区分。
+  未知 profile 在 `clientForTLSProfile` 与 `callUpstream` 两层均在拨号前失败（记录器零 hello）。
+  本地 CONNECT 代理 fixture 证明带 proxy 时代理只见 CONNECT、源站收到 rustls hello。
+- `go test -count=1 ./...`（无基础设施）与 `source configs/test-infra/test.env && go test -count=1 -p 1 ./...`
+  （Docker PG16 + Redis 7.0.15）全部通过；`go vet ./...`、`go test -race` 覆盖 gateway/contracts/provider、
+  `go build ./cmd/gwd`、`git diff --check` 通过。
+
+边界：JA3 哈希值（`d39e1be3…`、`44f88fca…`）来自参考实现注释，本轮未独立计算 JA3，也未向任何真实上游发起
+TLS 握手；真实 OpenAI/Anthropic 边缘是否接受该 hello 属 C3/C5。WebSocket 上游（`UpstreamProfile.WS`）
+尚无调用方，本轮未接指纹。
+
 ## A6 gateway 鉴权面与多 bucket（2026-09-10）
 
 本轮实现 `docs/TODO.md` A6。改动：

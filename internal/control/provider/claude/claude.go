@@ -80,7 +80,7 @@ func (p *Provider) RevokeOAuth(ctx context.Context, current contracts.TokenBundl
 }
 
 func (p *Provider) Profile(contracts.Account) contracts.UpstreamProfile {
-	profile := contracts.UpstreamProfile{BaseURL: p.Config.APIBaseURL, Protocol: "anthropic_messages", InferencePath: p.Config.InferencePath, ExtraHeaders: map[string]string{"anthropic-version": "2023-06-01"}}
+	profile := contracts.UpstreamProfile{BaseURL: p.Config.APIBaseURL, Protocol: "anthropic_messages", InferencePath: p.Config.InferencePath, TLSFingerprint: p.Config.TLSFingerprint, ExtraHeaders: map[string]string{"anthropic-version": "2023-06-01"}}
 	if p.Config.OAuthBetaHeader != "" {
 		profile.ExtraHeaders["anthropic-beta"] = p.Config.OAuthBetaHeader
 	}
