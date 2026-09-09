@@ -44,7 +44,9 @@
 
 - **每轮工作结束必须 `git commit`。**不允许留未提交的改动跨轮。
 - commit message 说明改了什么、为什么，以及验证到什么程度。
-- 不要 `git push`（无远端）。不要碰上层 `d1/.git`——那是个只含 `info/exclude` 的坏空壳，与本仓库无关。
+- 远端 `origin` 为 `git@github.com:False-Maker/gateway-platform.git`（2026-09-10 建立）。
+  **commit 后 `git push origin main`。**只能走 SSH；本机无 HTTPS 凭据、无 `gh` CLI。
+- 不要碰上层 `d1/.git`——那是个只含 `info/exclude` 的坏空壳，与本仓库无关。
 
 ## 4. 构建与测试
 
