@@ -37,7 +37,12 @@
    `redis_version:7.0.15` 失败，`TestP2RealRedisQueueLifecycleAndGatewayIsolation` 在默认并行 `go test`
    下也失败（`cmd/gwd`、`internal/control`、`internal/control/wrapper` 三个包共用同一 Redis DB 并各自
    `FLUSHDB`，互相清空对方的 pending）。改为 pin `redis:7.0.15-alpine` 并以 `-p 1` 串行后全部通过。
-   同一用例在 7.4.10 上是否存在真实 XCLAIM 语义差异**未单独验证**，本轮只确认 7.0.15 通过。
+   随后单独验证：临时起 `redis:7.4-alpine`（7.4.11），串行执行
+   `TestP2RealRedisQueueLifecycleAndGatewayIsolation`、三个 `TestAcceptance*` 各三轮，以及放宽断言后的
+   `TestP2RealRedisWrapperProcessLifecycle`，全部通过；7.0.15 同组用例同样通过。结论：7.4 上的失败
+   是并行 FLUSHDB 干扰，不是 XCLAIM 语义差异。`process_integration_test.go` 的版本断言已从
+   `7.0.15` 放宽到 `7.x`（唯一改动的 Go 文件，仅测试）。`-p 1` 保留为文档约束：wrapper 子进程经
+   环境变量连 Redis 且不支持 DB 序号，按包拆 DB 会扩散到生产配置。临时 7.4 容器已删除。
 
 本轮未执行真实 provider 请求、生产写入、部署或切流。
 

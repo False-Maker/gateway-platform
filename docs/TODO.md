@@ -229,9 +229,8 @@ harness 默认严格 skipped，只接受已审计官方 base URL，不接受 fix
   `test.env`。`source configs/test-infra/test.env && go test -count=1 -p 1 ./...` 23 个包全部通过，
   A4 进程级 e2e、PG ledger 幂等、crash 恢复、真实 Redis ACL 与 wrapper 进程用例首次在本机真实跑通，
   证据见 `docs/EVIDENCE.md`。**注意**：必须 `-p 1`（三个包共用 Redis DB 并 FLUSHDB），
-  Redis 镜像 pin 在 `7.0.15`（进程用例硬编码断言该版本）。
-  **遗留**：wrapper 进程用例对 7.0.15 的硬编码断言使其无法在更新的 Redis 上运行，是否放宽属后续决定；
-  `TestP2RealRedisQueueLifecycleAndGatewayIsolation` 在 7.4.10 上的失败未与并行干扰分离验证。
+  Redis 7.0.15 与 7.4.11 均已验证通过，进程用例的版本断言已放宽到 7.x；compose 默认仍 pin 7.0.15
+  作为原始验收基线。
 - **D2** 生产 AES 密钥的 KMS / secret 托管与轮换。属部署边界，非仓库内工程任务。
 - **D3** Redis HA 拓扑与演练参数（部署侧）。冷启动拉不到快照即无法加入，无降级路径。
 - **D4** utls JA3 指纹跟随上游客户端版本更新 —— 目前是人工流程，无自动化

@@ -29,7 +29,8 @@ services:
       timeout: 2s
       retries: 30
   redis:
-    # Pinned: internal/control/wrapper/process_integration_test.go asserts redis_version:7.0.15.
+    # 7.0.15 is the original acceptance baseline; 7.4.11 was also verified (2026-09-10).
+    # The wrapper process test accepts any 7.x.
     image: redis:7.0.15-alpine
     container_name: gateway-test-redis
     command: ["redis-server", "--aclfile", "/etc/redis/test.acl", "--appendonly", "no", "--save", ""]
