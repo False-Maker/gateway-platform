@@ -159,13 +159,19 @@ type QuotaInfo struct {
 }
 
 type QuotaItem struct {
-    Scope     string     // account | model
-    Model     string
-    Unit      string     // token | request | credit
-    Limit     *int64     // nil means provider does not expose this value
-    Remaining *int64
-    ResetAt   *time.Time
+    Scope             string          // account | model
+    Model             string
+    Unit              string          // token | request | credit | fraction
+    Limit             *int64
+    Remaining         *int64
+    LimitExact        *Decimal
+    RemainingExact    *Decimal
+    RemainingFraction *Decimal        // 0..1, nil means unknown
+    Precision         *QuotaPrecision // precise usage/limit/overage fields
+    ResetAt           *time.Time
 }
+
+// Decimal is a strictly validated decimal string serialized as a JSON number.
 ```
 
 `credentials` 表保存 refresh token/static secret 的密文;上面的 `Credential` 是解密后发布到受 ACL 保护的快照中的最小短期值。gateway 不接收 `RefreshToken`,也不能通过任何契约字段索取它。

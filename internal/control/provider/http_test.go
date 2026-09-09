@@ -55,6 +55,37 @@ func TestOAuthFixturesVerifyCodexAndClaudeTokenShapes(t *testing.T) {
 	}
 }
 
+func TestOAuthRefreshUsesTokenBundleProxy(t *testing.T) {
+	requests := make(chan string, 1)
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests <- r.URL.String()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"access_token":"access-proxied","refresh_token":"refresh-proxied","expires_in":60}`)
+	}))
+	defer proxy.Close()
+
+	profile := CodexChatGPTProfile()
+	profile.OAuthTokenURL = "http://oauth.invalid/token"
+	got, err := (HTTPClient{Client: &http.Client{Timeout: time.Second}}).Refresh(context.Background(), profile, contracts.TokenBundle{
+		RefreshToken: "refresh-1",
+		Metadata:     map[string]string{"proxy": proxy.URL},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.AccessToken != "access-proxied" || got.RefreshToken != "refresh-proxied" {
+		t.Fatalf("proxy refresh bundle=%#v", got)
+	}
+	select {
+	case requestURL := <-requests:
+		if requestURL != "http://oauth.invalid/token" {
+			t.Fatalf("proxy request URL=%q", requestURL)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("proxy did not receive OAuth request")
+	}
+}
+
 func TestOAuthRefreshAndInferenceFixturesVerifyHeadersAndPaths(t *testing.T) {
 	profiles := []EndpointProfile{CodexChatGPTProfile(), ClaudeConsoleOAuthProfile(), CodexAPIKeyProfile(), ClaudeAPIKeyProfile()}
 	for _, original := range profiles {

@@ -117,12 +117,33 @@ func (c *Chooser) AcquireExcluding(criteria contracts.Criteria, excluded map[str
 
 func hasQuota(account contracts.Account, model string) bool {
 	for _, item := range account.Quota.Items {
-		if item.Remaining == nil || *item.Remaining > 0 || !quotaApplies(item, model) {
+		if !quotaApplies(item, model) || quotaRemainingPositive(item) {
 			continue
 		}
-		return false
+		if item.RemainingExact != nil || item.RemainingFraction != nil || (item.Precision != nil && item.Precision.Remaining != nil) || item.Remaining != nil {
+			return false
+		}
 	}
 	return true
+}
+
+func quotaRemainingPositive(item contracts.QuotaItem) bool {
+	if item.RemainingExact != nil {
+		if sign, ok := item.RemainingExact.Sign(); ok {
+			return sign > 0
+		}
+	}
+	if item.RemainingFraction != nil {
+		if sign, ok := item.RemainingFraction.Sign(); ok {
+			return sign > 0
+		}
+	}
+	if item.Precision != nil && item.Precision.Remaining != nil {
+		if sign, ok := item.Precision.Remaining.Sign(); ok {
+			return sign > 0
+		}
+	}
+	return item.Remaining == nil || *item.Remaining > 0
 }
 
 func quotaApplies(item contracts.QuotaItem, model string) bool {

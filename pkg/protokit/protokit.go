@@ -5,10 +5,12 @@ package protokit
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"strings"
 )
 
@@ -188,6 +190,17 @@ type openAIMessage struct {
 	ToolCallID string           `json:"tool_call_id,omitempty"`
 }
 
+type openAIContentPart struct {
+	Type     string               `json:"type"`
+	Text     string               `json:"text,omitempty"`
+	ImageURL *openAIImageURLValue `json:"image_url,omitempty"`
+}
+
+type openAIImageURLValue struct {
+	URL    string `json:"url"`
+	Detail string `json:"detail,omitempty"`
+}
+
 type openAITool struct {
 	Type     string         `json:"type"`
 	Function openAIFunction `json:"function"`
@@ -230,13 +243,21 @@ type anthropicTool struct {
 }
 
 type anthropicContentBlock struct {
-	Type      string          `json:"type"`
-	Text      string          `json:"text,omitempty"`
-	ID        string          `json:"id,omitempty"`
-	Name      string          `json:"name,omitempty"`
-	Input     json.RawMessage `json:"input,omitempty"`
-	ToolUseID string          `json:"tool_use_id,omitempty"`
-	Content   json.RawMessage `json:"content,omitempty"`
+	Type      string                `json:"type"`
+	Text      string                `json:"text,omitempty"`
+	Source    *anthropicImageSource `json:"source,omitempty"`
+	ID        string                `json:"id,omitempty"`
+	Name      string                `json:"name,omitempty"`
+	Input     json.RawMessage       `json:"input,omitempty"`
+	ToolUseID string                `json:"tool_use_id,omitempty"`
+	Content   json.RawMessage       `json:"content,omitempty"`
+}
+
+type anthropicImageSource struct {
+	Type      string `json:"type"`
+	MediaType string `json:"media_type,omitempty"`
+	Data      string `json:"data,omitempty"`
+	URL       string `json:"url,omitempty"`
 }
 
 type geminiRequest struct {
@@ -251,7 +272,19 @@ type geminiContent struct {
 }
 
 type geminiPart struct {
-	Text string `json:"text,omitempty"`
+	Text       string          `json:"text,omitempty"`
+	InlineData *geminiBlob     `json:"inlineData,omitempty"`
+	FileData   *geminiFileData `json:"fileData,omitempty"`
+}
+
+type geminiBlob struct {
+	MimeType string `json:"mimeType"`
+	Data     string `json:"data"`
+}
+
+type geminiFileData struct {
+	MimeType string `json:"mimeType,omitempty"`
+	FileURI  string `json:"fileUri"`
 }
 
 type geminiGenerationConfig struct {
@@ -307,8 +340,10 @@ type responsesTool struct {
 }
 
 type responsesContentPart struct {
-	Type string `json:"type"`
-	Text string `json:"text"`
+	Type     string `json:"type"`
+	Text     string `json:"text,omitempty"`
+	ImageURL string `json:"image_url,omitempty"`
+	Detail   string `json:"detail,omitempty"`
 }
 
 func responsesToOpenAIRequest(body []byte) ([]byte, error) {
@@ -359,7 +394,7 @@ func responsesToOpenAIRequest(body []byte) ([]byte, error) {
 			if item.Role != "user" && item.Role != "assistant" && item.Role != "system" && item.Role != "developer" {
 				return nil, fmt.Errorf("%w: unsupported input role %q", ErrInvalidMessage, item.Role)
 			}
-			text, err := responsesTextValue(item.Content)
+			content, err := responsesContentToOpenAI(item.Content)
 			if err != nil {
 				return nil, fmt.Errorf("%w: input content: %s", ErrInvalidMessage, err)
 			}
@@ -367,7 +402,7 @@ func responsesToOpenAIRequest(body []byte) ([]byte, error) {
 			if role == "developer" {
 				role = "system"
 			}
-			messages = append(messages, openAIMessage{Role: role, Content: json.RawMessage(mustJSON(text))})
+			messages = append(messages, openAIMessage{Role: role, Content: content})
 		}
 	}
 	if len(messages) == 0 {
@@ -419,11 +454,15 @@ func openAIToResponsesRequest(body []byte) ([]byte, error) {
 			instructions += text
 		case "user", "assistant":
 			if len(bytes.TrimSpace(message.Content)) > 0 && !bytes.Equal(bytes.TrimSpace(message.Content), []byte("null")) {
-				text, err := textValue(message.Content)
+				parts, err := openAIContentParts(message.Content)
 				if err != nil {
 					return nil, fmt.Errorf("%w: %s", ErrInvalidMessage, err)
 				}
-				items = append(items, responsesInputItem{Type: "message", Role: message.Role, Content: json.RawMessage(mustJSON([]responsesContentPart{{Type: "input_text", Text: text}}))})
+				responseParts, err := openAIContentToResponses(parts)
+				if err != nil {
+					return nil, fmt.Errorf("%w: %s", ErrInvalidMessage, err)
+				}
+				items = append(items, responsesInputItem{Type: "message", Role: message.Role, Content: json.RawMessage(mustJSON(responseParts))})
 			}
 			for _, call := range message.ToolCalls {
 				if call.Type != "function" || strings.TrimSpace(call.ID) == "" || strings.TrimSpace(call.Function.Name) == "" {
@@ -438,11 +477,18 @@ func openAIToResponsesRequest(body []byte) ([]byte, error) {
 			if strings.TrimSpace(message.ToolCallID) == "" {
 				return nil, fmt.Errorf("%w: tool_call_id is required", ErrInvalidMessage)
 			}
-			text, err := textValue(message.Content)
+			parts, err := openAIContentParts(message.Content)
 			if err != nil {
 				return nil, fmt.Errorf("%w: tool output: %s", ErrInvalidMessage, err)
 			}
-			items = append(items, responsesInputItem{Type: "function_call_output", CallID: message.ToolCallID, Output: text})
+			var output strings.Builder
+			for _, part := range parts {
+				if part.Type != "text" {
+					return nil, fmt.Errorf("%w: tool output must be text", ErrUnsupportedProtocol)
+				}
+				output.WriteString(part.Text)
+			}
+			items = append(items, responsesInputItem{Type: "function_call_output", CallID: message.ToolCallID, Output: output.String()})
 		default:
 			return nil, fmt.Errorf("%w: unsupported role %q", ErrInvalidMessage, message.Role)
 		}
@@ -565,8 +611,8 @@ func anthropicToOpenAIRequest(body []byte) ([]byte, error) {
 }
 
 // openAIToGeminiRequest is intentionally strict and fixture-oriented. Model
-// selection and authentication remain in UpstreamProfile; this converter only
-// maps text messages and generation controls.
+// selection and authentication remain in UpstreamProfile; this converter maps
+// text/image messages and generation controls.
 func openAIToGeminiRequest(body []byte) ([]byte, error) {
 	var request openAIRequest
 	if err := decode(body, &request); err != nil {
@@ -580,21 +626,36 @@ func openAIToGeminiRequest(body []byte) ([]byte, error) {
 	}
 	converted := geminiRequest{Contents: make([]geminiContent, 0, len(request.Messages))}
 	for _, message := range request.Messages {
-		text, err := textValue(message.Content)
+		parts, err := openAIContentParts(message.Content)
 		if err != nil {
 			return nil, fmt.Errorf("%w: %s", ErrInvalidMessage, err)
+		}
+		geminiParts := make([]geminiPart, 0, len(parts))
+		for _, part := range parts {
+			if part.Type == "text" {
+				geminiParts = append(geminiParts, geminiPart{Text: part.Text})
+				continue
+			}
+			if part.ImageURL == nil {
+				return nil, fmt.Errorf("%w: image content has no url", ErrInvalidMessage)
+			}
+			image, imageErr := openAIImageToGemini(part.ImageURL.URL)
+			if imageErr != nil {
+				return nil, fmt.Errorf("%w: image content: %s", ErrInvalidMessage, imageErr)
+			}
+			geminiParts = append(geminiParts, image)
 		}
 		switch message.Role {
 		case "system":
 			if converted.SystemInstruction == nil {
-				converted.SystemInstruction = &geminiContent{Parts: []geminiPart{{Text: text}}}
+				converted.SystemInstruction = &geminiContent{Parts: geminiParts}
 			} else {
-				converted.SystemInstruction.Parts = append(converted.SystemInstruction.Parts, geminiPart{Text: text})
+				converted.SystemInstruction.Parts = append(converted.SystemInstruction.Parts, geminiParts...)
 			}
 		case "user":
-			converted.Contents = append(converted.Contents, geminiContent{Role: "user", Parts: []geminiPart{{Text: text}}})
+			converted.Contents = append(converted.Contents, geminiContent{Role: "user", Parts: geminiParts})
 		case "assistant":
-			converted.Contents = append(converted.Contents, geminiContent{Role: "model", Parts: []geminiPart{{Text: text}}})
+			converted.Contents = append(converted.Contents, geminiContent{Role: "model", Parts: geminiParts})
 		default:
 			return nil, fmt.Errorf("%w: unsupported role %q", ErrInvalidMessage, message.Role)
 		}
@@ -657,12 +718,24 @@ func openAIMessageToAnthropic(message openAIMessage) (anthropicMessage, error) {
 	case "user", "assistant":
 		blocks := make([]anthropicContentBlock, 0, len(message.ToolCalls)+1)
 		if len(bytes.TrimSpace(message.Content)) > 0 && !bytes.Equal(bytes.TrimSpace(message.Content), []byte("null")) {
-			text, err := textValue(message.Content)
+			parts, err := openAIContentParts(message.Content)
 			if err != nil {
 				return anthropicMessage{}, fmt.Errorf("%w: %s", ErrInvalidMessage, err)
 			}
-			if text != "" {
-				blocks = append(blocks, anthropicContentBlock{Type: "text", Text: text})
+			for _, part := range parts {
+				switch part.Type {
+				case "text":
+					blocks = append(blocks, anthropicContentBlock{Type: "text", Text: part.Text})
+				case "image_url":
+					if part.ImageURL == nil {
+						return anthropicMessage{}, fmt.Errorf("%w: image content has no url", ErrInvalidMessage)
+					}
+					source, imageErr := imageURLToAnthropic(part.ImageURL.URL)
+					if imageErr != nil {
+						return anthropicMessage{}, fmt.Errorf("%w: image content: %s", ErrInvalidMessage, imageErr)
+					}
+					blocks = append(blocks, anthropicContentBlock{Type: "image", Source: source})
+				}
 			}
 		}
 		for _, call := range message.ToolCalls {
@@ -706,12 +779,20 @@ func anthropicMessageToOpenAI(message anthropicMessage) ([]openAIMessage, error)
 		return nil, fmt.Errorf("%w: only string or supported content blocks are accepted", ErrInvalidMessage)
 	}
 	var text strings.Builder
+	contentParts := make([]openAIContentPart, 0, len(blocks))
 	toolCalls := make([]openAIToolCall, 0)
 	results := make([]openAIMessage, 0)
 	for _, block := range blocks {
 		switch block.Type {
 		case "text":
 			text.WriteString(block.Text)
+			contentParts = append(contentParts, openAIContentPart{Type: "text", Text: block.Text})
+		case "image":
+			part, err := anthropicImageToOpenAI(block.Source)
+			if err != nil {
+				return nil, fmt.Errorf("%w: image block: %s", ErrInvalidMessage, err)
+			}
+			contentParts = append(contentParts, part)
 		case "tool_use":
 			if message.Role != "assistant" || strings.TrimSpace(block.ID) == "" || strings.TrimSpace(block.Name) == "" || !json.Valid(block.Input) {
 				return nil, fmt.Errorf("%w: malformed tool_use block", ErrInvalidMessage)
@@ -730,9 +811,11 @@ func anthropicMessageToOpenAI(message anthropicMessage) ([]openAIMessage, error)
 			return nil, fmt.Errorf("%w: content block %q", ErrUnsupportedProtocol, block.Type)
 		}
 	}
-	if text.Len() > 0 || len(toolCalls) > 0 {
+	if text.Len() > 0 || len(contentParts) > 0 || len(toolCalls) > 0 {
 		content := json.RawMessage(nil)
-		if text.Len() > 0 {
+		if len(contentParts) > 0 {
+			content = openAIContentRaw(contentParts)
+		} else if text.Len() > 0 {
 			content = json.RawMessage(mustJSON(text.String()))
 		}
 		results = append([]openAIMessage{{Role: message.Role, Content: content, ToolCalls: toolCalls}}, results...)
@@ -849,7 +932,7 @@ func responsesToOpenAIResponse(body []byte) ([]byte, error) {
 	if response.Status != "" && response.Status != "completed" && response.Status != "incomplete" {
 		return nil, fmt.Errorf("%w: response status %q", ErrUnsupportedProtocol, response.Status)
 	}
-	var parts []string
+	parts := make([]openAIContentPart, 0)
 	toolCalls := make([]openAIToolCall, 0)
 	messageItems := 0
 	for _, item := range response.Output {
@@ -863,7 +946,7 @@ func responsesToOpenAIResponse(body []byte) ([]byte, error) {
 				if part.Type != "output_text" {
 					return nil, fmt.Errorf("%w: response content block %q", ErrUnsupportedProtocol, part.Type)
 				}
-				parts = append(parts, part.Text)
+				parts = append(parts, openAIContentPart{Type: "text", Text: part.Text})
 			}
 		case "function_call":
 			if strings.TrimSpace(item.CallID) == "" || strings.TrimSpace(item.Name) == "" {
@@ -889,7 +972,11 @@ func responsesToOpenAIResponse(body []byte) ([]byte, error) {
 	}
 	content := json.RawMessage(nil)
 	if len(parts) > 0 {
-		content = json.RawMessage(mustJSON(strings.Join(parts, "")))
+		if len(parts) == 1 && parts[0].Type == "text" {
+			content = json.RawMessage(mustJSON(parts[0].Text))
+		} else {
+			content = json.RawMessage(mustJSON(parts))
+		}
 	}
 	if len(toolCalls) > 0 {
 		finish = "tool_calls"
@@ -918,11 +1005,18 @@ func openAIToResponsesResponse(body []byte) ([]byte, error) {
 	choice := response.Choices[0]
 	output := make([]responsesOutputItem, 0, len(choice.Message.ToolCalls)+1)
 	if len(bytes.TrimSpace(choice.Message.Content)) > 0 && !bytes.Equal(bytes.TrimSpace(choice.Message.Content), []byte("null")) {
-		text, err := textValue(choice.Message.Content)
+		parts, err := openAIContentParts(choice.Message.Content)
 		if err != nil {
 			return nil, fmt.Errorf("%w: response content: %s", ErrInvalidMessage, err)
 		}
-		output = append(output, responsesOutputItem{Type: "message", Role: "assistant", Content: []responsesContentPart{{Type: "output_text", Text: text}}})
+		responseParts := make([]responsesContentPart, 0, len(parts))
+		for _, part := range parts {
+			if part.Type != "text" {
+				return nil, fmt.Errorf("%w: Responses output content block %q", ErrUnsupportedProtocol, part.Type)
+			}
+			responseParts = append(responseParts, responsesContentPart{Type: "output_text", Text: part.Text})
+		}
+		output = append(output, responsesOutputItem{Type: "message", Role: "assistant", Content: responseParts})
 	}
 	for _, call := range choice.Message.ToolCalls {
 		if call.Type != "function" || strings.TrimSpace(call.ID) == "" || strings.TrimSpace(call.Function.Name) == "" {
@@ -967,15 +1061,33 @@ func openAIToGeminiResponse(body []byte) ([]byte, error) {
 	if len(choice.Message.ToolCalls) > 0 {
 		return nil, fmt.Errorf("%w: Gemini text fixture does not support tool calls", ErrUnsupportedProtocol)
 	}
-	text, err := textValue(choice.Message.Content)
+	parts, err := openAIContentParts(choice.Message.Content)
 	if err != nil {
 		return nil, fmt.Errorf("%w: response content: %s", ErrInvalidMessage, err)
+	}
+	geminiParts := make([]geminiPart, 0, len(parts))
+	for _, part := range parts {
+		switch part.Type {
+		case "text":
+			geminiParts = append(geminiParts, geminiPart{Text: part.Text})
+		case "image_url":
+			if part.ImageURL == nil {
+				return nil, fmt.Errorf("%w: response image has no url", ErrInvalidMessage)
+			}
+			image, imageErr := openAIImageToGemini(part.ImageURL.URL)
+			if imageErr != nil {
+				return nil, fmt.Errorf("%w: response image: %s", ErrInvalidMessage, imageErr)
+			}
+			geminiParts = append(geminiParts, image)
+		default:
+			return nil, fmt.Errorf("%w: response content block %q", ErrUnsupportedProtocol, part.Type)
+		}
 	}
 	finish := "STOP"
 	if choice.FinishReason != nil && *choice.FinishReason == "length" {
 		finish = "MAX_TOKENS"
 	}
-	converted := geminiResponse{Candidates: []geminiCandidate{{Content: geminiContent{Role: "model", Parts: []geminiPart{{Text: text}}}, FinishReason: finish}}}
+	converted := geminiResponse{Candidates: []geminiCandidate{{Content: geminiContent{Role: "model", Parts: geminiParts}, FinishReason: finish}}}
 	if response.Usage != nil {
 		converted.UsageMetadata = &struct {
 			PromptTokenCount        int `json:"promptTokenCount"`
@@ -999,12 +1111,13 @@ func geminiToOpenAIResponse(body []byte) ([]byte, error) {
 	if candidate.Content.Role != "" && candidate.Content.Role != "model" {
 		return nil, fmt.Errorf("%w: Gemini response role %q", ErrInvalidMessage, candidate.Content.Role)
 	}
-	var parts []string
+	parts := make([]openAIContentPart, 0, len(candidate.Content.Parts))
 	for _, part := range candidate.Content.Parts {
-		if strings.TrimSpace(part.Text) == "" {
-			return nil, fmt.Errorf("%w: Gemini response contains a non-text part", ErrUnsupportedProtocol)
+		converted, convertErr := geminiImageToOpenAI(part)
+		if convertErr != nil {
+			return nil, fmt.Errorf("%w: %s", ErrInvalidMessage, convertErr)
 		}
-		parts = append(parts, part.Text)
+		parts = append(parts, converted)
 	}
 	if len(parts) == 0 {
 		return nil, fmt.Errorf("%w: Gemini response has no text output", ErrInvalidMessage)
@@ -1013,7 +1126,13 @@ func geminiToOpenAIResponse(body []byte) ([]byte, error) {
 	if candidate.FinishReason == "MAX_TOKENS" {
 		finish = "length"
 	}
-	converted := openAIResponse{Object: "chat.completion", Choices: []openAIChoice{{Index: 0, Message: openAIResponseMessage{Role: "assistant", Content: json.RawMessage(mustJSON(strings.Join(parts, "")))}, FinishReason: &finish}}}
+	content := json.RawMessage(nil)
+	if len(parts) == 1 && parts[0].Type == "text" {
+		content = json.RawMessage(mustJSON(parts[0].Text))
+	} else {
+		content = json.RawMessage(mustJSON(parts))
+	}
+	converted := openAIResponse{Object: "chat.completion", Choices: []openAIChoice{{Index: 0, Message: openAIResponseMessage{Role: "assistant", Content: content}, FinishReason: &finish}}}
 	if response.UsageMetadata != nil {
 		converted.Usage = &openAIUsage{PromptTokens: response.UsageMetadata.PromptTokenCount, CompletionTokens: response.UsageMetadata.CandidatesTokenCount, TotalTokens: response.UsageMetadata.TotalTokenCount, CacheReadInputTokens: response.UsageMetadata.CachedContentTokenCount}
 		if converted.Usage.TotalTokens == 0 {
@@ -1023,22 +1142,90 @@ func geminiToOpenAIResponse(body []byte) ([]byte, error) {
 	return json.Marshal(converted)
 }
 
-func responsesTextValue(raw json.RawMessage) (string, error) {
+func responsesContentToOpenAI(raw json.RawMessage) (json.RawMessage, error) {
 	if text, err := textValue(raw); err == nil {
-		return text, nil
+		return json.RawMessage(mustJSON(text)), nil
 	}
 	var parts []responsesContentPart
 	if err := json.Unmarshal(raw, &parts); err != nil || len(parts) == 0 {
-		return "", errors.New("only string or input_text content is supported")
+		return nil, errors.New("only string or supported input content blocks are accepted")
 	}
+	converted := make([]openAIContentPart, 0, len(parts))
+	for index, part := range parts {
+		switch part.Type {
+		case "input_text":
+			if part.Text == "" {
+				return nil, fmt.Errorf("input_text content part %d is empty", index)
+			}
+			converted = append(converted, openAIContentPart{Type: "text", Text: part.Text})
+		case "input_image":
+			if strings.TrimSpace(part.ImageURL) == "" {
+				return nil, fmt.Errorf("input_image content part %d has no image_url", index)
+			}
+			if err := validateImageDetail(part.Detail); err != nil {
+				return nil, fmt.Errorf("input_image content part %d: %s", index, err)
+			}
+			if _, _, _, err := parseImageURL(part.ImageURL); err != nil {
+				return nil, fmt.Errorf("input_image content part %d: %s", index, err)
+			}
+			converted = append(converted, openAIContentPart{Type: "image_url", ImageURL: &openAIImageURLValue{URL: part.ImageURL, Detail: part.Detail}})
+		default:
+			return nil, fmt.Errorf("content block %q is not supported", part.Type)
+		}
+	}
+	return openAIContentRaw(converted), nil
+}
+
+func openAIContentRaw(parts []openAIContentPart) json.RawMessage {
+	if len(parts) == 0 {
+		return nil
+	}
+	allText := true
 	var text strings.Builder
 	for _, part := range parts {
-		if part.Type != "input_text" {
-			return "", fmt.Errorf("content block %q is not supported", part.Type)
+		if part.Type != "text" {
+			allText = false
+			break
 		}
 		text.WriteString(part.Text)
 	}
-	return text.String(), nil
+	if allText {
+		return json.RawMessage(mustJSON(text.String()))
+	}
+	return json.RawMessage(mustJSON(parts))
+}
+
+func openAIContentToResponses(parts []openAIContentPart) ([]responsesContentPart, error) {
+	converted := make([]responsesContentPart, 0, len(parts))
+	for _, part := range parts {
+		switch part.Type {
+		case "text":
+			converted = append(converted, responsesContentPart{Type: "input_text", Text: part.Text})
+		case "image_url":
+			if part.ImageURL == nil {
+				return nil, errors.New("image content has no url")
+			}
+			if err := validateImageDetail(part.ImageURL.Detail); err != nil {
+				return nil, err
+			}
+			if _, _, _, err := parseImageURL(part.ImageURL.URL); err != nil {
+				return nil, err
+			}
+			converted = append(converted, responsesContentPart{Type: "input_image", ImageURL: part.ImageURL.URL, Detail: part.ImageURL.Detail})
+		default:
+			return nil, fmt.Errorf("content block %q is not supported", part.Type)
+		}
+	}
+	return converted, nil
+}
+
+func validateImageDetail(detail string) error {
+	switch detail {
+	case "", "auto", "low", "high":
+		return nil
+	default:
+		return fmt.Errorf("image detail %q is not supported", detail)
+	}
 }
 
 func openAIToAnthropicResponse(body []byte) ([]byte, error) {
@@ -1055,11 +1242,25 @@ func openAIToAnthropicResponse(body []byte) ([]byte, error) {
 	}
 	blocks := make([]anthropicContentBlock, 0, len(choice.Message.ToolCalls)+1)
 	if len(bytes.TrimSpace(choice.Message.Content)) > 0 && !bytes.Equal(bytes.TrimSpace(choice.Message.Content), []byte("null")) {
-		text, err := textValue(choice.Message.Content)
+		parts, err := openAIContentParts(choice.Message.Content)
 		if err != nil {
 			return nil, fmt.Errorf("%w: response content: %s", ErrInvalidMessage, err)
 		}
-		blocks = append(blocks, anthropicContentBlock{Type: "text", Text: text})
+		for _, part := range parts {
+			switch part.Type {
+			case "text":
+				blocks = append(blocks, anthropicContentBlock{Type: "text", Text: part.Text})
+			case "image_url":
+				if part.ImageURL == nil {
+					return nil, fmt.Errorf("%w: response image has no url", ErrInvalidMessage)
+				}
+				source, imageErr := imageURLToAnthropic(part.ImageURL.URL)
+				if imageErr != nil {
+					return nil, fmt.Errorf("%w: response image: %s", ErrInvalidMessage, imageErr)
+				}
+				blocks = append(blocks, anthropicContentBlock{Type: "image", Source: source})
+			}
+		}
 	}
 	for _, call := range choice.Message.ToolCalls {
 		arguments, err := normalizeToolArguments(call.Function.Arguments)
@@ -1096,12 +1297,18 @@ func anthropicToOpenAIResponse(body []byte) ([]byte, error) {
 	if response.StopReason != "" && response.StopReason != "end_turn" && response.StopReason != "max_tokens" && response.StopReason != "stop_sequence" && response.StopReason != "tool_use" {
 		return nil, fmt.Errorf("%w: stop_reason %q", ErrUnsupportedProtocol, response.StopReason)
 	}
-	var parts []string
+	contentParts := make([]openAIContentPart, 0, len(response.Content))
 	toolCalls := make([]openAIToolCall, 0)
 	for _, part := range response.Content {
 		switch part.Type {
 		case "text":
-			parts = append(parts, part.Text)
+			contentParts = append(contentParts, openAIContentPart{Type: "text", Text: part.Text})
+		case "image":
+			converted, err := anthropicImageToOpenAI(part.Source)
+			if err != nil {
+				return nil, fmt.Errorf("%w: response image: %s", ErrInvalidMessage, err)
+			}
+			contentParts = append(contentParts, converted)
 		case "tool_use":
 			if strings.TrimSpace(part.ID) == "" || strings.TrimSpace(part.Name) == "" || !json.Valid(part.Input) {
 				return nil, fmt.Errorf("%w: malformed tool_use response", ErrInvalidMessage)
@@ -1116,8 +1323,8 @@ func anthropicToOpenAIResponse(body []byte) ([]byte, error) {
 		finish = "tool_calls"
 	}
 	content := json.RawMessage(nil)
-	if len(parts) > 0 {
-		content = json.RawMessage(mustJSON(strings.Join(parts, "")))
+	if len(contentParts) > 0 {
+		content = openAIContentRaw(contentParts)
 	}
 	converted := openAIResponse{ID: response.ID, Object: "chat.completion", Model: response.Model, Choices: []openAIChoice{{Index: 0, Message: openAIResponseMessage{Role: "assistant", Content: content, ToolCalls: toolCalls}, FinishReason: &finish}}}
 	if response.Usage != nil {
@@ -1149,6 +1356,152 @@ func openAIFinishReason(reason string) string {
 	default:
 		return reason
 	}
+}
+
+func openAIContentParts(raw json.RawMessage) ([]openAIContentPart, error) {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 || bytes.Equal(raw, []byte("null")) {
+		return nil, errors.New("content is required")
+	}
+	var text string
+	if json.Unmarshal(raw, &text) == nil {
+		return []openAIContentPart{{Type: "text", Text: text}}, nil
+	}
+	var parts []openAIContentPart
+	if err := json.Unmarshal(raw, &parts); err != nil || len(parts) == 0 {
+		return nil, errors.New("content must be a string or non-empty content part array")
+	}
+	for index, part := range parts {
+		switch part.Type {
+		case "text":
+			if part.Text == "" {
+				return nil, fmt.Errorf("text content part %d is empty", index)
+			}
+		case "image_url":
+			if part.ImageURL == nil || strings.TrimSpace(part.ImageURL.URL) == "" {
+				return nil, fmt.Errorf("image_url content part %d has no url", index)
+			}
+			if err := validateImageDetail(part.ImageURL.Detail); err != nil {
+				return nil, fmt.Errorf("image_url content part %d: %s", index, err)
+			}
+			if _, _, _, err := parseImageURL(part.ImageURL.URL); err != nil {
+				return nil, fmt.Errorf("image_url content part %d: %s", index, err)
+			}
+		default:
+			return nil, fmt.Errorf("content block %q is not supported", part.Type)
+		}
+	}
+	return parts, nil
+}
+
+func parseImageURL(raw string) (mediaType, data, remoteURL string, err error) {
+	value := strings.TrimSpace(raw)
+	if strings.HasPrefix(value, "data:") {
+		payload := strings.TrimPrefix(value, "data:")
+		separator := strings.IndexByte(payload, ',')
+		if separator <= 0 {
+			return "", "", "", errors.New("data image URL is malformed")
+		}
+		metadata, encoded := payload[:separator], payload[separator+1:]
+		parts := strings.Split(metadata, ";")
+		if len(parts) != 2 || parts[1] != "base64" || strings.TrimSpace(parts[0]) == "" || strings.TrimSpace(encoded) == "" {
+			return "", "", "", errors.New("data image URL must use base64 encoding and a media type")
+		}
+		if !isImageMediaType(parts[0]) {
+			return "", "", "", fmt.Errorf("media type %q is not an image", parts[0])
+		}
+		if _, decodeErr := base64.StdEncoding.DecodeString(encoded); decodeErr != nil {
+			return "", "", "", fmt.Errorf("data image URL has invalid base64: %w", decodeErr)
+		}
+		return parts[0], encoded, "", nil
+	}
+	parsed, parseErr := url.Parse(value)
+	if parseErr != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+		return "", "", "", errors.New("image URL must be an absolute http(s) or data URL")
+	}
+	return "", "", value, nil
+}
+
+func isImageMediaType(mediaType string) bool {
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(mediaType)), "image/")
+}
+
+func imageURLToAnthropic(raw string) (*anthropicImageSource, error) {
+	mediaType, data, remoteURL, err := parseImageURL(raw)
+	if err != nil {
+		return nil, err
+	}
+	if remoteURL != "" {
+		return &anthropicImageSource{Type: "url", URL: remoteURL}, nil
+	}
+	return &anthropicImageSource{Type: "base64", MediaType: mediaType, Data: data}, nil
+}
+
+func anthropicImageToOpenAI(source *anthropicImageSource) (openAIContentPart, error) {
+	if source == nil {
+		return openAIContentPart{}, errors.New("image source is required")
+	}
+	switch source.Type {
+	case "url":
+		if _, _, remoteURL, err := parseImageURL(source.URL); err != nil || remoteURL == "" {
+			return openAIContentPart{}, errors.New("Anthropic url image source requires an absolute http(s) URL")
+		} else {
+			return openAIContentPart{Type: "image_url", ImageURL: &openAIImageURLValue{URL: remoteURL}}, nil
+		}
+	case "base64":
+		if strings.TrimSpace(source.MediaType) == "" || strings.TrimSpace(source.Data) == "" {
+			return openAIContentPart{}, errors.New("Anthropic base64 image source requires media_type and data")
+		}
+		if _, _, _, parseErr := parseImageURL("data:" + source.MediaType + ";base64," + source.Data); parseErr != nil {
+			return openAIContentPart{}, fmt.Errorf("Anthropic image source: %s", parseErr)
+		}
+		return openAIContentPart{Type: "image_url", ImageURL: &openAIImageURLValue{URL: "data:" + source.MediaType + ";base64," + source.Data}}, nil
+	default:
+		return openAIContentPart{}, fmt.Errorf("image source type %q is not supported", source.Type)
+	}
+}
+
+func openAIImageToGemini(raw string) (geminiPart, error) {
+	mediaType, data, remoteURL, err := parseImageURL(raw)
+	if err != nil {
+		return geminiPart{}, err
+	}
+	if remoteURL != "" {
+		return geminiPart{FileData: &geminiFileData{FileURI: remoteURL}}, nil
+	}
+	return geminiPart{InlineData: &geminiBlob{MimeType: mediaType, Data: data}}, nil
+}
+
+func geminiImageToOpenAI(part geminiPart) (openAIContentPart, error) {
+	if part.Text != "" && (part.InlineData != nil || part.FileData != nil) {
+		return openAIContentPart{}, errors.New("Gemini part has both text and image data")
+	}
+	if part.InlineData != nil && part.FileData != nil {
+		return openAIContentPart{}, errors.New("Gemini image part has both inlineData and fileData")
+	}
+	if part.InlineData != nil {
+		if strings.TrimSpace(part.InlineData.MimeType) == "" || strings.TrimSpace(part.InlineData.Data) == "" {
+			return openAIContentPart{}, errors.New("Gemini inlineData image is incomplete")
+		}
+		imageURL := "data:" + part.InlineData.MimeType + ";base64," + part.InlineData.Data
+		if _, _, _, parseErr := parseImageURL(imageURL); parseErr != nil {
+			return openAIContentPart{}, fmt.Errorf("Gemini inlineData image: %s", parseErr)
+		}
+		return openAIContentPart{Type: "image_url", ImageURL: &openAIImageURLValue{URL: imageURL}}, nil
+	}
+	if part.FileData != nil {
+		if part.FileData.MimeType != "" && !isImageMediaType(part.FileData.MimeType) {
+			return openAIContentPart{}, fmt.Errorf("Gemini fileData media type %q is not an image", part.FileData.MimeType)
+		}
+		if _, _, remoteURL, parseErr := parseImageURL(part.FileData.FileURI); parseErr != nil || remoteURL == "" {
+			return openAIContentPart{}, errors.New("Gemini fileData requires an absolute http(s) URI")
+		}
+		return openAIContentPart{Type: "image_url", ImageURL: &openAIImageURLValue{URL: part.FileData.FileURI}}, nil
+	}
+	if part.Text != "" {
+		return openAIContentPart{Type: "text", Text: part.Text}, nil
+	}
+	return openAIContentPart{}, errors.New("Gemini response contains an empty or unsupported part")
 }
 
 func textValue(raw json.RawMessage) (string, error) {

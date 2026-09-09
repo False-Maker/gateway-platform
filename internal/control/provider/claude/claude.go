@@ -51,7 +51,7 @@ func (p *Provider) Authorize(ctx context.Context, req contracts.ImportRequest) (
 		return contracts.TokenBundle{AccessToken: req.StaticKey}, nil
 	}
 	code, verifier, redirectURI := req.Metadata["code"], req.Metadata["code_verifier"], req.Metadata["redirect_uri"]
-	return p.HTTP.ExchangeCode(ctx, p.Config, code, verifier, redirectURI, req.Metadata["state"])
+	return p.HTTP.ExchangeCodeWithProxy(ctx, p.Config, code, verifier, redirectURI, req.Metadata["state"], req.Metadata["proxy"])
 }
 
 func (p *Provider) Refresh(_ context.Context, credential contracts.Credential) (contracts.TokenBundle, error) {
@@ -66,7 +66,7 @@ func (p *Provider) RefreshOAuth(ctx context.Context, current contracts.TokenBund
 }
 
 func (p *Provider) Revoke(ctx context.Context, credential contracts.Credential) error {
-	return p.HTTP.Revoke(ctx, p.Config, credential.AccessToken, "access_token")
+	return p.HTTP.RevokeWithProxy(ctx, p.Config, credential.AccessToken, "access_token", credential.Proxy)
 }
 
 func (p *Provider) RevokeOAuth(ctx context.Context, current contracts.TokenBundle) error {
@@ -76,7 +76,7 @@ func (p *Provider) RevokeOAuth(ctx context.Context, current contracts.TokenBundl
 		token = current.AccessToken
 		tokenType = "access_token"
 	}
-	return p.HTTP.Revoke(ctx, p.Config, token, tokenType)
+	return p.HTTP.RevokeWithProxy(ctx, p.Config, token, tokenType, current.Metadata["proxy"])
 }
 
 func (p *Provider) Profile(contracts.Account) contracts.UpstreamProfile {

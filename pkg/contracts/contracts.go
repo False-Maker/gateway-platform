@@ -6,6 +6,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/big"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -64,10 +67,12 @@ type Criteria struct {
 }
 
 type Credential struct {
-	Kind        string    `json:"kind"`
-	AccessToken string    `json:"access_token"`
-	ExpiresAt   time.Time `json:"expires_at"`
-	Version     int64     `json:"version"`
+	Kind        string            `json:"kind"`
+	AccessToken string            `json:"access_token"`
+	Proxy       string            `json:"proxy,omitempty"`
+	Metadata    map[string]string `json:"metadata,omitempty"`
+	ExpiresAt   time.Time         `json:"expires_at"`
+	Version     int64             `json:"version"`
 }
 
 type TokenBundle struct {
@@ -83,6 +88,7 @@ type TokenBundle struct {
 
 type UpstreamProfile struct {
 	BaseURL        string            `json:"base_url"`
+	Proxy          string            `json:"proxy,omitempty"`
 	Protocol       string            `json:"protocol,omitempty"`
 	InferencePath  string            `json:"inference_path,omitempty"`
 	TLSFingerprint string            `json:"tls_fingerprint,omitempty"`
@@ -124,13 +130,116 @@ type QuotaInfo struct {
 	Items []QuotaItem `json:"items,omitempty"`
 }
 
+// Decimal preserves a provider's decimal spelling without routing it through
+// float64 or an integer. It is serialized as a JSON number, so snapshots and
+// PostgreSQL retain the original precision while remaining interoperable.
+type Decimal string
+
+var decimalPattern = regexp.MustCompile(`^-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?$`)
+
+func (d Decimal) Valid() bool {
+	raw := strings.TrimSpace(string(d))
+	if raw == "" {
+		return false
+	}
+	return decimalPattern.MatchString(raw)
+}
+
+func (d Decimal) Sign() (int, bool) {
+	if !d.Valid() {
+		return 0, false
+	}
+	v, ok := new(big.Rat).SetString(strings.TrimSpace(string(d)))
+	if !ok {
+		return 0, false
+	}
+	return v.Sign(), true
+}
+
+func (d Decimal) Sub(other Decimal) (Decimal, bool) {
+	if !d.Valid() || !other.Valid() {
+		return "", false
+	}
+	left, ok := new(big.Rat).SetString(strings.TrimSpace(string(d)))
+	if !ok {
+		return "", false
+	}
+	right, ok := new(big.Rat).SetString(strings.TrimSpace(string(other)))
+	if !ok {
+		return "", false
+	}
+	result := new(big.Rat).Sub(left, right)
+	precision := decimalPlaces(d)
+	if places := decimalPlaces(other); places > precision {
+		precision = places
+	}
+	return Decimal(result.FloatString(precision)), true
+}
+
+func decimalPlaces(d Decimal) int {
+	raw := strings.TrimSpace(string(d))
+	exponent := 0
+	if index := strings.IndexAny(raw, "eE"); index >= 0 {
+		exponent, _ = strconv.Atoi(raw[index+1:])
+		raw = raw[:index]
+	}
+	if dot := strings.IndexByte(raw, '.'); dot >= 0 {
+		places := len(raw) - dot - 1 - exponent
+		if places > 0 {
+			return places
+		}
+		return 0
+	}
+	if exponent < 0 {
+		return -exponent
+	}
+	return 0
+}
+
+func (d Decimal) MarshalJSON() ([]byte, error) {
+	if !d.Valid() {
+		return nil, fmt.Errorf("%w: invalid decimal %q", ErrInvalidContract, d)
+	}
+	return []byte(strings.TrimSpace(string(d))), nil
+}
+
+func (d *Decimal) UnmarshalJSON(data []byte) error {
+	raw := strings.TrimSpace(string(data))
+	if len(raw) >= 2 && raw[0] == '"' && raw[len(raw)-1] == '"' {
+		var quoted string
+		if err := json.Unmarshal(data, &quoted); err != nil {
+			return err
+		}
+		raw = quoted
+	}
+	value := Decimal(raw)
+	if !value.Valid() {
+		return fmt.Errorf("%w: invalid decimal %q", ErrInvalidContract, raw)
+	}
+	*d = value
+	return nil
+}
+
+type QuotaPrecision struct {
+	Used        *Decimal `json:"used,omitempty"`
+	Limit       *Decimal `json:"limit,omitempty"`
+	Remaining   *Decimal `json:"remaining,omitempty"`
+	OverageRate *Decimal `json:"overage_rate,omitempty"`
+	OverageCap  *Decimal `json:"overage_cap,omitempty"`
+	Overages    *Decimal `json:"overages,omitempty"`
+}
+
 type QuotaItem struct {
-	Scope     string     `json:"scope"`
-	Model     string     `json:"model,omitempty"`
-	Unit      string     `json:"unit"`
-	Limit     *int64     `json:"limit,omitempty"`
-	Remaining *int64     `json:"remaining,omitempty"`
-	ResetAt   *time.Time `json:"reset_at,omitempty"`
+	Scope             string          `json:"scope"`
+	Model             string          `json:"model,omitempty"`
+	Unit              string          `json:"unit"`
+	Limit             *int64          `json:"limit,omitempty"`
+	Remaining         *int64          `json:"remaining,omitempty"`
+	LimitExact        *Decimal        `json:"limit_exact,omitempty"`
+	RemainingExact    *Decimal        `json:"remaining_exact,omitempty"`
+	RemainingFraction *Decimal        `json:"remaining_fraction,omitempty"`
+	Precision         *QuotaPrecision `json:"precision,omitempty"`
+	ResetAt           *time.Time      `json:"reset_at,omitempty"`
 }
 
 type Account struct {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/elucid/gateway-platform/pkg/contracts"
@@ -16,8 +17,7 @@ type Executor interface {
 	Execute(context.Context, contracts.WrapperJob) ([]byte, error)
 }
 
-// FixtureExecutor is the P2 local stub. It treats the envelope as opaque and
-// returns a copy, so no provider or account credentials are accessed.
+// FixtureExecutor is test-only. Production configuration uses PKCEExecutor.
 type FixtureExecutor struct {
 	Delay time.Duration
 }
@@ -59,7 +59,7 @@ func (w Worker) Run(ctx context.Context) error {
 		w.PollInterval = 100 * time.Millisecond
 	}
 	if w.Executor == nil {
-		w.Executor = FixtureExecutor{}
+		return errors.New("wrapper worker executor is nil")
 	}
 	claim := contracts.WrapperClaim{
 		SchemaVersion:   contracts.SchemaVersion,
@@ -89,6 +89,7 @@ func (w Worker) Run(ctx context.Context) error {
 			if ctx.Err() != nil {
 				return nil
 			}
+			code, retryable := classifyExecutionError(executeErr)
 			failure := contracts.WrapperFailure{
 				SchemaVersion: contracts.SchemaVersion,
 				JobID:         job.JobID,
@@ -96,8 +97,8 @@ func (w Worker) Run(ctx context.Context) error {
 				WorkerID:      lease.WorkerID,
 				AccountID:     lease.AccountID,
 				FenceEpoch:    lease.FenceEpoch,
-				Code:          "executor_failed",
-				Retryable:     true,
+				Code:          code,
+				Retryable:     retryable,
 			}
 			if err := w.Queue.Fail(ctx, lease, failure); err != nil {
 				if ctx.Err() != nil || errors.Is(err, ErrLeaseLost) {
@@ -126,6 +127,14 @@ func (w Worker) Run(ctx context.Context) error {
 			return fmt.Errorf("wrapper complete: %w", err)
 		}
 	}
+}
+
+func classifyExecutionError(err error) (string, bool) {
+	var executionErr *ExecutionError
+	if errors.As(err, &executionErr) && strings.TrimSpace(executionErr.Code) != "" && len(executionErr.Code) <= 128 {
+		return executionErr.Code, executionErr.Retryable
+	}
+	return "executor_failed", true
 }
 
 func waitFor(ctx context.Context, duration time.Duration) error {

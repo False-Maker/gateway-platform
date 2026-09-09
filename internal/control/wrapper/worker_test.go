@@ -31,7 +31,7 @@ func TestWorkerProcessesFixtureAndStopsOnContextCancel(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
-		done <- (Worker{Queue: queue, WorkerID: "worker-test", LeaseTTLSeconds: 30, PollInterval: time.Millisecond}).Run(ctx)
+		done <- (Worker{Queue: queue, WorkerID: "worker-test", LeaseTTLSeconds: 30, PollInterval: time.Millisecond, Executor: FixtureExecutor{}}).Run(ctx)
 	}()
 
 	var terminal []byte
@@ -137,4 +137,50 @@ func TestWorkerFailsFixtureJobThroughQueueContract(t *testing.T) {
 	if envelope.Status != "failed" || envelope.Failure == nil || envelope.Failure.Code != "executor_failed" {
 		t.Fatalf("unexpected failure terminal: %#v", envelope)
 	}
+}
+
+type classifiedExecutor struct{}
+
+func (classifiedExecutor) Execute(context.Context, contracts.WrapperJob) ([]byte, error) {
+	return nil, executionError(ErrorUnsupportedJob, false, contracts.ErrUnsupportedCapability)
+}
+
+func TestWorkerPreservesExecutorFailureClassification(t *testing.T) {
+	mini := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mini.Addr()})
+	queue := Queue{Redis: rdb}
+	job := contracts.WrapperJob{SchemaVersion: contracts.SchemaVersion, JobID: "classified-job", Provider: "claude", Operation: contracts.WrapperAuthorize, EncryptedInput: []byte("opaque")}
+	if _, err := queue.Enqueue(context.Background(), job); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- (Worker{Queue: queue, WorkerID: "worker-classified", LeaseTTLSeconds: 30, PollInterval: time.Millisecond, Executor: classifiedExecutor{}}).Run(ctx)
+	}()
+	terminal := waitForTerminalEnvelope(t, queue, job.JobID)
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("worker cancellation: %v", err)
+	}
+	if terminal.Failure == nil || terminal.Failure.Code != ErrorUnsupportedJob || terminal.Failure.Retryable {
+		t.Fatalf("unexpected classified failure: %#v", terminal)
+	}
+}
+
+func waitForTerminalEnvelope(t *testing.T, queue Queue, jobID string) terminalEnvelope {
+	t.Helper()
+	for deadline := time.Now().Add(2 * time.Second); time.Now().Before(deadline); {
+		raw, err := queue.Terminal(context.Background(), jobID)
+		if err == nil {
+			var terminal terminalEnvelope
+			if err := json.Unmarshal(raw, &terminal); err != nil {
+				t.Fatal(err)
+			}
+			return terminal
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("terminal was not written for %s", jobID)
+	return terminalEnvelope{}
 }

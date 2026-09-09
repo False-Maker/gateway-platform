@@ -16,6 +16,7 @@ import (
 	"github.com/alicebob/miniredis/v2"
 	"github.com/elucid/gateway-platform/internal/events"
 	"github.com/elucid/gateway-platform/pkg/contracts"
+	"github.com/elucid/gateway-platform/pkg/protokit"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -60,6 +61,36 @@ func latestRelease(t *testing.T, rdb *redis.Client) contracts.Release {
 		t.Fatal(err)
 	}
 	return release
+}
+
+func TestClientForProxyRoutesRequestThroughConfiguredProxy(t *testing.T) {
+	requests := make(chan string, 1)
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests <- r.URL.String()
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer proxy.Close()
+
+	client, err := clientForProxy(&http.Client{Timeout: time.Second}, proxy.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := client.Get("http://target.invalid/v1/test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusNoContent {
+		t.Fatalf("proxy response status=%d", response.StatusCode)
+	}
+	select {
+	case got := <-requests:
+		if got != "http://target.invalid/v1/test" {
+			t.Fatalf("proxy request URL=%q", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("proxy did not receive request")
+	}
 }
 
 func TestOpenAIChatStreamingIncludesUsageAndWritesRelease(t *testing.T) {
@@ -318,6 +349,218 @@ func TestOpenAIStreamingConvertsGeminiUpstreamEvents(t *testing.T) {
 	release := latestRelease(t, rdb)
 	if release.UsageSource != contracts.UsageSourceUpstream || release.TokensIn != 5 || release.TokensOut != 7 || release.Partial {
 		t.Fatalf("unexpected Gemini cross-protocol release: %+v", release)
+	}
+}
+
+func TestNonOpenAIStreamingRequestConversionSupportsAllUpstreamProtocols(t *testing.T) {
+	tests := []struct {
+		name   string
+		body   string
+		from   protokit.Protocol
+		to     protokit.Protocol
+		stream bool
+	}{
+		{name: "AnthropicToChat", body: `{"model":"m","max_tokens":32,"stream":true,"messages":[{"role":"user","content":"hello"}]}`, from: protokit.AnthropicMessages, to: protokit.OpenAIChat, stream: true},
+		{name: "AnthropicToResponses", body: `{"model":"m","max_tokens":32,"stream":true,"messages":[{"role":"user","content":"hello"}]}`, from: protokit.AnthropicMessages, to: protokit.OpenAIResponses, stream: true},
+		{name: "AnthropicToGemini", body: `{"model":"m","max_tokens":32,"stream":true,"messages":[{"role":"user","content":"hello"}]}`, from: protokit.AnthropicMessages, to: protokit.GeminiGenerate},
+		{name: "ResponsesToChat", body: `{"model":"m","max_output_tokens":32,"stream":true,"input":"hello"}`, from: protokit.OpenAIResponses, to: protokit.OpenAIChat, stream: true},
+		{name: "ResponsesToAnthropic", body: `{"model":"m","max_output_tokens":32,"stream":true,"input":"hello"}`, from: protokit.OpenAIResponses, to: protokit.AnthropicMessages, stream: true},
+		{name: "ResponsesToGemini", body: `{"model":"m","max_output_tokens":32,"stream":true,"input":"hello"}`, from: protokit.OpenAIResponses, to: protokit.GeminiGenerate},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			converted, err := convertStreamingRequest([]byte(test.body), test.from, test.to)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var request map[string]any
+			if err := json.Unmarshal(converted, &request); err != nil {
+				t.Fatal(err)
+			}
+			stream, present := request["stream"]
+			if test.stream && (!present || stream != true) {
+				t.Fatalf("stream flag missing after conversion: %#v", request)
+			}
+			if !test.stream && present {
+				t.Fatalf("Gemini request retained stream flag: %#v", request)
+			}
+			if test.to == protokit.OpenAIChat {
+				options, ok := request["stream_options"].(map[string]any)
+				if !ok || options["include_usage"] != true {
+					t.Fatalf("Chat request did not require streaming usage: %#v", request)
+				}
+			}
+		})
+	}
+}
+
+func TestAnthropicIngressConvertsChatStreamingResponse(t *testing.T) {
+	mini := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mini.Addr()})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/chat/completions" || r.Header.Get("Authorization") != "Bearer key" {
+			t.Fatalf("unexpected Chat stream request: path=%s authorization=%q", r.URL.Path, r.Header.Get("Authorization"))
+		}
+		var request map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatal(err)
+		}
+		if request["stream"] != true || request["max_tokens"] != float64(32) {
+			t.Fatalf("Anthropic request was not converted to Chat streaming: %#v", request)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"converted\"},\"finish_reason\":null}]}\n\n")
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n")
+		_, _ = io.WriteString(w, "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":3}}\n\n")
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	}))
+	defer upstream.Close()
+	server := NewServer(events.Producer{Redis: rdb, ProducerID: "gateway-test"}, "apikey")
+	server.Chooser.Replace([]contracts.Account{{ID: "a", Provider: "apikey", Platform: "apikey", Group: "default", Status: "active", Credential: contracts.Credential{Kind: "static", AccessToken: "key", Version: 1}, Profile: contracts.UpstreamProfile{BaseURL: upstream.URL, Protocol: "openai_chat"}}})
+	recorder := httptest.NewRecorder()
+	status, err := server.HandleMessagesStreaming(context.Background(), "tenant", "default", []byte(`{"model":"m","max_tokens":32,"stream":true,"messages":[{"role":"user","content":"hello"}]}`), recorder)
+	if err != nil || status != http.StatusOK || recorder.Code != http.StatusOK {
+		t.Fatalf("Anthropic ingress stream failed: status=%d recorder=%d err=%v body=%s", status, recorder.Code, err, recorder.Body.String())
+	}
+	body := recorder.Body.String()
+	for _, expected := range []string{"event: message_start", "event: content_block_delta", `"text":"converted"`, `"input_tokens":2`, `"output_tokens":3`, "event: message_stop"} {
+		if !strings.Contains(body, expected) {
+			t.Fatalf("Anthropic SSE is missing %q: %s", expected, body)
+		}
+	}
+	release := latestRelease(t, rdb)
+	if release.UsageSource != contracts.UsageSourceUpstream || release.TokensIn != 2 || release.TokensOut != 3 || release.Partial {
+		t.Fatalf("unexpected Anthropic ingress release: %+v", release)
+	}
+}
+
+func TestResponsesIngressConvertsAnthropicStreamingResponse(t *testing.T) {
+	mini := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mini.Addr()})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/messages" || r.Header.Get("x-api-key") != "claude-key" {
+			t.Fatalf("unexpected Anthropic stream request: path=%s x-api-key=%q", r.URL.Path, r.Header.Get("x-api-key"))
+		}
+		var request map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatal(err)
+		}
+		if request["stream"] != true || request["max_tokens"] != float64(32) {
+			t.Fatalf("Responses request was not converted to Anthropic streaming: %#v", request)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":4}}}\n\n")
+		_, _ = io.WriteString(w, "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"converted\"}}\n\n")
+		_, _ = io.WriteString(w, "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":6}}\n\n")
+		_, _ = io.WriteString(w, "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
+	}))
+	defer upstream.Close()
+	server := NewServer(events.Producer{Redis: rdb, ProducerID: "gateway-test"}, "claude")
+	server.Chooser.Replace([]contracts.Account{{ID: "a", Provider: "claude", Platform: "claude", Group: "default", Status: "active", Credential: contracts.Credential{Kind: "static", AccessToken: "claude-key", Version: 1}, Profile: contracts.UpstreamProfile{BaseURL: upstream.URL, Protocol: "anthropic_messages"}}})
+	recorder := httptest.NewRecorder()
+	status, err := server.HandleResponsesStreaming(context.Background(), "tenant", "default", []byte(`{"model":"m","max_output_tokens":32,"stream":true,"input":"hello"}`), recorder)
+	if err != nil || status != http.StatusOK || recorder.Code != http.StatusOK {
+		t.Fatalf("Responses ingress stream failed: status=%d recorder=%d err=%v body=%s", status, recorder.Code, err, recorder.Body.String())
+	}
+	body := recorder.Body.String()
+	for _, expected := range []string{"event: response.created", "event: response.output_text.delta", `"delta":"converted"`, `"input_tokens":4`, `"output_tokens":6`, "event: response.completed"} {
+		if !strings.Contains(body, expected) {
+			t.Fatalf("Responses SSE is missing %q: %s", expected, body)
+		}
+	}
+	release := latestRelease(t, rdb)
+	if release.UsageSource != contracts.UsageSourceUpstream || release.TokensIn != 4 || release.TokensOut != 6 || release.Partial {
+		t.Fatalf("unexpected Responses ingress release: %+v", release)
+	}
+}
+
+func TestProtocolSSEConverterSupportsResponsesAndGeminiSources(t *testing.T) {
+	tests := []struct {
+		name     string
+		from     protokit.Protocol
+		to       protokit.Protocol
+		events   [][2]string
+		expected []string
+	}{
+		{
+			name: "ResponsesToAnthropic", from: protokit.OpenAIResponses, to: protokit.AnthropicMessages,
+			events: [][2]string{
+				{"response.output_text.delta", `{"type":"response.output_text.delta","delta":"hello"}`},
+				{"response.completed", `{"type":"response.completed","response":{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"usage":{"input_tokens":7,"output_tokens":8}}}`},
+			},
+			expected: []string{`"text":"hello"`, `"input_tokens":7`, `"output_tokens":8`, `"stop_reason":"max_tokens"`, "event: message_stop"},
+		},
+		{
+			name: "GeminiToResponses", from: protokit.GeminiGenerate, to: protokit.OpenAIResponses,
+			events: [][2]string{
+				{"", `{"candidates":[{"content":{"parts":[{"text":"hello"}]}}]}`},
+				{"", `{"candidates":[{"content":{"parts":[]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":9,"candidatesTokenCount":10}}`},
+			},
+			expected: []string{`"delta":"hello"`, `"input_tokens":9`, `"output_tokens":10`, "event: response.completed"},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			converter := newProtocolSSEConverter(test.from, test.to, "m")
+			var blocks []string
+			for _, event := range test.events {
+				converted, err := converter.convert(event[0], event[1])
+				if err != nil {
+					t.Fatal(err)
+				}
+				blocks = append(blocks, converted...)
+			}
+			body := strings.Join(blocks, "")
+			for _, expected := range test.expected {
+				if !strings.Contains(body, expected) {
+					t.Fatalf("converted SSE is missing %q: %s", expected, body)
+				}
+			}
+		})
+	}
+}
+
+func TestProtocolSSEConverterRejectsUnsupportedContentEvents(t *testing.T) {
+	tests := []struct {
+		name  string
+		from  protokit.Protocol
+		to    protokit.Protocol
+		event string
+		data  string
+	}{
+		{name: "ChatToolCall", from: protokit.OpenAIChat, to: protokit.AnthropicMessages, data: `{"choices":[{"delta":{"tool_calls":[{"id":"call-1"}]}}]}`},
+		{name: "AnthropicToolUse", from: protokit.AnthropicMessages, to: protokit.OpenAIResponses, event: "content_block_start", data: `{"type":"content_block_start","content_block":{"type":"tool_use"}}`},
+		{name: "ResponsesFunctionCall", from: protokit.OpenAIResponses, to: protokit.AnthropicMessages, event: "response.output_item.added", data: `{"type":"response.output_item.added","item":{"type":"function_call"}}`},
+		{name: "GeminiInlineData", from: protokit.GeminiGenerate, to: protokit.OpenAIResponses, data: `{"candidates":[{"content":{"parts":[{"inlineData":{"mimeType":"image/png","data":"AA=="}}]}}]}`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			converter := newProtocolSSEConverter(test.from, test.to, "m")
+			if _, err := converter.convert(test.event, test.data); !errors.Is(err, contracts.ErrUnsupportedCapability) {
+				t.Fatalf("unsupported stream event error=%v", err)
+			}
+		})
+	}
+}
+
+func TestCrossProtocolStreamingClassifiesUnexpectedContent(t *testing.T) {
+	mini := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mini.Addr()})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"id\":\"call-1\"}]}}]}\n\n")
+	}))
+	defer upstream.Close()
+	server := NewServer(events.Producer{Redis: rdb, ProducerID: "gateway-test"}, "apikey")
+	server.Chooser.Replace([]contracts.Account{{ID: "a", Provider: "apikey", Platform: "apikey", Group: "default", Status: "active", Credential: contracts.Credential{Kind: "static", AccessToken: "key", Version: 1}, Profile: contracts.UpstreamProfile{BaseURL: upstream.URL, Protocol: "openai_chat"}}})
+	recorder := httptest.NewRecorder()
+	status, err := server.HandleMessagesStreaming(context.Background(), "tenant", "default", []byte(`{"model":"m","max_tokens":32,"stream":true,"messages":[{"role":"user","content":"hello"}]}`), recorder)
+	if status != http.StatusOK || !errors.Is(err, contracts.ErrUnsupportedCapability) {
+		t.Fatalf("unexpected cross-protocol content result: status=%d err=%v", status, err)
+	}
+	release := latestRelease(t, rdb)
+	if release.ErrorClass != contracts.ErrorForbiddenCapability || !release.Partial || release.UsageSource != contracts.UsageSourceMissing {
+		t.Fatalf("unexpected unsupported-content release: %+v", release)
 	}
 }
 
@@ -1049,5 +1292,47 @@ func TestForbiddenTransportFailoverUsesDifferentAccount(t *testing.T) {
 	}
 	if len(tokens) != 2 || tokens[0] != "Bearer a" || tokens[1] != "Bearer b" {
 		t.Fatalf("failover reused an account: %v", tokens)
+	}
+}
+
+func TestNonStreamingAllowsImageContentAndStreamingRejectsIt(t *testing.T) {
+	mini := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mini.Addr()})
+	called := false
+	var received map[string]any
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		if err := json.NewDecoder(r.Body).Decode(&received); err != nil {
+			t.Fatal(err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"chat-image","model":"vision","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":1,"total_tokens":3}}`)
+	}))
+	defer upstream.Close()
+	server := NewServer(events.Producer{Redis: rdb, ProducerID: "gateway-test"}, "apikey")
+	server.Chooser.Replace([]contracts.Account{{ID: "a", Provider: "apikey", Platform: "apikey", Group: "default", Status: "active", Credential: contracts.Credential{Kind: "static", AccessToken: "key", Version: 1}, Profile: contracts.UpstreamProfile{BaseURL: upstream.URL, Protocol: "openai_chat"}}})
+	request := ChatCompletionRequest{Model: "vision", Messages: []map[string]any{{"role": "user", "content": []any{
+		map[string]any{"type": "text", "text": "describe"},
+		map[string]any{"type": "image_url", "image_url": map[string]any{"url": "data:image/png;base64,AA=="}},
+	}}}}
+	body, status, err := server.HandleNonStreaming(context.Background(), "tenant", "default", request)
+	if err != nil || status != http.StatusOK {
+		t.Fatalf("image non-streaming request failed: status=%d err=%v body=%s", status, err, body)
+	}
+	if !called {
+		t.Fatal("image request did not reach upstream")
+	}
+	receivedMessages := received["messages"].([]any)
+	receivedContent := receivedMessages[0].(map[string]any)["content"].([]any)
+	if receivedContent[1].(map[string]any)["type"] != "image_url" {
+		t.Fatalf("image content was not forwarded: %#v", received)
+	}
+
+	called = false
+	recorder := httptest.NewRecorder()
+	request.Stream = true
+	streamStatus, streamErr := server.HandleStreaming(context.Background(), "tenant", "default", request, recorder)
+	if streamStatus != http.StatusBadRequest || !errors.Is(streamErr, contracts.ErrUnsupportedCapability) || called {
+		t.Fatalf("streaming image result: status=%d err=%v called=%v", streamStatus, streamErr, called)
 	}
 }

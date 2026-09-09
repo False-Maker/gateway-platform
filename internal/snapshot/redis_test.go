@@ -58,6 +58,25 @@ func TestPublishLoadAndStaleEpoch(t *testing.T) {
 	}
 }
 
+func TestPublishLoadPreservesDecimalQuota(t *testing.T) {
+	mini := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mini.Addr()})
+	fraction := contracts.Decimal("0.99833333")
+	precise := contracts.Decimal("2028.68")
+	account := contracts.Account{ID: "decimal", Provider: "kiro", Platform: "kiro", Group: "default", Status: "active", Quota: contracts.QuotaInfo{Items: []contracts.QuotaItem{{Scope: "model", Model: "gemini", Unit: "fraction", RemainingFraction: &fraction, Precision: &contracts.QuotaPrecision{Remaining: &precise}}}}}
+	if _, err := (Publisher{Redis: rdb}).Publish(context.Background(), "kiro", "default", 0, []contracts.Account{account}); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := (Loader{Redis: rdb}).Load(context.Background(), "kiro", "default")
+	if err != nil || len(loaded.Accounts) != 1 {
+		t.Fatalf("loaded=%#v err=%v", loaded, err)
+	}
+	item := loaded.Accounts[0].Quota.Items[0]
+	if string(*item.RemainingFraction) != "0.99833333" || string(*item.Precision.Remaining) != "2028.68" {
+		t.Fatalf("decimal quota changed after snapshot round trip: %#v", item)
+	}
+}
+
 func TestPublishCASAllowsOneWriterPerEpoch(t *testing.T) {
 	mini := miniredis.RunT(t)
 	rdb := redis.NewClient(&redis.Options{Addr: mini.Addr()})

@@ -63,6 +63,26 @@ func TestChooserQuotaAdmission(t *testing.T) {
 	}
 }
 
+func TestChooserQuotaAdmissionPreservesFractionAndPrecisionBoundaries(t *testing.T) {
+	positiveFraction := contracts.Decimal("0.0001")
+	zeroFraction := contracts.Decimal("0")
+	preciseRemaining := contracts.Decimal("0.01")
+	chooser := NewChooser(nil)
+	chooser.Replace([]contracts.Account{
+		{ID: "fraction-positive", Provider: "x", Platform: "x", Group: "default", Status: "active", Quota: contracts.QuotaInfo{Items: []contracts.QuotaItem{{Scope: "model", Model: "target", Unit: "fraction", RemainingFraction: &positiveFraction}}}},
+		{ID: "fraction-zero", Provider: "x", Platform: "x", Group: "default", Status: "active", Quota: contracts.QuotaInfo{Items: []contracts.QuotaItem{{Scope: "model", Model: "target", Unit: "fraction", RemainingFraction: &zeroFraction}}}},
+	})
+	lease, err := chooser.Acquire(contracts.Criteria{Platform: "x", Group: "default", Model: "target"})
+	if err != nil || lease.AccountID != "fraction-positive" {
+		t.Fatalf("fraction admission lease=%#v err=%v", lease, err)
+	}
+	chooser.Replace([]contracts.Account{{ID: "precise-positive", Provider: "x", Platform: "x", Group: "default", Status: "active", Quota: contracts.QuotaInfo{Items: []contracts.QuotaItem{{Scope: "model", Model: "target", Unit: "credit", Precision: &contracts.QuotaPrecision{Remaining: &preciseRemaining}}}}}})
+	lease, err = chooser.Acquire(contracts.Criteria{Platform: "x", Group: "default", Model: "target"})
+	if err != nil || lease.AccountID != "precise-positive" {
+		t.Fatalf("precision admission lease=%#v err=%v", lease, err)
+	}
+}
+
 func TestChooserCooldownIsNotReportedAsQuotaExhaustion(t *testing.T) {
 	now := time.Unix(100, 0)
 	zero := int64(0)

@@ -16,6 +16,9 @@ type Config struct {
 	WorkerID        string
 	LeaseTTLSeconds int
 	PollInterval    time.Duration
+	ExecutorMode    string
+	EnvelopeKey     string
+	CallbackTimeout time.Duration
 	FixtureDelay    time.Duration
 }
 
@@ -25,8 +28,11 @@ func ConfigFromEnv() Config {
 		RedisUsername:   os.Getenv("GATEWAY_WRAPPER_REDIS_USERNAME"),
 		RedisPassword:   os.Getenv("GATEWAY_WRAPPER_REDIS_PASSWORD"),
 		WorkerID:        getenv("GATEWAY_WRAPPER_WORKER_ID", "wrapper-1"),
-		LeaseTTLSeconds: getenvInt("GATEWAY_WRAPPER_LEASE_TTL_SECONDS", 30),
+		LeaseTTLSeconds: getenvInt("GATEWAY_WRAPPER_LEASE_TTL_SECONDS", 600),
 		PollInterval:    time.Duration(getenvInt("GATEWAY_WRAPPER_POLL_INTERVAL_MS", 100)) * time.Millisecond,
+		ExecutorMode:    getenv("GATEWAY_WRAPPER_EXECUTOR", ExecutorOAuth),
+		EnvelopeKey:     os.Getenv("GATEWAY_WRAPPER_ENVELOPE_KEY"),
+		CallbackTimeout: time.Duration(getenvInt("GATEWAY_WRAPPER_CALLBACK_TIMEOUT_SECONDS", 300)) * time.Second,
 		FixtureDelay:    time.Duration(getenvInt("GATEWAY_WRAPPER_FIXTURE_DELAY_MS", 0)) * time.Millisecond,
 	}
 }

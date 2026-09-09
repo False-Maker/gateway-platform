@@ -56,6 +56,8 @@ func init() { provider.Register(&Codex{}) } // 新增渠道 = 加一个目录 + 
   - **多重置窗口**(codex 的 5h + 7d 同时存在,各有独立余量与 reset 时间)
   - **额度缺失是合法状态**(apikey 渠道无额度概念,不能用 0 冒充"已耗尽")
   - 每项额度带 `unit`(token / request / credit)+ `reset_at`,不假设各渠道同单位
+  - 精度扩展保留旧整数字段，同时用严格十进制 `Decimal` 表达
+    `remaining_fraction`、`*_exact` 和 Kiro `precision`；快照/PG 不经 `float64` 舍入，未知值继续 missing
 - **Profile 静态 vs 每请求动态**:`Profile(acc) UpstreamProfile` 是纯静态的。若某渠道需**每请求**现场生成 challenge/session/PoW token(见总览附录未决问题 F8),静态 Profile 覆盖不了——这类逻辑要么下沉成 gateway 可调用的 per-request minter,要么该渠道不走无状态热路径。P2 打通 codex 前先核实。
 
 ## 3. OAuth 三段

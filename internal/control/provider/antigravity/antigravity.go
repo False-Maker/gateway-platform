@@ -82,6 +82,10 @@ func (p *Provider) RefreshOAuth(ctx context.Context, current contracts.TokenBund
 	if client == nil {
 		client = &http.Client{Timeout: 30 * time.Second}
 	}
+	client, err = (providerapi.HTTPClient{Client: client}).ClientForProxy(current.Metadata["proxy"])
+	if err != nil {
+		return contracts.TokenBundle{}, err
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		return contracts.TokenBundle{}, err
@@ -156,9 +160,119 @@ func (p *Provider) ProfileForImport(account contracts.Account, req contracts.Imp
 	return profile, nil
 }
 
-func (p *Provider) Quota(context.Context, contracts.Credential) (contracts.QuotaInfo, error) {
-	// fetchAvailableModels exposes a per-model remaining fraction and needs the
-	// account project ID. The stable integer QuotaInfo contract cannot represent
-	// that schema losslessly, so it remains missing until the contract is extended.
-	return contracts.QuotaInfo{}, nil
+func (p *Provider) Quota(ctx context.Context, credential contracts.Credential) (contracts.QuotaInfo, error) {
+	project := strings.TrimSpace(credential.Metadata["project_id"])
+	if project == "" {
+		return contracts.QuotaInfo{}, nil
+	}
+	endpoint := strings.TrimRight(p.Config.APIBaseURL, "/") + "/v1internal:fetchAvailableModels"
+	headers, err := p.Config.InferenceHeaders(credential.AccessToken)
+	if err != nil {
+		return contracts.QuotaInfo{}, err
+	}
+	headers.Set("Content-Type", "application/json")
+	headers.Set("User-Agent", defaultUserAgent)
+	body, err := json.Marshal(map[string]string{"project": project})
+	if err != nil {
+		return contracts.QuotaInfo{}, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return contracts.QuotaInfo{}, err
+	}
+	req.Header = headers
+	client, err := p.HTTP.ClientForProxy(credential.Proxy)
+	if err != nil {
+		return contracts.QuotaInfo{}, err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return contracts.QuotaInfo{}, err
+	}
+	defer resp.Body.Close()
+	responseBody, err := io.ReadAll(io.LimitReader(resp.Body, maxRefreshResponseBytes+1))
+	if err != nil {
+		return contracts.QuotaInfo{}, err
+	}
+	if len(responseBody) > maxRefreshResponseBytes {
+		return contracts.QuotaInfo{}, fmt.Errorf("Antigravity quota response exceeds %d bytes", maxRefreshResponseBytes)
+	}
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return contracts.QuotaInfo{}, &providerapi.HTTPError{Operation: "Antigravity quota", StatusCode: resp.StatusCode, Class: quotaHTTPErrorClass(resp.StatusCode)}
+	}
+	return ParseAvailableModelsQuota(responseBody)
+}
+
+func quotaHTTPErrorClass(status int) contracts.ErrorClass {
+	switch {
+	case status == http.StatusUnauthorized:
+		return contracts.ErrorAuthInvalid
+	case status == http.StatusForbidden:
+		return contracts.ErrorForbiddenCapability
+	case status == http.StatusTooManyRequests:
+		return contracts.ErrorRateLimitedKnown
+	case status >= http.StatusInternalServerError:
+		return contracts.ErrorUpstream5xx
+	default:
+		return contracts.ErrorForbiddenCapability
+	}
+}
+
+type availableModelsResponse struct {
+	Models map[string]struct {
+		QuotaInfo *struct {
+			RemainingFraction json.RawMessage `json:"remainingFraction"`
+			ResetTime         string          `json:"resetTime"`
+		} `json:"quotaInfo"`
+	} `json:"models"`
+}
+
+// ParseAvailableModelsQuota maps only the documented per-model fraction and
+// reset fields. Missing quotaInfo or missing remainingFraction stays unknown.
+func ParseAvailableModelsQuota(body []byte) (contracts.QuotaInfo, error) {
+	var response availableModelsResponse
+	if err := json.Unmarshal(body, &response); err != nil {
+		return contracts.QuotaInfo{}, fmt.Errorf("decode Antigravity quota: %w", err)
+	}
+	if response.Models == nil {
+		return contracts.QuotaInfo{}, nil
+	}
+	items := make([]contracts.QuotaItem, 0, len(response.Models))
+	for model, entry := range response.Models {
+		if entry.QuotaInfo == nil {
+			continue
+		}
+		fraction, ok := parseDecimal(entry.QuotaInfo.RemainingFraction)
+		if !ok {
+			continue
+		}
+		item := contracts.QuotaItem{Scope: "model", Model: model, Unit: "fraction", RemainingFraction: fraction}
+		if raw := strings.TrimSpace(entry.QuotaInfo.ResetTime); raw != "" {
+			reset, err := time.Parse(time.RFC3339, raw)
+			if err != nil {
+				return contracts.QuotaInfo{}, fmt.Errorf("decode Antigravity quota reset time: %w", err)
+			}
+			item.ResetAt = &reset
+		}
+		items = append(items, item)
+	}
+	if len(items) == 0 {
+		return contracts.QuotaInfo{}, nil
+	}
+	quota := contracts.QuotaInfo{Items: items}
+	if err := providerapi.ValidateQuotaInfo(quota); err != nil {
+		return contracts.QuotaInfo{}, err
+	}
+	return quota, nil
+}
+
+func parseDecimal(raw json.RawMessage) (*contracts.Decimal, bool) {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil, false
+	}
+	var value contracts.Decimal
+	if err := json.Unmarshal(raw, &value); err != nil || !value.Valid() {
+		return nil, false
+	}
+	return &value, true
 }

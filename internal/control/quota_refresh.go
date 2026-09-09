@@ -107,7 +107,8 @@ func (s QuotaService) Refresh(ctx context.Context, accountID string) (contracts.
 	if !ok {
 		return contracts.QuotaInfo{}, fmt.Errorf("%w: %s", ErrProviderMissing, stored.Provider)
 	}
-	quota, err := p.Quota(ctx, contracts.Credential{Kind: stored.CredentialKind, AccessToken: current.AccessToken, ExpiresAt: current.ExpiresAt})
+	quotaCredential := contracts.Credential{Kind: stored.CredentialKind, AccessToken: current.AccessToken, Proxy: stored.Proxy, Metadata: current.Metadata, ExpiresAt: current.ExpiresAt}
+	quota, err := p.Quota(ctx, quotaCredential)
 	if err != nil {
 		if failureErr := s.Repository.Fail(ctx, stored, provider.ErrorClass(err)); failureErr != nil {
 			return contracts.QuotaInfo{}, errors.Join(err, failureErr)

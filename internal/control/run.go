@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"time"
 
 	"github.com/elucid/gateway-platform/internal/control/provider/builtin"
@@ -16,24 +17,28 @@ import (
 )
 
 type Config struct {
-	RedisAddr     string
-	RedisUsername string
-	RedisPassword string
-	DatabaseURL   string
-	ConsumerID    string
-	MetricsAddr   string
-	CredentialKey string
+	RedisAddr               string
+	RedisUsername           string
+	RedisPassword           string
+	DatabaseURL             string
+	ConsumerID              string
+	MetricsAddr             string
+	CredentialKey           string
+	WrapperEnvelopeKey      string
+	WrapperAuthorizeTimeout time.Duration
 }
 
 func ConfigFromEnv() Config {
 	return Config{
-		RedisAddr:     getenv("GATEWAY_REDIS_ADDR", "127.0.0.1:6379"),
-		RedisUsername: os.Getenv("GATEWAY_REDIS_USERNAME"),
-		RedisPassword: os.Getenv("GATEWAY_REDIS_PASSWORD"),
-		DatabaseURL:   os.Getenv("GATEWAY_DATABASE_URL"),
-		ConsumerID:    getenv("GATEWAY_CONSUMER_ID", "control-1"),
-		MetricsAddr:   getenv("GATEWAY_METRICS_ADDR", ":9091"),
-		CredentialKey: os.Getenv("GATEWAY_CREDENTIAL_KEY"),
+		RedisAddr:               getenv("GATEWAY_REDIS_ADDR", "127.0.0.1:6379"),
+		RedisUsername:           os.Getenv("GATEWAY_REDIS_USERNAME"),
+		RedisPassword:           os.Getenv("GATEWAY_REDIS_PASSWORD"),
+		DatabaseURL:             os.Getenv("GATEWAY_DATABASE_URL"),
+		ConsumerID:              getenv("GATEWAY_CONSUMER_ID", "control-1"),
+		MetricsAddr:             getenv("GATEWAY_METRICS_ADDR", ":9091"),
+		CredentialKey:           os.Getenv("GATEWAY_CREDENTIAL_KEY"),
+		WrapperEnvelopeKey:      os.Getenv("GATEWAY_WRAPPER_ENVELOPE_KEY"),
+		WrapperAuthorizeTimeout: getenvSeconds("GATEWAY_WRAPPER_AUTHORIZE_TIMEOUT_SECONDS", 6*time.Minute),
 	}
 }
 
@@ -44,9 +49,20 @@ func getenv(key, fallback string) string {
 	return fallback
 }
 
+func getenvSeconds(key string, fallback time.Duration) time.Duration {
+	value, err := strconv.Atoi(os.Getenv(key))
+	if err != nil || value <= 0 {
+		return fallback
+	}
+	return time.Duration(value) * time.Second
+}
+
 func Run(cfg Config) error {
 	if cfg.DatabaseURL == "" {
 		return errors.New("GATEWAY_DATABASE_URL is required for control role")
+	}
+	if cfg.CredentialKey == "" {
+		return errors.New("GATEWAY_CREDENTIAL_KEY is required for control role")
 	}
 	if cfg.MetricsAddr == "" {
 		cfg.MetricsAddr = ":9091"
@@ -62,32 +78,28 @@ func Run(cfg Config) error {
 	defer rdb.Close()
 	ledger := Ledger{DB: db}
 	consumer := eventsConsumer(rdb, cfg.ConsumerID, ledger)
-	var refreshLoop *RefreshLoop
-	var refreshTicker *time.Ticker
-	var refreshC <-chan time.Time
-	var quotaLoop *QuotaLoop
-	var quotaReconciler *QuotaReconciler
-	var quotaTicker *time.Ticker
-	var quotaC <-chan time.Time
-	var quotaReconcileTicker *time.Ticker
-	var quotaReconcileC <-chan time.Time
-	if cfg.CredentialKey != "" {
-		refreshLoop, err = NewRefreshLoop(db, cfg.CredentialKey)
-		if err != nil {
-			return err
-		}
-		refreshTicker = time.NewTicker(time.Minute)
-		defer refreshTicker.Stop()
-		refreshC = refreshTicker.C
-		refreshLoop.QuotaService.Snapshot = RedisQuotaSnapshotPublisher{Redis: rdb}
-		quotaLoop = &QuotaLoop{Repository: refreshLoop.Repository, Service: refreshLoop.QuotaService}
-		quotaReconciler = &QuotaReconciler{Repository: refreshLoop.Repository, Snapshot: refreshLoop.QuotaService.Snapshot}
-		quotaTicker = time.NewTicker(5 * time.Minute)
-		defer quotaTicker.Stop()
-		quotaC = quotaTicker.C
-		quotaReconcileTicker = time.NewTicker(quotaReconcileInterval)
-		defer quotaReconcileTicker.Stop()
-		quotaReconcileC = quotaReconcileTicker.C
+	refreshLoop, err := NewRefreshLoop(db, cfg.CredentialKey)
+	if err != nil {
+		return err
+	}
+	refreshTicker := time.NewTicker(time.Minute)
+	defer refreshTicker.Stop()
+	refreshC := refreshTicker.C
+	refreshLoop.QuotaService.Snapshot = RedisQuotaSnapshotPublisher{Redis: rdb}
+	quotaLoop := &QuotaLoop{Repository: refreshLoop.Repository, Service: refreshLoop.QuotaService}
+	quotaReconciler := &QuotaReconciler{Repository: refreshLoop.Repository, Snapshot: refreshLoop.QuotaService.Snapshot}
+	quotaTicker := time.NewTicker(5 * time.Minute)
+	defer quotaTicker.Stop()
+	quotaC := quotaTicker.C
+	quotaReconcileTicker := time.NewTicker(quotaReconcileInterval)
+	defer quotaReconcileTicker.Stop()
+	quotaReconcileC := quotaReconcileTicker.C
+	snapshotLoop := &SnapshotLoop{Repository: PGSnapshotRepository{DB: db, Cipher: refreshLoop.Service.Cipher}, Redis: rdb}
+	snapshotTicker := time.NewTicker(snapshotRefreshInterval)
+	defer snapshotTicker.Stop()
+	snapshotC := snapshotTicker.C
+	if err := snapshotLoop.RunOnce(ctx); err != nil {
+		log.Printf("control initial snapshot publish failed: %v", err)
 	}
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
@@ -111,6 +123,10 @@ func Run(cfg Config) error {
 		case <-refreshC:
 			if err := refreshLoop.RunOnce(ctx); err != nil {
 				log.Printf("control credential refresh failed: %v", err)
+			}
+		case <-snapshotC:
+			if err := snapshotLoop.RunOnce(ctx); err != nil {
+				log.Printf("control snapshot publish failed: %v", err)
 			}
 		case <-quotaC:
 			if err := quotaLoop.RunOnce(ctx); err != nil {

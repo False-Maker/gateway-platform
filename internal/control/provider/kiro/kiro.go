@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 	"unicode"
@@ -19,11 +20,12 @@ const maxRefreshResponseBytes = 1 << 20
 
 type Provider struct {
 	Client *http.Client
+	HTTP   providerapi.HTTPClient
 	Config providerapi.EndpointProfile
 }
 
 func NewOAuth(client *http.Client) *Provider {
-	return &Provider{Client: client, Config: providerapi.KiroOAuthProfile()}
+	return &Provider{Client: client, HTTP: providerapi.HTTPClient{Client: client}, Config: providerapi.KiroOAuthProfile()}
 }
 
 func (p *Provider) Kind() string { return providerapi.KindKiro }
@@ -79,6 +81,10 @@ func (p *Provider) RefreshOAuth(ctx context.Context, current contracts.TokenBund
 	client := p.Client
 	if client == nil {
 		client = &http.Client{Timeout: 30 * time.Second}
+	}
+	client, err = (providerapi.HTTPClient{Client: client}).ClientForProxy(current.Metadata["proxy"])
+	if err != nil {
+		return contracts.TokenBundle{}, err
 	}
 	resp, err := client.Do(req)
 	if err != nil {
@@ -161,8 +167,139 @@ func cloneMetadata(source map[string]string) map[string]string {
 	return cloned
 }
 
-func (p *Provider) Quota(context.Context, contracts.Credential) (contracts.QuotaInfo, error) {
-	// getUsageLimits includes decimal precision fields that the stable integer
-	// quota contract cannot represent losslessly. Keep it missing for now.
-	return contracts.QuotaInfo{}, nil
+func (p *Provider) Quota(ctx context.Context, credential contracts.Credential) (contracts.QuotaInfo, error) {
+	profileARN := strings.TrimSpace(credential.Metadata["profile_arn"])
+	if profileARN == "" {
+		return contracts.QuotaInfo{}, nil
+	}
+	endpoint := strings.TrimRight(p.Config.APIBaseURL, "/") + "/getUsageLimits?origin=AI_EDITOR&profileArn=" + url.QueryEscape(profileARN) + "&resourceType=AGENTIC_REQUEST"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return contracts.QuotaInfo{}, err
+	}
+	req.Header.Set("Authorization", "Bearer "+credential.AccessToken)
+	req.Header.Set("Accept", "application/json")
+	client, err := p.HTTP.ClientForProxy(credential.Proxy)
+	if err != nil {
+		return contracts.QuotaInfo{}, err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return contracts.QuotaInfo{}, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxRefreshResponseBytes+1))
+	if err != nil {
+		return contracts.QuotaInfo{}, err
+	}
+	if len(body) > maxRefreshResponseBytes {
+		return contracts.QuotaInfo{}, fmt.Errorf("Kiro quota response exceeds %d bytes", maxRefreshResponseBytes)
+	}
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return contracts.QuotaInfo{}, &providerapi.HTTPError{Operation: "Kiro quota", StatusCode: resp.StatusCode, Class: quotaHTTPErrorClass(resp.StatusCode)}
+	}
+	return ParseUsageLimitsQuota(body)
+}
+
+func quotaHTTPErrorClass(status int) contracts.ErrorClass {
+	switch {
+	case status == http.StatusUnauthorized:
+		return contracts.ErrorAuthInvalid
+	case status == http.StatusForbidden:
+		return contracts.ErrorForbiddenCapability
+	case status == http.StatusTooManyRequests:
+		return contracts.ErrorRateLimitedKnown
+	case status >= http.StatusInternalServerError:
+		return contracts.ErrorUpstream5xx
+	default:
+		return contracts.ErrorForbiddenCapability
+	}
+}
+
+type usageLimitsResponse struct {
+	UsageBreakdownList []struct {
+		Type                string          `json:"type"`
+		CurrentUsage        json.RawMessage `json:"currentUsage"`
+		UsageLimit          json.RawMessage `json:"usageLimit"`
+		CurrentUsagePrecise json.RawMessage `json:"currentUsagePrecise"`
+		UsageLimitPrecise   json.RawMessage `json:"usageLimitPrecise"`
+		UsedPrecise         json.RawMessage `json:"usedPrecise"`
+		LimitPrecise        json.RawMessage `json:"limitPrecise"`
+		RemainingPrecise    json.RawMessage `json:"remainingPrecise"`
+		OverageRate         json.RawMessage `json:"overageRate"`
+		OverageCap          json.RawMessage `json:"overageCap"`
+		Overages            json.RawMessage `json:"overages"`
+		ResetDate           string          `json:"resetDate"`
+		DisplayName         string          `json:"displayName"`
+	} `json:"usageBreakdownList"`
+	NextDateReset int64 `json:"nextDateReset"`
+}
+
+// ParseUsageLimitsQuota maps the stable usage breakdown and preserves Kiro's
+// precise values. It rejects entries without a precise or integer limit so an
+// unknown response cannot become a fabricated zero quota.
+func ParseUsageLimitsQuota(body []byte) (contracts.QuotaInfo, error) {
+	var response usageLimitsResponse
+	if err := json.Unmarshal(body, &response); err != nil {
+		return contracts.QuotaInfo{}, fmt.Errorf("decode Kiro quota: %w", err)
+	}
+	if response.UsageBreakdownList == nil {
+		return contracts.QuotaInfo{}, nil
+	}
+	items := make([]contracts.QuotaItem, 0, len(response.UsageBreakdownList))
+	for _, entry := range response.UsageBreakdownList {
+		used, usedOK := parseDecimal(entry.CurrentUsagePrecise)
+		if !usedOK {
+			used, usedOK = parseDecimal(entry.UsedPrecise)
+		}
+		limit, limitOK := parseDecimal(entry.UsageLimitPrecise)
+		if !limitOK {
+			limit, limitOK = parseDecimal(entry.LimitPrecise)
+		}
+		remaining, remainingOK := parseDecimal(entry.RemainingPrecise)
+		if !usedOK && !limitOK && !remainingOK {
+			continue
+		}
+		item := contracts.QuotaItem{Scope: "account", Unit: "credit", Precision: &contracts.QuotaPrecision{}}
+		item.Precision.Used = used
+		item.Precision.Limit = limit
+		item.Precision.Remaining = remaining
+		item.Precision.OverageRate, _ = parseDecimal(entry.OverageRate)
+		item.Precision.OverageCap, _ = parseDecimal(entry.OverageCap)
+		item.Precision.Overages, _ = parseDecimal(entry.Overages)
+		if item.Precision.Remaining == nil && item.Precision.Used != nil && item.Precision.Limit != nil {
+			remaining, ok := item.Precision.Limit.Sub(*item.Precision.Used)
+			if !ok {
+				return contracts.QuotaInfo{}, fmt.Errorf("%w: Kiro precise usage is invalid", contracts.ErrInvalidContract)
+			}
+			item.Precision.Remaining = &remaining
+		}
+		if raw := strings.TrimSpace(entry.ResetDate); raw != "" {
+			reset, err := time.Parse(time.RFC3339, raw)
+			if err != nil {
+				return contracts.QuotaInfo{}, fmt.Errorf("decode Kiro quota reset time: %w", err)
+			}
+			item.ResetAt = &reset
+		}
+		items = append(items, item)
+	}
+	if len(items) == 0 {
+		return contracts.QuotaInfo{}, nil
+	}
+	quota := contracts.QuotaInfo{Items: items}
+	if err := providerapi.ValidateQuotaInfo(quota); err != nil {
+		return contracts.QuotaInfo{}, err
+	}
+	return quota, nil
+}
+
+func parseDecimal(raw json.RawMessage) (*contracts.Decimal, bool) {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil, false
+	}
+	var value contracts.Decimal
+	if err := json.Unmarshal(raw, &value); err != nil || !value.Valid() {
+		return nil, false
+	}
+	return &value, true
 }

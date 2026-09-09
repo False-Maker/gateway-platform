@@ -55,10 +55,13 @@ gateway 是纯执行器 —— 渠道的业务逻辑(client_id、refresh)全在 
 
 ## 4. 协议互转(protokit)+ usage 完整性(评审 F3)
 
+快照中的 quota 同时保留旧整数字段与严格十进制精度字段；gateway 只对明确为零/负数的
+`remaining`、`remaining_exact`、`remaining_fraction` 或 `precision.remaining` 做耗尽判断，缺失值不猜测。
+
 独立零依赖 Go module(仿 new-api 的 relaykit),放本仓库。
 - **P1 只实现一个方向**:OpenAI Chat Completions 非流式 JSON → 同形态 OpenAI-compatible 上游;保留 `model/messages` 中 P1 明确允许的字段,不接受客户端自带 `tenant/group/base_url`。
-- P1 `stream=true`、tool-call、thinking、multimodal 直接返回结构化 `unsupported_capability`,不得半转换后调用上游。
-- **当前本地切片**:OpenAI Chat、Anthropic Messages、OpenAI Responses 的非流式纯文本/标准 function tool 互转，以及 OpenAI Chat 入站到 Anthropic/Responses/Gemini 的纯文本 SSE 转换均有 fixture；非 OpenAI 入站的任意跨协议 streaming、多模态和真实 provider 协议仍 pending（详见 `docs/EVIDENCE.md`）。
+- P1 `thinking`、流式工具调用和流式图像事件直接返回结构化 `unsupported_capability`，不得半转换后调用上游；非流式标准 function tool 与图像块按当前协议切片转换。
+- **当前本地切片**:OpenAI Chat、Anthropic Messages、OpenAI Responses 的非流式文本/图像块/标准 function tool 互转；图像支持 OpenAI `image_url`、Anthropic base64/url image、Responses `input_image` 与 Gemini `inlineData/fileData`，可表示的 Anthropic/Gemini 与 Chat 图像响应也会保留。OpenAI Chat、Anthropic Messages、OpenAI Responses 入站在纯文本、无工具调用边界内均可跨协议转发到 Chat/Anthropic/Responses/Gemini 上游并生成入站协议 SSE，同协议原生事件继续透传。流式图像/工具事件、Responses 图像生成输出和真实 provider 协议仍 pending（详见 `docs/EVIDENCE.md`）。
 - **硬约束:usage 字段不得丢**——按 token 计费依赖它(总览 §6.2)。usage 解析是**契约级**要求,不是实现细节,直接照 sub2api 实战:
   - **强制注入**:OpenAI Chat Completions 向上游强注 `stream_options.include_usage=true`(`openai_gateway_chat_completions_raw.go:384-391`),否则流式不吐 usage。取**最后一个** usage chunk(上游可能重发)。
   - **协议原生解析**:Anthropic 从 `message_start`/`message_delta` 累加;OpenAI /responses 从终止事件(`response.completed` 等)取;Gemini 每 chunk `usageMetadata`(注意 `promptTokenCount` 含 cache 而 Claude `input_tokens` 不含,别重复计)。

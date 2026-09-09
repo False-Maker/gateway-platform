@@ -133,7 +133,7 @@ func (s *Server) HandleStreaming(ctx context.Context, tenantID, group string, re
 	if request.Model == "" {
 		return http.StatusBadRequest, errors.New("model is required")
 	}
-	if !request.Stream || containsUnsupportedMessageFields(request.Messages) {
+	if !request.Stream || containsUnsupportedMessageFields(request.Messages) || containsImageMessageFields(request.Messages) {
 		return http.StatusBadRequest, contracts.ErrUnsupportedCapability
 	}
 	if len(request.Tools) > 0 {
@@ -170,8 +170,20 @@ func validateStreamingProtocolBody(body []byte, protocol protokit.Protocol) erro
 	if err != nil {
 		return err
 	}
-	_, err = protokit.ConvertRequest(normalized, protocol, protokit.OpenAIChat)
-	return err
+	canonical, err := protokit.ConvertRequest(normalized, protocol, protokit.OpenAIChat)
+	if err != nil {
+		return err
+	}
+	var request struct {
+		Messages []map[string]any `json:"messages"`
+	}
+	if err := json.Unmarshal(canonical, &request); err != nil {
+		return err
+	}
+	if containsImageMessageFields(request.Messages) {
+		return fmt.Errorf("%w: image content is not supported for streaming", contracts.ErrUnsupportedCapability)
+	}
+	return nil
 }
 
 func streamingBodyHasTools(body []byte) bool {
@@ -195,7 +207,16 @@ func convertStreamingRequest(body []byte, from, to protokit.Protocol) ([]byte, e
 	if err != nil {
 		return nil, err
 	}
-	converted, err := protokit.ConvertRequest(normalized, from, to)
+	var converted []byte
+	if from != protokit.OpenAIChat && to != protokit.OpenAIChat {
+		canonical, convertErr := protokit.ConvertRequest(normalized, from, protokit.OpenAIChat)
+		if convertErr != nil {
+			return nil, convertErr
+		}
+		converted, err = protokit.ConvertRequest(canonical, protokit.OpenAIChat, to)
+	} else {
+		converted, err = protokit.ConvertRequest(normalized, from, to)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -205,6 +226,9 @@ func convertStreamingRequest(body []byte, from, to protokit.Protocol) ([]byte, e
 	}
 	if to != protokit.GeminiGenerate {
 		convertedObject["stream"] = true
+	}
+	if to == protokit.OpenAIChat {
+		convertedObject["stream_options"] = map[string]any{"include_usage": true}
 	}
 	return json.Marshal(convertedObject)
 }
@@ -242,9 +266,6 @@ func (s *Server) handleProtocolStreaming(ctx context.Context, tenantID, group st
 	upstreamProtocol, err := selectedProtocol(s.Provider, lease.Profile)
 	if err != nil {
 		return http.StatusBadGateway, err
-	}
-	if upstreamProtocol != inboundProtocol && inboundProtocol != protokit.OpenAIChat {
-		return http.StatusBadRequest, contracts.ErrUnsupportedCapability
 	}
 	if upstreamProtocol != inboundProtocol {
 		payload, err = convertStreamingRequest(payload, inboundProtocol, upstreamProtocol)
@@ -317,6 +338,10 @@ func (s *Server) handleProtocolStreaming(ctx context.Context, tenantID, group st
 	if client == nil {
 		client = http.DefaultClient
 	}
+	client, err = clientForProxy(client, lease.Profile.Proxy)
+	if err != nil {
+		return s.finishStreamingRelease(requestCtx, tenantID, requestID, attemptID, startedAt, lease, ChatCompletionRequest{Model: model}, 0, nil, false, true, err)
+	}
 	response, err := client.Do(upstreamRequest)
 	if err != nil {
 		return s.finishStreamingRelease(requestCtx, tenantID, requestID, attemptID, startedAt, lease, ChatCompletionRequest{Model: model}, 0, nil, false, true, err)
@@ -354,11 +379,17 @@ func (s *Server) handleProtocolStreaming(ctx context.Context, tenantID, group st
 		parsedUsage, partial, _, readErr = drainSSEProtocol(ctx, response.Body, dst, flusher, upstreamProtocol, inboundProtocol, model, s.Provider)
 	}
 	if readErr != nil {
-		releaseErr := s.writeStreamingRelease(requestCtx, tenantID, requestID, attemptID, startedAt, lease, ChatCompletionRequest{Model: model}, http.StatusOK, parsedUsage, partial, contracts.ErrorNetwork, readErr)
+		class := contracts.ErrorNetwork
+		resultErr := error(ErrNetwork)
+		if errors.Is(readErr, contracts.ErrUnsupportedCapability) {
+			class = contracts.ErrorForbiddenCapability
+			resultErr = readErr
+		}
+		releaseErr := s.writeStreamingRelease(requestCtx, tenantID, requestID, attemptID, startedAt, lease, ChatCompletionRequest{Model: model}, http.StatusOK, parsedUsage, partial, class, readErr)
 		if releaseErr != nil {
 			return http.StatusServiceUnavailable, releaseErr
 		}
-		return http.StatusOK, ErrNetwork
+		return http.StatusOK, resultErr
 	}
 	releaseErr := s.writeStreamingRelease(requestCtx, tenantID, requestID, attemptID, startedAt, lease, ChatCompletionRequest{Model: model}, http.StatusOK, parsedUsage, partial, contracts.ErrorOK, nil)
 	if releaseErr != nil {
@@ -393,6 +424,7 @@ const maxSSELineBytes = 1 << 20
 func drainSSEProtocol(ctx context.Context, body io.Reader, dst io.Writer, flusher http.Flusher, protocol, inboundProtocol protokit.Protocol, model, provider string) (*usage, bool, error, error) {
 	reader := bufio.NewReader(body)
 	var accumulator streamUsageAccumulator
+	converter := newProtocolSSEConverter(protocol, inboundProtocol, model)
 	clientConnected := true
 	done := false
 	var writeErr error
@@ -440,7 +472,11 @@ func drainSSEProtocol(ctx context.Context, body io.Reader, dst io.Writer, flushe
 				if protocol == inboundProtocol {
 					write([]byte(eventSSEBlock(eventType, eventData)))
 				} else if eventData != "" {
-					for _, block := range convertSSEBlock(protocol, inboundProtocol, eventType, eventData, model) {
+					blocks, convertErr := converter.convert(eventType, eventData)
+					if convertErr != nil {
+						return accumulator.value(), true, writeErr, convertErr
+					}
+					for _, block := range blocks {
 						write([]byte(block))
 					}
 				}
@@ -459,7 +495,11 @@ func drainSSEProtocol(ctx context.Context, body io.Reader, dst io.Writer, flushe
 		if protocol == inboundProtocol {
 			write([]byte(eventSSEBlock(eventType, eventData)))
 		} else {
-			for _, block := range convertSSEBlock(protocol, inboundProtocol, eventType, eventData, model) {
+			blocks, convertErr := converter.convert(eventType, eventData)
+			if convertErr != nil {
+				return accumulator.value(), true, writeErr, convertErr
+			}
+			for _, block := range blocks {
 				write([]byte(block))
 			}
 		}
@@ -478,6 +518,397 @@ func eventSSEBlock(eventType, data string) string {
 	builder.WriteString(data)
 	builder.WriteString("\n\n")
 	return builder.String()
+}
+
+type protocolSSEConverter struct {
+	source         protokit.Protocol
+	target         protokit.Protocol
+	model          string
+	usage          streamUsageAccumulator
+	started        bool
+	contentStarted bool
+	finished       bool
+	finishReason   string
+	text           strings.Builder
+	sequenceNumber int
+}
+
+func newProtocolSSEConverter(source, target protokit.Protocol, model string) *protocolSSEConverter {
+	return &protocolSSEConverter{source: source, target: target, model: model}
+}
+
+func (c *protocolSSEConverter) convert(eventType, data string) ([]string, error) {
+	if c.target != protokit.OpenAIChat && c.finished {
+		return nil, nil
+	}
+	text, finishReason, done, err := decodeProtocolStreamEvent(c.source, eventType, data)
+	if err != nil {
+		return nil, err
+	}
+	if c.target == protokit.OpenAIChat {
+		return convertSSEBlock(c.source, c.target, eventType, data, c.model), nil
+	}
+	c.usage.observe(c.source, data)
+	if finishReason != "" {
+		c.finishReason = finishReason
+	}
+	switch c.target {
+	case protokit.AnthropicMessages:
+		return c.convertToAnthropic(text, done), nil
+	case protokit.OpenAIResponses:
+		return c.convertToResponses(text, done), nil
+	default:
+		return nil, fmt.Errorf("%w: cannot encode streaming protocol %s", contracts.ErrUnsupportedCapability, c.target)
+	}
+}
+
+func decodeProtocolStreamEvent(protocol protokit.Protocol, eventType, data string) (string, string, bool, error) {
+	if protocol == protokit.OpenAIChat && data == "[DONE]" {
+		return "", "", true, nil
+	}
+	var envelope map[string]json.RawMessage
+	if json.Unmarshal([]byte(data), &envelope) != nil {
+		return "", "", false, fmt.Errorf("%w: invalid %s stream event", contracts.ErrUnsupportedCapability, protocol)
+	}
+	switch protocol {
+	case protokit.OpenAIChat:
+		var response struct {
+			Choices []struct {
+				Delta        map[string]json.RawMessage `json:"delta"`
+				FinishReason string                     `json:"finish_reason"`
+			} `json:"choices"`
+		}
+		if json.Unmarshal([]byte(data), &response) != nil {
+			return "", "", false, unsupportedStreamEvent(protocol, "invalid chunk")
+		}
+		if len(response.Choices) == 0 {
+			return "", "", false, nil
+		}
+		if len(response.Choices) != 1 {
+			return "", "", false, unsupportedStreamEvent(protocol, "multiple choices")
+		}
+		choice := response.Choices[0]
+		for field, raw := range choice.Delta {
+			trimmed := bytes.TrimSpace(raw)
+			if field != "role" && field != "content" && len(trimmed) != 0 &&
+				!bytes.Equal(trimmed, []byte("null")) && !bytes.Equal(trimmed, []byte("[]")) && !bytes.Equal(trimmed, []byte("{}")) {
+				return "", "", false, unsupportedStreamEvent(protocol, "delta."+field)
+			}
+		}
+		var text string
+		if raw := bytes.TrimSpace(choice.Delta["content"]); len(raw) > 0 && !bytes.Equal(raw, []byte("null")) {
+			if json.Unmarshal(raw, &text) != nil {
+				return "", "", false, unsupportedStreamEvent(protocol, "non-text content")
+			}
+		}
+		return text, canonicalStreamFinishReason(choice.FinishReason), false, nil
+	case protokit.AnthropicMessages:
+		var response struct {
+			Type         string `json:"type"`
+			ContentBlock struct {
+				Type string `json:"type"`
+			} `json:"content_block"`
+			Delta struct {
+				Type       string `json:"type"`
+				Text       string `json:"text"`
+				StopReason string `json:"stop_reason"`
+			} `json:"delta"`
+		}
+		if json.Unmarshal([]byte(data), &response) != nil {
+			return "", "", false, unsupportedStreamEvent(protocol, "invalid event")
+		}
+		typeValue := response.Type
+		if typeValue == "" {
+			typeValue = eventType
+		}
+		switch typeValue {
+		case "message_start", "content_block_stop", "message_delta", "ping":
+			return "", canonicalStreamFinishReason(response.Delta.StopReason), false, nil
+		case "content_block_start":
+			if response.ContentBlock.Type != "" && response.ContentBlock.Type != "text" {
+				return "", "", false, unsupportedStreamEvent(protocol, "content_block_start."+response.ContentBlock.Type)
+			}
+			return "", "", false, nil
+		case "content_block_delta":
+			if response.Delta.Type != "" && response.Delta.Type != "text_delta" {
+				return "", "", false, unsupportedStreamEvent(protocol, "content_block_delta."+response.Delta.Type)
+			}
+			return response.Delta.Text, "", false, nil
+		case "message_stop":
+			return "", "", true, nil
+		default:
+			return "", "", false, unsupportedStreamEvent(protocol, typeValue)
+		}
+	case protokit.OpenAIResponses:
+		var response struct {
+			Type  string `json:"type"`
+			Delta string `json:"delta"`
+			Item  struct {
+				Type string `json:"type"`
+			} `json:"item"`
+			Part struct {
+				Type string `json:"type"`
+			} `json:"part"`
+			Response struct {
+				Status            string `json:"status"`
+				IncompleteDetails *struct {
+					Reason string `json:"reason"`
+				} `json:"incomplete_details"`
+			} `json:"response"`
+		}
+		if json.Unmarshal([]byte(data), &response) != nil {
+			return "", "", false, unsupportedStreamEvent(protocol, "invalid event")
+		}
+		typeValue := response.Type
+		if typeValue == "" {
+			typeValue = eventType
+		}
+		switch typeValue {
+		case "response.output_text.delta":
+			return response.Delta, "", false, nil
+		case "response.created", "response.queued", "response.in_progress", "response.output_text.done", "response.output_item.done":
+			return "", "", false, nil
+		case "response.output_item.added":
+			if response.Item.Type != "" && response.Item.Type != "message" {
+				return "", "", false, unsupportedStreamEvent(protocol, "output_item."+response.Item.Type)
+			}
+			return "", "", false, nil
+		case "response.content_part.added", "response.content_part.done":
+			if response.Part.Type != "" && response.Part.Type != "output_text" {
+				return "", "", false, unsupportedStreamEvent(protocol, "content_part."+response.Part.Type)
+			}
+			return "", "", false, nil
+		case "response.completed", "response.done":
+			finishReason := "stop"
+			if response.Response.IncompleteDetails != nil {
+				finishReason = canonicalStreamFinishReason(response.Response.IncompleteDetails.Reason)
+			} else if response.Response.Status == "incomplete" {
+				finishReason = "length"
+			}
+			return "", finishReason, true, nil
+		default:
+			return "", "", false, unsupportedStreamEvent(protocol, typeValue)
+		}
+	case protokit.GeminiGenerate:
+		var response struct {
+			Candidates []struct {
+				Content struct {
+					Parts []map[string]json.RawMessage `json:"parts"`
+				} `json:"content"`
+				FinishReason string `json:"finishReason"`
+			} `json:"candidates"`
+			UsageMetadata json.RawMessage `json:"usageMetadata"`
+		}
+		if json.Unmarshal([]byte(data), &response) != nil {
+			return "", "", false, unsupportedStreamEvent(protocol, "invalid chunk")
+		}
+		if len(response.Candidates) == 0 {
+			if len(bytes.TrimSpace(response.UsageMetadata)) != 0 {
+				return "", "", false, nil
+			}
+			return "", "", false, unsupportedStreamEvent(protocol, "missing candidate")
+		}
+		if len(response.Candidates) != 1 {
+			return "", "", false, unsupportedStreamEvent(protocol, "multiple candidates")
+		}
+		candidate := response.Candidates[0]
+		var text strings.Builder
+		for _, part := range candidate.Content.Parts {
+			if len(part) != 1 {
+				return "", "", false, unsupportedStreamEvent(protocol, "non-text part")
+			}
+			raw, ok := part["text"]
+			if !ok {
+				return "", "", false, unsupportedStreamEvent(protocol, "non-text part")
+			}
+			var partText string
+			if json.Unmarshal(raw, &partText) != nil {
+				return "", "", false, unsupportedStreamEvent(protocol, "non-text part")
+			}
+			text.WriteString(partText)
+		}
+		finishReason := canonicalStreamFinishReason(candidate.FinishReason)
+		return text.String(), finishReason, finishReason != "", nil
+	}
+	return "", "", false, unsupportedStreamEvent(protocol, eventType)
+}
+
+func unsupportedStreamEvent(protocol protokit.Protocol, detail string) error {
+	return fmt.Errorf("%w: cannot convert %s stream event %q", contracts.ErrUnsupportedCapability, protocol, detail)
+}
+
+func canonicalStreamFinishReason(reason string) string {
+	switch strings.ToLower(strings.TrimSpace(reason)) {
+	case "":
+		return ""
+	case "length", "max_tokens", "max_output_tokens":
+		return "length"
+	default:
+		return "stop"
+	}
+}
+
+func (c *protocolSSEConverter) convertToAnthropic(text string, done bool) []string {
+	blocks := make([]string, 0, 4)
+	if text != "" || done {
+		blocks = append(blocks, c.startAnthropic()...)
+	}
+	if text != "" {
+		payload := map[string]any{
+			"type":  "content_block_delta",
+			"index": 0,
+			"delta": map[string]any{"type": "text_delta", "text": text},
+		}
+		blocks = append(blocks, eventSSEBlock("content_block_delta", string(mustJSON(payload))))
+	}
+	if !done {
+		return blocks
+	}
+	if c.contentStarted {
+		payload := map[string]any{"type": "content_block_stop", "index": 0}
+		blocks = append(blocks, eventSSEBlock("content_block_stop", string(mustJSON(payload))))
+	}
+	stopReason := "end_turn"
+	if c.finishReason == "length" {
+		stopReason = "max_tokens"
+	}
+	payload := map[string]any{
+		"type":  "message_delta",
+		"delta": map[string]any{"stop_reason": stopReason, "stop_sequence": nil},
+		"usage": anthropicStreamUsage(c.usage.value()),
+	}
+	blocks = append(blocks, eventSSEBlock("message_delta", string(mustJSON(payload))))
+	blocks = append(blocks, eventSSEBlock("message_stop", string(mustJSON(map[string]any{"type": "message_stop"}))))
+	c.finished = true
+	return blocks
+}
+
+func (c *protocolSSEConverter) startAnthropic() []string {
+	if c.started {
+		return nil
+	}
+	c.started = true
+	c.contentStarted = true
+	message := map[string]any{
+		"id": "msg_stream", "type": "message", "role": "assistant", "model": c.model,
+		"content": []any{}, "stop_reason": nil, "stop_sequence": nil,
+		"usage": anthropicStreamUsage(c.usage.value()),
+	}
+	start := map[string]any{"type": "message_start", "message": message}
+	content := map[string]any{
+		"type": "content_block_start", "index": 0,
+		"content_block": map[string]any{"type": "text", "text": ""},
+	}
+	return []string{
+		eventSSEBlock("message_start", string(mustJSON(start))),
+		eventSSEBlock("content_block_start", string(mustJSON(content))),
+	}
+}
+
+func anthropicStreamUsage(parsed *usage) map[string]any {
+	value := map[string]any{"input_tokens": 0, "output_tokens": 0}
+	if parsed == nil {
+		return value
+	}
+	value["input_tokens"] = parsed.Input
+	value["output_tokens"] = parsed.Output
+	if parsed.CacheRead != 0 {
+		value["cache_read_input_tokens"] = parsed.CacheRead
+	}
+	if parsed.CacheWrite != 0 {
+		value["cache_creation_input_tokens"] = parsed.CacheWrite
+	}
+	return value
+}
+
+func (c *protocolSSEConverter) convertToResponses(text string, done bool) []string {
+	blocks := make([]string, 0, 6)
+	if text != "" || done {
+		blocks = append(blocks, c.startResponses()...)
+	}
+	if text != "" {
+		c.text.WriteString(text)
+		blocks = append(blocks, c.responsesEvent("response.output_text.delta", map[string]any{
+			"item_id": "msg_stream", "output_index": 0, "content_index": 0, "delta": text,
+		}))
+	}
+	if !done {
+		return blocks
+	}
+	fullText := c.text.String()
+	part := map[string]any{"type": "output_text", "text": fullText, "annotations": []any{}}
+	item := map[string]any{
+		"id": "msg_stream", "type": "message", "status": "completed", "role": "assistant",
+		"content": []any{part},
+	}
+	blocks = append(blocks, c.responsesEvent("response.output_text.done", map[string]any{
+		"item_id": "msg_stream", "output_index": 0, "content_index": 0, "text": fullText,
+	}))
+	blocks = append(blocks, c.responsesEvent("response.content_part.done", map[string]any{
+		"item_id": "msg_stream", "output_index": 0, "content_index": 0, "part": part,
+	}))
+	blocks = append(blocks, c.responsesEvent("response.output_item.done", map[string]any{
+		"output_index": 0, "item": item,
+	}))
+	status := "completed"
+	response := map[string]any{
+		"id": "resp_stream", "object": "response", "status": status, "model": c.model,
+		"output": []any{item}, "usage": responsesStreamUsage(c.usage.value()),
+	}
+	if c.finishReason == "length" {
+		response["status"] = "incomplete"
+		response["incomplete_details"] = map[string]any{"reason": "max_output_tokens"}
+	}
+	blocks = append(blocks, c.responsesEvent("response.completed", map[string]any{"response": response}))
+	c.finished = true
+	return blocks
+}
+
+func (c *protocolSSEConverter) startResponses() []string {
+	if c.started {
+		return nil
+	}
+	c.started = true
+	response := map[string]any{
+		"id": "resp_stream", "object": "response", "status": "in_progress", "model": c.model,
+		"output": []any{},
+	}
+	item := map[string]any{
+		"id": "msg_stream", "type": "message", "status": "in_progress", "role": "assistant",
+		"content": []any{},
+	}
+	part := map[string]any{"type": "output_text", "text": "", "annotations": []any{}}
+	return []string{
+		c.responsesEvent("response.created", map[string]any{"response": response}),
+		c.responsesEvent("response.in_progress", map[string]any{"response": response}),
+		c.responsesEvent("response.output_item.added", map[string]any{"output_index": 0, "item": item}),
+		c.responsesEvent("response.content_part.added", map[string]any{"item_id": "msg_stream", "output_index": 0, "content_index": 0, "part": part}),
+	}
+}
+
+func (c *protocolSSEConverter) responsesEvent(eventType string, fields map[string]any) string {
+	payload := make(map[string]any, len(fields)+2)
+	for key, value := range fields {
+		payload[key] = value
+	}
+	payload["type"] = eventType
+	payload["sequence_number"] = c.sequenceNumber
+	c.sequenceNumber++
+	return eventSSEBlock(eventType, string(mustJSON(payload)))
+}
+
+func responsesStreamUsage(parsed *usage) map[string]any {
+	value := map[string]any{"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+	if parsed == nil {
+		return value
+	}
+	value["input_tokens"] = parsed.Input
+	value["output_tokens"] = parsed.Output
+	value["total_tokens"] = parsed.Input + parsed.Output
+	if parsed.CacheRead != 0 {
+		value["input_tokens_details"] = map[string]any{"cached_tokens": parsed.CacheRead}
+	}
+	return value
 }
 
 func convertSSEBlock(protocol, inboundProtocol protokit.Protocol, eventType, data, model string) []string {
@@ -866,7 +1297,32 @@ func containsUnsupportedMessageFields(messages []map[string]any) bool {
 			}
 		}
 		if content, exists := message["content"]; exists {
-			if _, isArray := content.([]any); isArray {
+			if parts, isArray := content.([]any); isArray {
+				for _, rawPart := range parts {
+					part, ok := rawPart.(map[string]any)
+					if !ok {
+						return true
+					}
+					partType, _ := part["type"].(string)
+					if partType != "text" && partType != "image_url" {
+						return true
+					}
+				}
+			}
+		}
+	}
+	return false
+}
+
+func containsImageMessageFields(messages []map[string]any) bool {
+	for _, message := range messages {
+		parts, ok := message["content"].([]any)
+		if !ok {
+			continue
+		}
+		for _, rawPart := range parts {
+			part, ok := rawPart.(map[string]any)
+			if ok && part["type"] == "image_url" {
 				return true
 			}
 		}
@@ -935,6 +1391,10 @@ func (s *Server) callUpstream(ctx context.Context, lease contracts.Lease, reques
 	if client == nil {
 		client = http.DefaultClient
 	}
+	client, err = clientForProxy(client, lease.Profile.Proxy)
+	if err != nil {
+		return nil, 0, nil, true, 0, err
+	}
 	response, err := client.Do(upstreamRequest)
 	if err != nil {
 		return nil, 0, nil, true, 0, err
@@ -965,6 +1425,30 @@ func (s *Server) callUpstream(ctx context.Context, lease contracts.Lease, reques
 
 func parseUsage(body []byte) *usage {
 	return parseUsageForProtocol(body, protokit.OpenAIChat)
+}
+
+func clientForProxy(base *http.Client, rawProxy string) (*http.Client, error) {
+	rawProxy = strings.TrimSpace(rawProxy)
+	if rawProxy == "" {
+		return base, nil
+	}
+	proxyURL, err := url.Parse(rawProxy)
+	if err != nil || (proxyURL.Scheme != "http" && proxyURL.Scheme != "https") || proxyURL.Host == "" {
+		return nil, fmt.Errorf("%w: invalid proxy URL", contracts.ErrInvalidContract)
+	}
+	client := *base
+	var transport *http.Transport
+	switch configured := base.Transport.(type) {
+	case nil:
+		transport = http.DefaultTransport.(*http.Transport).Clone()
+	case *http.Transport:
+		transport = configured.Clone()
+	default:
+		return nil, fmt.Errorf("%w: proxy requires an HTTP transport", contracts.ErrInvalidContract)
+	}
+	transport.Proxy = http.ProxyURL(proxyURL)
+	client.Transport = transport
+	return &client, nil
 }
 
 func parseUsageForProtocol(body []byte, protocol protokit.Protocol) *usage {

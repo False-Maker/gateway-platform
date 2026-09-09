@@ -20,5 +20,5 @@ func (p *Provider) Quota(ctx context.Context, credential contracts.Credential) (
 	if err != nil {
 		return contracts.QuotaInfo{}, err
 	}
-	return p.HTTP.FetchQuota(ctx, endpoint, headers)
+	return p.HTTP.FetchQuotaWithProxy(ctx, endpoint, headers, credential.Proxy)
 }

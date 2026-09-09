@@ -7,6 +7,266 @@
 > 阅读规则：本文的每一条都是**对已发生事实的描述**。不要从本文推断"项目是否可以继续开发"——
 > 那个问题由 `docs/TODO.md` 和 `AGENTS.md` §0 回答。
 
+## D1 PostgreSQL 与真实 Redis 集成复核（2026-09-07）
+
+本轮检查了现有 PostgreSQL、真实 Redis ACL 和进程级集成测试入口。环境中未配置
+`GATEWAY_TEST_DATABASE_URL` 或 `GATEWAY_TEST_REDIS_*`；PATH 中没有 `psql`、`redis-cli` 或
+`pg_isready`，也没有监听本地 PostgreSQL `5432` 或 Redis `6379` 的服务。Docker CLI 路径可见，
+但 `docker info`、`docker ps` 和 `docker context ls` 均因当前 WSL 发行版未启用 Docker Desktop
+WSL 集成而失败，无法启动临时测试容器。
+
+本轮实际执行并通过（可选外部服务用例按既有约定 skipped）：
+
+- `/home/elucid/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/bin/go test -count=1 -v ./internal/control ./internal/control/wrapper ./cmd/gwd -run 'Integration|Acceptance|ProcessE2E|QuotaReconcile|Ledger|Snapshot'`
+
+该命令中内存 quota、snapshot、ledger 和 control 回归通过；PG ledger/snapshot、真实 Redis ACL、
+导入到快照以及 control/gateway 进程级 PG 用例分别因 `GATEWAY_TEST_DATABASE_URL` 或真实 Redis
+环境未配置而严格 skipped。此前本轮 B3 完成后执行的全量
+`/home/elucid/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/bin/go test -count=1 ./...`
+也通过。
+
+本轮未连接 PostgreSQL 或 Redis，未执行任何生产写入、部署、真实 provider 请求或真实计费；本轮
+没有形成真实基础设施验收证据，skipped 结果未被表述为验收通过。
+
+## B3 Quota 精度契约（2026-09-06）
+
+本轮扩展 `contracts.QuotaInfo`：保留既有 `*int64` 字段以兼容旧快照，同时增加 JSON 数字形式的
+`Decimal`、`remaining_fraction`、`limit_exact`、`remaining_exact` 和 `precision` 字段。Decimal 以
+严格十进制字符串校验并原样序列化，不经过 `float64` 或整数截断；未知/缺失值不补零。gateway chooser
+只在明确的精确余量、fraction 或 precision remaining 为零/负数时排除账号，未知余量继续放行。
+
+Antigravity quota adapter 调用 `fetchAvailableModels`，只映射带 `quotaInfo.remainingFraction` 的模型项
+及 RFC3339 `resetTime`；Kiro quota adapter 调用 `getUsageLimits`，只映射带
+`currentUsagePrecise`/`usageLimitPrecise`/`remainingPrecise` 的 usage breakdown，并从 used/limit 精确
+相减得到 remaining。没有可靠字段的条目和未知 envelope 返回 `Items == nil`，不会变成耗尽额度。
+短期 credential snapshot 只携带 quota 所需的非秘密 metadata（Antigravity project、Kiro profile/machine/region），
+不把 client secret 放入 gateway 快照。
+
+本轮实际执行并通过：
+
+- `/home/elucid/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/bin/go test -count=1 ./pkg/contracts ./internal/control/provider/... ./internal/control ./internal/snapshot ./internal/gateway`
+- `/home/elucid/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/bin/go vet ./...`
+- `/home/elucid/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/bin/go build -o /tmp/gwd-b3 ./cmd/gwd`
+- `/home/elucid/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/bin/go test -race -count=1 ./pkg/contracts ./internal/control/... ./internal/gateway`
+- `git diff --check`
+
+针对性回归覆盖十进制精度/非法值、Antigravity/Kiro fixture 请求与 parser、missing、Redis snapshot round-trip
+以及 fraction/precision chooser 边界。真实 Antigravity/Kiro provider 请求、生产写入、部署和 live schema 对账未执行；
+后者按 C2/C5 留到项目结束真实验收。
+
+本轮提交尝试：`git add -A` 与 `git commit -m 'extend quota contracts for decimal provider precision'` 均因项目
+`.git` 挂载为只读而失败，Git 无法创建 `.git/index.lock`，返回 `Read-only file system`；工作区改动未回滚。
+
+## B1 非 OpenAI 入站跨协议 streaming（2026-09-06）
+
+本轮在纯文本、无工具调用边界内补齐 Anthropic Messages 与 OpenAI Responses 入站的跨协议
+streaming。请求先移除入站 `stream` 字段；目标协议不是 canonical Chat 时，经 Chat 请求模型组合
+转换，再按目标协议恢复流式标志。支持的上游协议为 OpenAI Chat、Anthropic Messages、OpenAI
+Responses 与 Gemini GenerateContent；转到 Chat 时强制 `stream_options.include_usage=true`，同协议
+SSE 仍逐块原样转发。
+
+跨协议回程现在按入站协议生成完整事件生命周期：Anthropic 输出
+`message_start`、文本块、`message_delta` 和 `message_stop`；Responses 输出 response/item/content
+创建、文本 delta/done 和 `response.completed`。`stop`、`max_tokens`/`max_output_tokens` 终态按协议
+映射；上游 input/output/cache usage 继续由独立累加器写入 terminal Release，客户端断开后的 drain
+语义未改。回归覆盖六种非 OpenAI 入站请求目标组合、Chat → Anthropic、Anthropic → Responses、
+Responses → Anthropic 和 Gemini → Responses 的事件与 usage 映射。
+
+本轮实际执行并通过：
+
+- `/home/elucid/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/bin/go test -count=1 ./internal/gateway`
+- `/home/elucid/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/bin/go test -count=1 ./pkg/protokit ./internal/gateway/...`
+- `/home/elucid/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/bin/go test -count=1 ./...`
+- `/home/elucid/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/bin/go vet ./...`
+- `/home/elucid/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/bin/go build -o /tmp/gwd-b1 ./cmd/gwd`
+- `/home/elucid/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/bin/go test -race -count=1 ./internal/gateway ./pkg/contracts ./internal/control/...`
+- `git diff --check`
+
+本轮限制仍是流式工具调用、多模态与未知内容事件不做跨协议转换；请求侧的工具和多模态继续在调用
+上游前拒绝，上游返回这些事件时终止转换，并以 `forbidden_capability`、`partial=true` 写 Release，
+避免静默丢内容。证据来自本地 `httptest`/miniredis fixture，不代表真实 provider 或各官方 SDK 已验收。
+本轮未设置可选 PostgreSQL、真实 Redis 或 live provider 环境变量；相应测试按约定 skipped。
+
+本轮提交尝试仍因项目 `.git` 只读失败：Git 无法创建 `.git/index.lock`，返回
+`Read-only file system`。B1 与此前未提交改动均保留在工作区，未产生 commit。
+
+## B2 非流式图像内容块（2026-09-06）
+
+本轮补齐 `pkg/protokit` 的非流式图像内容块转换。canonical Chat 保留 OpenAI
+`image_url` 的 data URL 与绝对 http(s) URL，并映射到 Anthropic `image` 的 base64/url source、
+Responses `input_image`、Gemini `inlineData`/`fileData`。响应方向保留 Anthropic 与 Gemini 的文本+图像
+块，并把 OpenAI Chat 可表示的图像内容转换回这两种协议；纯文本仍按原有字符串形态输出，混合内容才使用
+数组，避免旧客户端纯文本回归。
+
+边界校验覆盖：data URL 必须是非空标准 base64 且 MIME 为 `image/*`；远程地址必须是绝对
+`http(s)` URL；图像 `detail` 只接受 `auto/low/high`；`image_url: null`、非法 base64、音频 MIME、空
+Gemini 图像 part 均在调用上游前拒绝。
+gateway 非流式入口允许合法图像数组，流式入口仍返回 `unsupported_capability`，不会把图像事件塞进文本
+SSE。Responses 输出侧只接受标准 `output_text`；图像生成 call 没有稳定 MIME，继续按不可无损表示拒绝。
+
+本轮实际执行并通过：
+
+- `/home/elucid/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/bin/go test -count=1 -v ./pkg/protokit ./internal/gateway`
+- `/home/elucid/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/bin/go test -count=1 ./...`
+- `/home/elucid/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/bin/go vet ./...`
+- `/home/elucid/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/bin/go build -o /tmp/gwd-b2-20260906 ./cmd/gwd`
+- `/home/elucid/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/bin/go test -race -count=1 ./pkg/contracts ./pkg/protokit ./internal/gateway ./internal/control/...`
+- `git diff --check`
+
+回归覆盖 OpenAI Chat → Anthropic/Responses/Gemini 请求、Anthropic/Gemini → OpenAI Chat 响应、
+混合文本+图像 round-trip、非法 MIME/base64/空字段，以及 gateway 非流式放行与流式拒绝。证据来自本地
+Go fixture、httptest 和 miniredis，不代表真实 provider 或真实图像模型准入；本轮未执行生产写入、部署、
+真实 provider 请求或可选 PostgreSQL/Redis 环境测试。
+
+提交尝试因项目 `.git` 挂载为只读失败：Git 无法创建 `.git/index.lock`，返回 `Read-only file system`。
+本轮未产生 commit，工作区改动保持未暂存状态。
+
+## 审查修复：快照删除与账号代理（2026-09-06）
+
+本轮修复两项代码审查确认的问题。control 现在把已发布 bucket 的
+`platform + group` 身份保存在 Redis 注册表；当 PostgreSQL 中整个 bucket 消失时，下一轮先发布
+空快照，再清理 `snap:buckets` 与注册表记录，避免最后一条账号被物理删除后旧账号继续留在 active
+快照。回归覆盖账号列表清空、bucket 行消失、空快照版本推进和注册表清理。
+
+`accounts.proxy` 现在进入 `UpstreamProfile` 和短期 `Credential` 快照，并用于 gateway 的流式与
+非流式上游 HTTP client。control 的 OAuth authorization-code exchange、refresh、revoke、Codex/Claude
+quota，以及 Copilot/Antigravity/Kiro refresh 均使用账号代理；wrapper PKCE job 通过加密输入携带代理。
+代理只接受带 host 的 `http`/`https` URL，按请求复制 `http.Client`/`http.Transport`，不修改共享 client。
+
+本轮实际执行并通过：
+
+- `/home/elucid/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/bin/go test -count=1 ./internal/snapshot ./internal/control ./internal/control/provider/... ./internal/control/wrapper ./internal/gateway ./internal/migration/newapi ./cmd/gwd`
+- `/home/elucid/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/bin/go build -o /tmp/gwd-review-fix ./cmd/gwd`
+- `/home/elucid/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/bin/go vet ./...`
+- `/home/elucid/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/bin/go test -count=1 ./...`
+- `/home/elucid/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/bin/go test -race -count=1 ./pkg/contracts ./internal/control/...`
+- `/home/elucid/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/bin/go test -count=1 ./cmd/gwd ./internal/control/wrapper`
+- `git diff --check`
+
+本轮 `GATEWAY_TEST_DATABASE_URL`、`GATEWAY_TEST_REDIS_ADDR` 和
+`GATEWAY_RUN_LIVE_PROVIDER_TESTS` 均未设置，因此可选 PostgreSQL、真实 Redis ACL 和真实 provider
+测试按既有约定 skipped；没有执行生产写入、部署、切流或真实计费。最高剩余风险是账号代理尚未在
+真实 provider/企业代理环境验收，当前证据来自本地 HTTP proxy fixture；这不阻塞下一条 `[no-cred]`
+任务。
+
+提交尝试因项目 `.git` 挂载为只读失败：Git 无法创建 `.git/index.lock`，返回
+`Read-only file system`。本轮未产生 commit，工作区改动保持未暂存状态。
+
+## A5 new-api 迁移（2026-09-04）
+
+本轮新增 `cmd/new-api-migrate` 与 `internal/migration/newapi`。命令默认只读读取
+PostgreSQL `information_schema` 和 `channels/users/tokens/quota_data/groups`，按已核实的
+new-api channel type 分别转换 Codex OAuth、Claude/Gemini/Grok API key；多 key、多 group
+展开为独立账号。`setting.proxy`、model mapping、能力、状态和 Codex OAuth token bundle
+字段保留；未知 provider/status/凭据进入 `rejected`，不会猜测。users/tokens/quota/groups
+进入已有 `migration_records` staging，token 只存 SHA-256，quota/balance 只保留源单位和原始
+字符串；`contracts.QuotaInfo` 不补零。目标 apply 使用现有 AES-GCM credential cipher，accounts、
+credentials、staging records 和 `migration_runs` 在单个事务内写入，source transaction 使用
+PostgreSQL `READ ONLY`。
+
+本轮实际执行并通过：
+
+- `/home/elucid/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/bin/go test -count=1 ./internal/migration/newapi ./cmd/new-api-migrate`：provider 分流、多 key/group、per-key status、proxy、unknown/rejected、model manual review、重复 key、token 脱敏和 CLI 配置保护通过。
+- `/home/elucid/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/bin/go build ./cmd/new-api-migrate`：通过；生成的二进制已移至 `/tmp/new-api-migrate-a5-build-20260904`。
+- `/home/elucid/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/bin/go build ./cmd/gwd`：通过；生成的二进制已移至 `/tmp/gwd-a5-build-20260904`，未留在仓库根目录。
+- `/home/elucid/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/bin/go vet ./...`：通过。
+- `/home/elucid/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/bin/go test -count=1 ./...`：全部通过。
+- `/home/elucid/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/bin/go test -race -count=1 ./pkg/contracts ./internal/control/...`：全部通过。
+
+安全边界验证：`/home/elucid/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/bin/go run ./cmd/new-api-migrate` 在无
+`GATEWAY_NEW_API_DATABASE_URL` 时按设计拒绝并提示 source database URL required，退出码为 1，
+未建立连接或写入。
+
+本轮没有设置 `GATEWAY_NEW_API_DATABASE_URL` 或 `GATEWAY_TEST_DATABASE_URL`，因此没有执行真实
+new-api PostgreSQL schema 查询，也没有执行 target `--apply`。没有执行生产写入、部署或真实
+provider 请求；缺少 provider 账号不是本轮阻塞。真实 PG 运行时仍需先应用现有
+`migrations/001_initial.sql`，并由运维提供只读 source DSN、独立 target DSN 与 32-byte base64
+credential key。
+
+本轮最高剩余风险是不同部署的 new-api PostgreSQL schema 可能存在未覆盖的列类型或自定义表名；
+实现会把可选列/表缺失记录为 warning，必需 channels 列缺失则停止，不能替代一次实际 source
+database dry-run。provider 服务端行为与 quota schema 仍按 §C live-gate 保持未验证。
+
+## A1 快照发布回路（2026-09-03）
+
+本轮实现了 control 从 PostgreSQL 读取 active 账号、解密 credential、解析 profile/limits/quota/capabilities，按 `platform + group` 经既有 Redis `snapshot.Publisher` 发布；control 启动时执行一次，之后每分钟执行一次。发布前读取 Redis bucket epoch，仍由既有 Lua publisher 执行 expected-epoch CAS。账号变更与 quota 发布衔接均使用 miniredis 回归覆盖。
+
+本轮实际执行并通过：
+
+- `/home/elucid/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/bin/go test -count=1 ./internal/control ./internal/snapshot`
+- `/home/elucid/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/bin/go test -count=1 -v ./internal/control -run 'TestSnapshotLoop|TestPGSnapshotRepository'`：快照首次发布、账号增删、最终账号删除后的空快照、quota 发布衔接通过；PG 测试因 `GATEWAY_TEST_DATABASE_URL` 未设置而严格 skipped。
+- `/home/elucid/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/bin/go build ./cmd/gwd`：通过；随后删除本次生成的根目录 `gwd` 二进制。
+- `/home/elucid/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/bin/go vet ./...`：通过。
+- `/home/elucid/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/bin/go test -count=1 ./...`：全部通过。
+- `/home/elucid/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/bin/go test -race -count=1 ./pkg/contracts ./internal/control/...`：全部通过。
+
+本轮未配置 PostgreSQL，因此 PG SQL 查询与真实数据库连接未在本轮执行；未执行真实 provider、生产写入或部署。miniredis 与内存 repository 证据不等同于真实 Redis/PostgreSQL 验收。
+
+提交尝试：`git add docs/TODO.md docs/EVIDENCE.md internal/control/run.go internal/control/snapshot_loop.go internal/control/snapshot_loop_test.go internal/control/snapshot_loop_integration_test.go` 因项目 `.git` 独立挂载为只读（`Read-only file system`，无法创建 `.git/index.lock`）失败；本轮未产生 commit。
+
+## A2 导入入口（2026-09-03）
+
+本轮新增 `gwd import --file=... [--dry-run]` CLI。JSON 文件直接解码为既有 `contracts.ImportRequest`，调用既有 `ImportService`、`PGImportRepository` 和 AES-GCM `credentials.Cipher`；dry-run 不连接或写入 PostgreSQL。CLI 只输出账号摘要（ID、provider、bucket、credential kind/version、fence epoch、dry-run 状态），不输出 access token、refresh token 或 static key。
+
+本轮实际执行并通过：
+
+- `/home/elucid/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/bin/go test -count=1 -v ./cmd/gwd -run 'TestRunImportCommand|TestImportCommandPublishesSnapshot'`：dry-run provider import 与凭据脱敏通过；PG + miniredis 导入→密文→快照→gateway chooser 测试因 `GATEWAY_TEST_DATABASE_URL` 未设置而严格 skipped。
+- `/home/elucid/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/bin/go run ./cmd/gwd import --file=/tmp/gwd-a2-import.json --dry-run`：手工 dry-run 通过，输出为账号摘要且不含 static key。
+- `/home/elucid/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/bin/go build ./cmd/gwd`：通过；随后删除本次生成的根目录 `gwd` 二进制。
+- `/home/elucid/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/bin/go vet ./...`：通过。
+- `/home/elucid/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/bin/go test -count=1 ./...`：全部通过。
+- `/home/elucid/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/bin/go test -race -count=1 ./pkg/contracts ./internal/control/...`：全部通过。
+
+本轮未执行真实 PostgreSQL CLI 导入；未执行真实 provider 请求或生产写入。dry-run 只证明 CLI 到既有 `ImportService` 的本地调用路径，不能替代 PG 集成证据。
+
+提交尝试：`git add cmd/gwd/main.go cmd/gwd/main_test.go cmd/gwd/import_integration_test.go docs/TODO.md docs/EVIDENCE.md` 因项目 `.git` 独立挂载为只读（`Read-only file system`，无法创建 `.git/index.lock`）失败；本轮未产生 commit。
+
+## A3 OAuth wrapper 派单与 PKCE executor（2026-09-04）
+
+本轮把 `gwd import` 的 `auth_mode=pkce` 接到既有 wrapper Redis Stream：control 使用独立的 `GATEWAY_WRAPPER_ENVELOPE_KEY` 加密 job，等待 terminal 后解密 `TokenBundle`，再交给既有 `ImportService`。wrapper 生产入口默认使用 Codex PKCE executor，按 provider + operation 分发；`FixtureExecutor` 不再是隐式 fallback，只能通过 `GATEWAY_WRAPPER_EXECUTOR=fixture` 显式选择。PKCE executor 使用 64 字节随机 verifier、S256 challenge、32 字节随机 state 和 `localhost` 临时回调，校验 method/state/code，复用既有 provider HTTP client 交换授权码，并将失败归为稳定的 code/retryable 结果。默认 callback 预算为 5 分钟、lease 为 10 分钟，启动时拒绝 callback + exchange 预算不短于 lease 的配置。
+
+公共协议参数通过 OpenAI 官方 Codex 仓库当前源码核对：`codex-rs/login/src/pkce.rs` 与 `codex-rs/login/src/server.rs`。实际执行 `curl -fsSL https://raw.githubusercontent.com/openai/codex/main/codex-rs/login/src/pkce.rs` 和 `curl -fsSL https://raw.githubusercontent.com/openai/codex/main/codex-rs/login/src/server.rs`，只读取公开源码，确认 verifier/challenge 算法、`http://localhost:<port>/auth/callback`、scope、state、`S256` 和标准 token form；未访问 OAuth authorize/token 服务，也未使用真实账号。
+
+本轮实际执行并通过：
+
+- 绝对路径 `gofmt -w`：A3 Go 文件格式化通过。首次直接执行裸 `gofmt` 因当前 `PATH` 中无该命令失败，随后使用项目指定 Go toolchain 的 `gofmt` 成功。
+- `go test -count=1 -v ./internal/control/wrapper ./cmd/gwd ./internal/control`：Codex PKCE 本地 HTTP fixture、错误 state 拒绝、成功 callback/token exchange、拒绝授权分类、unsupported dispatch、worker failure 分类、CLI enqueue/terminal/import dry-run 全部通过；可选 PostgreSQL 与真实 Redis 测试因环境变量未配置按设计 skipped。
+- `go test -race -count=1 ./internal/control/wrapper ./cmd/gwd`：通过。
+- `go build ./cmd/gwd`：通过。
+- `go vet ./...`：通过。
+- `go test -count=1 ./...`：21 个包全部通过。
+- `go test -race -count=1 ./pkg/contracts ./internal/control/...`：全部通过。
+- `git diff --check`：通过。
+
+`go build` 生成的仓库根目录 `gwd` 已确认是本轮产物。直接 `rm -f` 被执行环境安全策略拒绝，随后将其移动到可恢复路径 `/tmp/gwd-a3-build-20260904`；仓库未残留该二进制。
+
+本轮未执行真实 Codex OAuth、未使用默认 `xdg-open`/系统浏览器完成登录、未连接 PostgreSQL 或真实 Redis，也未执行生产写入、部署或切流。本地 miniredis + httptest 证据只覆盖 job 派发、密文 envelope、PKCE 参数/回调、fixture token exchange 和错误分类。用户明确要求跳过当前 git 问题继续后续任务；项目 `.git` 仍为只读挂载，本轮未尝试 commit，也未产生 commit。
+
+## A4 control→gateway 进程级端到端回路（2026-09-04）
+
+新增 `cmd/gwd/process_e2e_test.go`。测试在可选 PostgreSQL 上执行真实导入和 SQL profile 配置，
+启动独立 `gwd --role=control` 与 `gwd --role=gateway` 进程，共用 miniredis；本地
+httptest provider 校验请求路径、Bearer fixture key 和 model，返回带 usage 的 OpenAI Chat
+响应。测试随后轮询 PostgreSQL，断言对应 `request_attempts` 只有一条且为 `terminal`，
+`usage_ledger` 只有一条且 `status_code=200`、`error_class=ok`、`tokens_in=3`、
+`tokens_out=5`、`usage_source=upstream`、`partial=false`；再向 Redis Stream 注入相同
+Release 事件，确认 control 消费后 ledger/attempt 仍各一条，且上游只收到一次请求。
+
+本轮实际执行并通过：
+
+- `/home/elucid/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/bin/go test ./cmd/gwd`：A4 测试编译通过；PG 用例因环境未配置而 skip。
+- `/home/elucid/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/bin/go test -count=1 -v ./cmd/gwd -run '^TestProcessE2EControlGatewayRelease$'`：严格 skip（`GATEWAY_TEST_DATABASE_URL` 未设置），命令退出码 0。
+- `/home/elucid/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/bin/go build ./cmd/gwd`：通过；生成的临时二进制已移至 `/tmp/gwd-a4-build-20260904`，仓库未残留构建产物。
+- `/home/elucid/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/bin/go vet ./...`：通过。
+- `/home/elucid/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/bin/go test -count=1 ./...`：全部通过。
+- `/home/elucid/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/bin/go test -race -count=1 ./pkg/contracts ./internal/control/...`：全部通过。
+- `git diff --check`：通过。
+
+本轮未配置 PostgreSQL，因此 control/gateway 子进程、真实 SQL ledger 写入和 A4 的真实进程
+断言未在本轮执行；也未执行真实 provider、生产写入、部署或切流。A4 代码路径已由编译、
+静态检查和默认无凭据保护验证，但最高剩余风险是尚未在本地 PostgreSQL 上复现一次完整
+进程回路。项目 `.git` 仍为只读挂载，按用户要求跳过提交问题，本轮未产生 commit。
+
 ## 独立审核轮（2026-09-03，仅工程基线与文档，未改动代码）
 
 本轮不写业务代码，只处理版本控制缺失和文档结构问题。已执行并确认：

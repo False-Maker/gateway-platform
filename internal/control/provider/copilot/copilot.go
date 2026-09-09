@@ -71,6 +71,10 @@ func (p *Provider) RefreshOAuth(ctx context.Context, current contracts.TokenBund
 	if client == nil {
 		client = &http.Client{Timeout: 30 * time.Second}
 	}
+	client, err = (providerapi.HTTPClient{Client: client}).ClientForProxy(current.Metadata["proxy"])
+	if err != nil {
+		return contracts.TokenBundle{}, err
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		return contracts.TokenBundle{}, err

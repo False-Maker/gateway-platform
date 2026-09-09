@@ -26,6 +26,7 @@ type StoredCredential struct {
 	Provider        string
 	Platform        string
 	Group           string
+	Proxy           string
 	CredentialKind  string
 	FenceEpoch      int64
 	EncryptedSecret []byte
@@ -58,7 +59,7 @@ func (r PGCredentialRepository) Acquire(ctx context.Context, accountID string) (
 	}
 	var stored StoredCredential
 	stored.AccountID, stored.FenceEpoch = accountID, epoch
-	err = r.DB.QueryRow(ctx, `SELECT a.provider,a.platform,a."group",c.kind,c.encrypted_secret FROM accounts a JOIN credentials c ON c.account_id=a.id WHERE a.id=$1 AND a.fence_epoch=$2`, accountID, epoch).Scan(&stored.Provider, &stored.Platform, &stored.Group, &stored.CredentialKind, &stored.EncryptedSecret)
+	err = r.DB.QueryRow(ctx, `SELECT a.provider,a.platform,a."group",a.proxy,c.kind,c.encrypted_secret FROM accounts a JOIN credentials c ON c.account_id=a.id WHERE a.id=$1 AND a.fence_epoch=$2`, accountID, epoch).Scan(&stored.Provider, &stored.Platform, &stored.Group, &stored.Proxy, &stored.CredentialKind, &stored.EncryptedSecret)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return StoredCredential{}, ErrFenceLost
 	}
@@ -124,6 +125,14 @@ func (s RefreshService) Refresh(ctx context.Context, accountID string) (contract
 	var current contracts.TokenBundle
 	if err := json.Unmarshal(plaintext, &current); err != nil {
 		return contracts.TokenBundle{}, errors.New("decode encrypted credential: invalid token bundle")
+	}
+	if stored.Proxy != "" {
+		if current.Metadata == nil {
+			current.Metadata = make(map[string]string)
+		}
+		if current.Metadata["proxy"] == "" {
+			current.Metadata["proxy"] = stored.Proxy
+		}
 	}
 	var p provider.Provider
 	var ok bool

@@ -50,7 +50,7 @@ func (r PGImportRepository) Save(ctx context.Context, record ImportRecord) (stri
 	defer tx.Rollback(ctx)
 	var accountID string
 	var epoch int64
-	err = tx.QueryRow(ctx, `INSERT INTO accounts (id,provider,platform,"group",source_system,source_id,status,base_url,profile,limits) VALUES ($1,$2,$3,$4,$5,$6,'active',$7,$8,$9) ON CONFLICT (source_system,source_id) DO UPDATE SET provider=EXCLUDED.provider,platform=EXCLUDED.platform,"group"=EXCLUDED."group",status='active',base_url=EXCLUDED.base_url,profile=EXCLUDED.profile,limits=EXCLUDED.limits,fence_epoch=accounts.fence_epoch+1,updated_at=now() RETURNING id,fence_epoch`, record.Account.ID, record.Account.Provider, record.Account.Platform, record.Account.Group, record.Request.SourceSystem, record.Request.SourceID, record.Account.Profile.BaseURL, string(profile), string(limits)).Scan(&accountID, &epoch)
+	err = tx.QueryRow(ctx, `INSERT INTO accounts (id,provider,platform,"group",source_system,source_id,status,base_url,proxy,profile,limits) VALUES ($1,$2,$3,$4,$5,$6,'active',$7,$8,$9,$10) ON CONFLICT (source_system,source_id) DO UPDATE SET provider=EXCLUDED.provider,platform=EXCLUDED.platform,"group"=EXCLUDED."group",status='active',base_url=EXCLUDED.base_url,proxy=EXCLUDED.proxy,profile=EXCLUDED.profile,limits=EXCLUDED.limits,fence_epoch=accounts.fence_epoch+1,updated_at=now() RETURNING id,fence_epoch`, record.Account.ID, record.Account.Provider, record.Account.Platform, record.Account.Group, record.Request.SourceSystem, record.Request.SourceID, record.Account.Profile.BaseURL, record.Account.Profile.Proxy, string(profile), string(limits)).Scan(&accountID, &epoch)
 	if err != nil {
 		return "", 0, 0, err
 	}
@@ -162,6 +162,9 @@ func (s ImportService) Import(ctx context.Context, req contracts.ImportRequest) 
 		if err != nil {
 			return contracts.Account{}, err
 		}
+	}
+	if proxy := strings.TrimSpace(req.Metadata["proxy"]); proxy != "" {
+		account.Profile.Proxy = proxy
 	}
 	if req.DryRun {
 		return account, nil

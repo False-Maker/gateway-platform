@@ -192,6 +192,7 @@ func startWrapperProcess(t *testing.T, binary string, cfg processRedisConfig, wo
 		"GATEWAY_WRAPPER_WORKER_ID="+workerID,
 		"GATEWAY_WRAPPER_LEASE_TTL_SECONDS="+itoa(leaseTTL),
 		"GATEWAY_WRAPPER_POLL_INTERVAL_MS=10",
+		"GATEWAY_WRAPPER_EXECUTOR=fixture",
 		"GATEWAY_WRAPPER_FIXTURE_DELAY_MS="+itoa(fixtureDelayMS),
 	)
 	if err := cmd.Start(); err != nil {

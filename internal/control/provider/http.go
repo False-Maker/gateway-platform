@@ -52,6 +52,10 @@ type tokenResponse struct {
 }
 
 func (c HTTPClient) ExchangeCode(ctx context.Context, profile EndpointProfile, code, verifier, redirectURI, state string) (contracts.TokenBundle, error) {
+	return c.ExchangeCodeWithProxy(ctx, profile, code, verifier, redirectURI, state, "")
+}
+
+func (c HTTPClient) ExchangeCodeWithProxy(ctx context.Context, profile EndpointProfile, code, verifier, redirectURI, state, proxy string) (contracts.TokenBundle, error) {
 	if err := validateOAuthRequest(profile, code, verifier, redirectURI); err != nil {
 		return contracts.TokenBundle{}, err
 	}
@@ -87,7 +91,11 @@ func (c HTTPClient) ExchangeCode(ctx context.Context, profile EndpointProfile, c
 	if err != nil {
 		return contracts.TokenBundle{}, err
 	}
-	return c.doTokenRequest(ctx, profile, contentType, body, contracts.TokenBundle{})
+	fallback := contracts.TokenBundle{}
+	if strings.TrimSpace(proxy) != "" {
+		fallback.Metadata = map[string]string{"proxy": proxy}
+	}
+	return c.doTokenRequest(ctx, profile, contentType, body, fallback)
 }
 
 func (c HTTPClient) Refresh(ctx context.Context, profile EndpointProfile, current contracts.TokenBundle) (contracts.TokenBundle, error) {
@@ -160,6 +168,10 @@ func (c HTTPClient) Inference(ctx context.Context, profile EndpointProfile, acce
 }
 
 func (c HTTPClient) Revoke(ctx context.Context, profile EndpointProfile, token, tokenType string) error {
+	return c.RevokeWithProxy(ctx, profile, token, tokenType, "")
+}
+
+func (c HTTPClient) RevokeWithProxy(ctx context.Context, profile EndpointProfile, token, tokenType, proxy string) error {
 	if err := profile.Validate(); err != nil {
 		return err
 	}
@@ -185,7 +197,11 @@ func (c HTTPClient) Revoke(ctx context.Context, profile EndpointProfile, token, 
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := c.httpClient().Do(req)
+	client, err := c.clientForProxy(map[string]string{"proxy": proxy})
+	if err != nil {
+		return err
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return err
 	}
@@ -210,7 +226,11 @@ func (c HTTPClient) doTokenRequest(ctx context.Context, profile EndpointProfile,
 	}
 	req.Header.Set("Content-Type", contentType)
 	req.Header.Set("Accept", "application/json")
-	resp, err := c.httpClient().Do(req)
+	client, err := c.clientForProxy(fallback.Metadata)
+	if err != nil {
+		return contracts.TokenBundle{}, err
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return contracts.TokenBundle{}, err
 	}
@@ -246,6 +266,12 @@ func (c HTTPClient) doTokenRequest(ctx context.Context, profile EndpointProfile,
 		AccountID:    fallback.AccountID,
 		Email:        fallback.Email,
 	}
+	if len(fallback.Metadata) > 0 {
+		bundle.Metadata = make(map[string]string, len(fallback.Metadata))
+		for key, value := range fallback.Metadata {
+			bundle.Metadata[key] = value
+		}
+	}
 	if token.Scope == "" {
 		bundle.Scopes = append([]string(nil), fallback.Scopes...)
 	} else {
@@ -264,6 +290,39 @@ func (c HTTPClient) httpClient() *http.Client {
 		return c.Client
 	}
 	return defaultHTTPClient
+}
+
+func (c HTTPClient) clientForProxy(metadata map[string]string) (*http.Client, error) {
+	proxy := strings.TrimSpace(metadata["proxy"])
+	if proxy == "" {
+		proxy = strings.TrimSpace(metadata["source_proxy"])
+	}
+	if proxy == "" {
+		return c.httpClient(), nil
+	}
+	proxyURL, err := url.Parse(proxy)
+	if err != nil || (proxyURL.Scheme != "http" && proxyURL.Scheme != "https") || proxyURL.Host == "" {
+		return nil, fmt.Errorf("%w: invalid proxy URL", contracts.ErrInvalidContract)
+	}
+	client := *c.httpClient()
+	var transport *http.Transport
+	switch configured := client.Transport.(type) {
+	case nil:
+		transport = http.DefaultTransport.(*http.Transport).Clone()
+	case *http.Transport:
+		transport = configured.Clone()
+	default:
+		return nil, fmt.Errorf("%w: proxy requires an HTTP transport", contracts.ErrInvalidContract)
+	}
+	transport.Proxy = http.ProxyURL(proxyURL)
+	client.Transport = transport
+	return &client, nil
+}
+
+// ClientForProxy returns a shallow client copy with an account-specific HTTP
+// proxy while leaving the provider's shared client unchanged.
+func (c HTTPClient) ClientForProxy(proxy string) (*http.Client, error) {
+	return c.clientForProxy(map[string]string{"proxy": proxy})
 }
 
 func (c HTTPClient) now() time.Time {

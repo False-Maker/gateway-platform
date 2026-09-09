@@ -18,6 +18,10 @@ const maxQuotaResponseBytes = 1 << 20
 // the stable QuotaInfo contract. Real provider response shapes are deliberately
 // not inferred here; each provider enables this endpoint only when verified.
 func (c HTTPClient) FetchQuota(ctx context.Context, endpoint string, headers http.Header) (contracts.QuotaInfo, error) {
+	return c.FetchQuotaWithProxy(ctx, endpoint, headers, "")
+}
+
+func (c HTTPClient) FetchQuotaWithProxy(ctx context.Context, endpoint string, headers http.Header, proxy string) (contracts.QuotaInfo, error) {
 	if strings.TrimSpace(endpoint) == "" {
 		return contracts.QuotaInfo{}, fmt.Errorf("%w: quota endpoint is empty", contracts.ErrInvalidContract)
 	}
@@ -31,7 +35,11 @@ func (c HTTPClient) FetchQuota(ctx context.Context, endpoint string, headers htt
 		}
 	}
 	req.Header.Set("Accept", "application/json")
-	resp, err := c.httpClient().Do(req)
+	client, err := c.clientForProxy(map[string]string{"proxy": proxy})
+	if err != nil {
+		return contracts.QuotaInfo{}, err
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return contracts.QuotaInfo{}, err
 	}
@@ -83,7 +91,7 @@ func validateQuotaInfo(quota contracts.QuotaInfo) error {
 			return fmt.Errorf("%w: quota item %d account scope has model", contracts.ErrInvalidContract, i)
 		}
 		switch item.Unit {
-		case "token", "request", "credit":
+		case "token", "request", "credit", "fraction":
 		default:
 			return fmt.Errorf("%w: quota item %d has invalid unit", contracts.ErrInvalidContract, i)
 		}
@@ -93,9 +101,62 @@ func validateQuotaInfo(quota contracts.QuotaInfo) error {
 		if item.Remaining != nil && *item.Remaining < 0 {
 			return fmt.Errorf("%w: quota item %d remaining is negative", contracts.ErrInvalidContract, i)
 		}
+		for name, value := range map[string]*contracts.Decimal{
+			"limit_exact": item.LimitExact, "remaining_exact": item.RemainingExact,
+		} {
+			if value != nil {
+				if sign, ok := value.Sign(); !ok || sign < 0 {
+					return fmt.Errorf("%w: quota item %d %s is invalid", contracts.ErrInvalidContract, i, name)
+				}
+			}
+		}
+		if item.RemainingFraction != nil {
+			if sign, ok := item.RemainingFraction.Sign(); !ok || sign < 0 {
+				return fmt.Errorf("%w: quota item %d remaining_fraction is invalid", contracts.ErrInvalidContract, i)
+			}
+			one := contracts.Decimal("1")
+			if difference, ok := one.Sub(*item.RemainingFraction); !ok {
+				return fmt.Errorf("%w: quota item %d remaining_fraction is invalid", contracts.ErrInvalidContract, i)
+			} else if sign, ok := difference.Sign(); !ok || sign < 0 {
+				return fmt.Errorf("%w: quota item %d remaining_fraction exceeds one", contracts.ErrInvalidContract, i)
+			}
+		}
+		if item.LimitExact != nil && item.RemainingExact != nil {
+			if difference, ok := item.LimitExact.Sub(*item.RemainingExact); !ok {
+				return fmt.Errorf("%w: quota item %d exact values are invalid", contracts.ErrInvalidContract, i)
+			} else if sign, ok := difference.Sign(); !ok || sign < 0 {
+				return fmt.Errorf("%w: quota item %d exact remaining exceeds limit", contracts.ErrInvalidContract, i)
+			}
+		}
+		if item.Precision != nil {
+			for name, value := range map[string]*contracts.Decimal{
+				"used": item.Precision.Used, "limit": item.Precision.Limit,
+				"remaining": item.Precision.Remaining, "overage_rate": item.Precision.OverageRate,
+				"overage_cap": item.Precision.OverageCap, "overages": item.Precision.Overages,
+			} {
+				if value != nil {
+					if sign, ok := value.Sign(); !ok || sign < 0 {
+						return fmt.Errorf("%w: quota item %d precision.%s is invalid", contracts.ErrInvalidContract, i, name)
+					}
+				}
+			}
+			if item.Precision.Limit != nil && item.Precision.Remaining != nil {
+				if difference, ok := item.Precision.Limit.Sub(*item.Precision.Remaining); !ok {
+					return fmt.Errorf("%w: quota item %d precision values are invalid", contracts.ErrInvalidContract, i)
+				} else if sign, ok := difference.Sign(); !ok || sign < 0 {
+					return fmt.Errorf("%w: quota item %d precision remaining exceeds limit", contracts.ErrInvalidContract, i)
+				}
+			}
+		}
 		if item.Limit != nil && item.Remaining != nil && *item.Remaining > *item.Limit {
 			return fmt.Errorf("%w: quota item %d remaining exceeds limit", contracts.ErrInvalidContract, i)
 		}
 	}
 	return nil
+}
+
+// ValidateQuotaInfo is shared by provider-specific quota adapters after they
+// map a verified upstream response into the canonical contract.
+func ValidateQuotaInfo(quota contracts.QuotaInfo) error {
+	return validateQuotaInfo(quota)
 }

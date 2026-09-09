@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -19,6 +20,8 @@ import (
 const (
 	GraceTTL = 60 * time.Second
 	DataTTL  = 120 * time.Second
+
+	BucketRegistryKey = "snap:bucket_registry"
 )
 
 var ErrStaleEpoch = errors.New("stale snapshot epoch")
@@ -55,12 +58,13 @@ local version = redis.call('INCR', KEYS[3])
 local data = 'snap:data:' .. ARGV[6] .. ':' .. version
 redis.call('DEL', data)
 redis.call('HSET', data, '__version', version)
-for i = 7, #ARGV, 2 do
+for i = 8, #ARGV, 2 do
   redis.call('HSET', data, ARGV[i], ARGV[i+1])
 end
 redis.call('EXPIRE', data, ARGV[3])
 redis.call('SET', KEYS[2], version)
 redis.call('SADD', KEYS[1], ARGV[6])
+redis.call('HSET', KEYS[7], ARGV[6], ARGV[7])
 redis.call('SET', KEYS[4], ARGV[2])
 if old then
   redis.call('ZADD', KEYS[5], ARGV[5], old)
@@ -81,7 +85,11 @@ func (p Publisher) Publish(ctx context.Context, platform, group string, expected
 	bucket := BucketID(platform, group)
 	_, active, versionKey, epochKey, retired, lock := Keys(bucket)
 	nextEpoch := expectedEpoch + 1
-	args := []any{expectedEpoch, nextEpoch, int(DataTTL / time.Second), int(GraceTTL / time.Second), time.Now().Add(GraceTTL).UnixMilli(), bucket}
+	identity, err := json.Marshal([]string{platform, group})
+	if err != nil {
+		return 0, err
+	}
+	args := []any{expectedEpoch, nextEpoch, int(DataTTL / time.Second), int(GraceTTL / time.Second), time.Now().Add(GraceTTL).UnixMilli(), bucket, string(identity)}
 	for _, account := range accounts {
 		if account.Platform != platform || account.Group != group {
 			return 0, fmt.Errorf("account %s does not belong to snapshot bucket", account.ID)
@@ -93,7 +101,7 @@ func (p Publisher) Publish(ctx context.Context, platform, group string, expected
 		}
 		args = append(args, account.ID, string(value))
 	}
-	result, err := publishScript.Run(ctx, p.Redis, []string{"snap:buckets", active, versionKey, epochKey, retired, lock}, args...).Result()
+	result, err := publishScript.Run(ctx, p.Redis, []string{"snap:buckets", active, versionKey, epochKey, retired, lock, BucketRegistryKey}, args...).Result()
 	if err != nil {
 		if strings.Contains(err.Error(), "STALE_EPOCH") {
 			return 0, ErrStaleEpoch
@@ -105,6 +113,56 @@ func (p Publisher) Publish(ctx context.Context, platform, group string, expected
 		return 0, err
 	}
 	return version, nil
+}
+
+type RegisteredBucket struct {
+	Platform string
+	Group    string
+}
+
+// RegisteredBuckets returns bucket identities previously published by control.
+// The registry makes a physical deletion observable after the final account row
+// disappears from PostgreSQL.
+func RegisteredBuckets(ctx context.Context, client redis.UniversalClient) ([]RegisteredBucket, error) {
+	if client == nil {
+		return nil, errors.New("redis client is nil")
+	}
+	values, err := client.HGetAll(ctx, BucketRegistryKey).Result()
+	if err != nil {
+		return nil, err
+	}
+	buckets := make([]RegisteredBucket, 0, len(values))
+	for bucket, raw := range values {
+		var identity []string
+		if err := json.Unmarshal([]byte(raw), &identity); err != nil || len(identity) != 2 || identity[0] == "" || identity[1] == "" || BucketID(identity[0], identity[1]) != bucket {
+			return nil, fmt.Errorf("invalid snapshot bucket registry entry %q", bucket)
+		}
+		buckets = append(buckets, RegisteredBucket{Platform: identity[0], Group: identity[1]})
+	}
+	sort.Slice(buckets, func(i, j int) bool {
+		if buckets[i].Platform == buckets[j].Platform {
+			return buckets[i].Group < buckets[j].Group
+		}
+		return buckets[i].Platform < buckets[j].Platform
+	})
+	return buckets, nil
+}
+
+var removeBucketScript = redis.NewScript(`
+redis.call('SREM', KEYS[1], ARGV[1])
+redis.call('HDEL', KEYS[2], ARGV[1])
+return 1
+`)
+
+// RemoveRegisteredBucket removes a deleted bucket from the control registry.
+// Its empty active generation remains available until the normal data TTL.
+func RemoveRegisteredBucket(ctx context.Context, client redis.UniversalClient, platform, group string) error {
+	if client == nil {
+		return errors.New("redis client is nil")
+	}
+	bucket := BucketID(platform, group)
+	_, err := removeBucketScript.Run(ctx, client, []string{"snap:buckets", BucketRegistryKey}, bucket).Result()
+	return err
 }
 
 type Loader struct{ Redis redis.UniversalClient }
