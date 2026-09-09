@@ -5,10 +5,10 @@ import (
 	"context"
 	"errors"
 	"os"
-	"path/filepath"
 	"testing"
 	"time"
 
+	"github.com/elucid/gateway-platform/migrations"
 	"github.com/elucid/gateway-platform/pkg/contracts"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -24,11 +24,7 @@ func TestPostgresLedgerIdempotencyAndRecovery(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	migration, err := os.ReadFile(filepath.Join("..", "..", "migrations", "001_initial.sql"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := db.Exec(ctx, string(migration)); err != nil {
+	if err := migrations.Apply(ctx, db); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.Exec(ctx, `TRUNCATE migration_records, migration_runs, usage_ledger, request_attempts, credentials, accounts RESTART IDENTITY CASCADE`); err != nil {

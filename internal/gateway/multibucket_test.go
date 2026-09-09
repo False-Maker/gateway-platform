@@ -183,3 +183,19 @@ func TestRouterAuthenticatesAndDerivesTenantFromToken(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestChooserHonoursControlExcludedModels(t *testing.T) {
+	chooser := NewChooser(nil)
+	chooser.Replace([]contracts.Account{
+		{ID: "excluded", Provider: "x", Platform: "x", Group: "default", Status: "active", ExcludedModels: []string{"gpt-x"}},
+		{ID: "open", Provider: "x", Platform: "x", Group: "default", Status: "active"},
+	})
+	lease, err := chooser.Acquire(contracts.Criteria{Platform: "x", Group: "default", Model: "gpt-x"})
+	if err != nil || lease.AccountID != "open" {
+		t.Fatalf("excluded model still selected: lease=%#v err=%v", lease, err)
+	}
+	lease, err = chooser.Acquire(contracts.Criteria{Platform: "x", Group: "default", Model: "gpt-y"})
+	if err != nil || lease.AccountID != "excluded" {
+		t.Fatalf("exclusion leaked to other models: lease=%#v err=%v", lease, err)
+	}
+}

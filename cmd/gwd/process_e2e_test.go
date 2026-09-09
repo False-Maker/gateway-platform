@@ -55,13 +55,6 @@ func TestProcessE2EControlGatewayRelease(t *testing.T) {
 		t.Fatal(err)
 	}
 	repoRoot := filepath.Clean(filepath.Join(sourceDir(t), "../.."))
-	migration, err := os.ReadFile(filepath.Join(repoRoot, "migrations", "001_initial.sql"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := db.Exec(ctx, string(migration)); err != nil {
-		t.Fatal(err)
-	}
 	if err := migrations.Apply(ctx, db); err != nil {
 		t.Fatal(err)
 	}

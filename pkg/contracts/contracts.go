@@ -257,6 +257,9 @@ type Account struct {
 	FenceEpoch   int64           `json:"fence_epoch"`
 	Quota        QuotaInfo       `json:"quota,omitempty"`
 	Capabilities []string        `json:"capabilities,omitempty"`
+	// ExcludedModels lists models control has persistently marked as
+	// forbidden_capability for this account. Gateway never schedules them.
+	ExcludedModels []string `json:"excluded_models,omitempty"`
 }
 
 type ImportRequest struct {

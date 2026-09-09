@@ -76,7 +76,7 @@ func Run(cfg Config) error {
 	defer db.Close()
 	rdb := redis.NewClient(&redis.Options{Addr: cfg.RedisAddr, Username: cfg.RedisUsername, Password: cfg.RedisPassword})
 	defer rdb.Close()
-	ledger := Ledger{DB: db}
+	ledger := Ledger{DB: db, Signals: NewPlatformSignals(observability.Default)}
 	consumer := eventsConsumer(rdb, cfg.ConsumerID, ledger)
 	refreshLoop, err := NewRefreshLoop(db, cfg.CredentialKey)
 	if err != nil {

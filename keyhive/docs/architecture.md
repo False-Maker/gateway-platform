@@ -138,14 +138,14 @@ P0 索引与回收约束固定为:
 ## 5. control 角色的 P0 交付物
 
 - [x] `pkg/contracts`:Criteria / Lease / UpstreamProfile / AccountLimits(含 **DegradePolicy**,默认 fail_closed) / Release(含 UsageSource/Partial) + 六个类型定稿(结构见总览 §4);`QuotaInfo` 按 codex+kiro 并集一次定死(§2.1)。本地契约与回归已完成，真实 provider/基础设施验收仍以 `docs/EVIDENCE.md` 为准。
-- [ ] `ErrorClass` **已定稿,见总览 §6.3.1**(10 个枚举值 + 两层时长)。control 侧要落的是**权威层**:`auth_expired` 由刷新结果驱动而非固定时长、`auth_invalid` 永久踢池告警、`forbidden_capability` 持久排除该号在该模型的候选集、`upstream_5xx` 计平台级熔断而非罚号
+- [x] `ErrorClass` **已定稿,见总览 §6.3.1**(10 个枚举值 + 两层时长)。control 权威层已落地(`internal/control/health.go`,2026-09-10):`auth_expired` 由刷新结果驱动、`auth_invalid` 禁用、`forbidden_capability` 按模型持久排除(`accounts.excluded_models`)、`rate_limited_unknown` 连续 3 次才 5min 冷却、`blocked` 60s、`upstream_5xx`/`forbidden_transport` 只计平台级计数不罚号;快照排除冷却中账号;50% 防饿死闸
 - [x] 快照形态定稿:Redis key 分桶 / 版本 + epoch fencing / grace-TTL / 重建节奏(总览 §3.1)
 - [x] `internal/control/provider/provider.go`:接口 + registry
 - [x] **每账号 fencing** 写者骨架 + 周期任务 singleton 锁(PG advisory 优先);PG 是 `fence_epoch` 唯一权威,Redis 不承担账号写者权威
 - [x] 快照写入 + Redis Stream consumer 的空跑通道(无真实 provider),含 pending reclaim(60s)、最多 5 次重试、死信和坏版本处理。本地/miniredis 已覆盖，真实 Redis 验收 pending。
 - [x] P1:PG `usage_ledger` 幂等写入,事务提交后 ACK,并通过重复投递与 control 崩溃恢复测试(`TestPostgresLedgerIdempotencyAndRecovery`、`TestAcceptanceControlCrashAfterCommitBeforeAck`、`TestAcceptanceGatewayCrashAfterAttemptStartedRecovery`,2026-09-10 在 Docker PG/Redis 真实通过)
 - [x] P1:事件消费指标 `control_stream_pending` / `control_stream_reclaim_total` / `control_stream_dlq_total{reason}` / `usage_ledger_duplicate_total` / `request_attempt_recovered_total{source}` / `request_attempt_open_age_seconds` / `release_xadd_total{result}` 已在 `internal/events`、`internal/control` 暴露(`/metrics` :9091)。**未做**:合成终态和 `UsageSource=missing` 的超阈值告警规则(部署侧 alerting)。
-- [ ] **平台级速率告警**:消费 Release 时按平台聚合 `forbidden_transport` / `blocked` 速率,超阈值告警——这是 R4(TLS 指纹时效)与出口 IP 被标记的**唯一探测机制**,不能只做账号级处理(总览 §6.3.1 规则 2)
+- [x] **平台级速率告警**:`PlatformSignals` 按平台 60s 窗口聚合 `forbidden_transport` / `blocked` 的不同账号数,≥2 即置 `control_platform_alert{provider}` 网关指标——这是 R4(TLS 指纹时效)与出口 IP 被标记的**唯一探测机制**(总览 §6.3.1 规则 2)。告警投递规则(Prometheus rule / 通知)属部署侧,未做
 - [x] `gwd --role=wrapper` 进程 + **语言无关** claim/complete/fail lease 契约(Go 与 Python worker 都能领)。本地进程与 Python fixture 已覆盖；Redis 7.0.15 与 7.4.11 ACL/进程验收 2026-09-10 在 Docker 上通过。
 - [x] 建表(部分):accounts / credentials / quota_snapshot_outbox / tenants / principals / tenant_tokens(控制 PG)+ usage_ledger / request_attempts(计量与尝试)+ migration_runs / migration_records(staging)。**未建**:import_templates、request_logs(独立存储)。
 

@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -17,6 +16,7 @@ import (
 	"github.com/elucid/gateway-platform/internal/events"
 	"github.com/elucid/gateway-platform/internal/gateway"
 	"github.com/elucid/gateway-platform/internal/snapshot"
+	"github.com/elucid/gateway-platform/migrations"
 	"github.com/elucid/gateway-platform/pkg/contracts"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
@@ -236,13 +236,8 @@ func acceptanceDatabase(t *testing.T) *pgxpool.Pool {
 	if err != nil {
 		t.Fatal(err)
 	}
-	migration, err := os.ReadFile(filepath.Join("..", "..", "migrations", "001_initial.sql"))
-	if err != nil {
-		db.Close()
-		t.Fatal(err)
-	}
 	ctx := context.Background()
-	if _, err := db.Exec(ctx, string(migration)); err != nil {
+	if err := migrations.Apply(ctx, db); err != nil {
 		db.Close()
 		t.Fatal(err)
 	}

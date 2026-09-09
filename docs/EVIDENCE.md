@@ -7,6 +7,27 @@
 > 阅读规则：本文的每一条都是**对已发生事实的描述**。不要从本文推断"项目是否可以继续开发"——
 > 那个问题由 `docs/TODO.md` 和 `AGENTS.md` §0 回答。
 
+## A9 control 侧 ErrorClass 权威层 + 平台级速率告警（2026-09-10）
+
+实现见 `docs/TODO.md` A9 摘要。本轮实际执行并通过：
+
+- 无基础设施 `go test -count=1 ./...`：全部通过。
+- `source configs/test-infra/test.env && go test -count=1 -p 1 ./...`（Docker PG16 + Redis 7.0.15）：连续两轮
+  全部通过。其中新增 `TestPGReleaseAuthorityCooldownsAndExclusions` 在真实 PG 上断言：两次无头 429 不冷却、
+  第三次进入 4–6 分钟冷却且从快照消失、`ok` 清零并回到快照；`forbidden_capability` 两模型去重追加且不冷却，
+  快照携带 `ExcludedModels`；`forbidden_transport`/`upstream_5xx` 三连不计失败不冷却；第二个账号 `blocked`
+  后 `PlatformSignals.Alerting()` 返回该平台且账号获得 50–70 秒冷却；4 账号冷却 3 个时防饿死闸释放最早到期的
+  `a9-4`，降到 2/4 后不再释放。`TestPlatformSignalsAlertOnlyWhenSeveralAccountsFailTogether` 覆盖单账号重复
+  不告警、非 transport 类不计、5xx 不计、平台独立、窗口过期清除、nil 接收器安全。
+  `TestChooserHonoursControlExcludedModels` 覆盖 gateway 侧只排除指定模型。
+- `go vet ./...`、`go test -race` 覆盖 control/gateway/contracts、`git diff --check` 通过。
+
+本轮排查的两个测试自身问题（非实现缺陷）：新测试一处 SQL 把字面量与 `$1` 混用（SQLSTATE 42P18），已改；
+新测试用独立密钥写入的账号在后续 `cmd/gwd` 导入测试遍历全部 bucket 时无法解密，已加 `defer DELETE`
+清理。两者修正后全量两轮稳定。
+
+未执行真实 provider 请求、生产写入或部署。冷却阈值与时长为总览 §6.3.1 定值，真实 429/403 语义校准属 C3。
+
 ## A8 设计文档与代码对齐（2026-09-10，仅文档）
 
 对照仓库当前代码修正描述性内容，未改任何 `.go` 文件、设计决策或阶段计划：

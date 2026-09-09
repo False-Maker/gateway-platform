@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"sort"
 	"strconv"
 	"strings"
@@ -67,11 +68,12 @@ func (r PGSnapshotRepository) ListSnapshotAccounts(ctx context.Context, platform
 	}
 	rows, err := r.DB.Query(ctx, `
 		SELECT a.id,a.provider,a.platform,a."group",a.status,a.fence_epoch,
-		       a.base_url,a.profile,a.limits,a.quota,a.capabilities,a.proxy,
+		       a.base_url,a.profile,a.limits,a.quota,a.capabilities,a.proxy,a.excluded_models,
 		       c.kind,c.encrypted_secret,c.expires_at,c.version
 		FROM accounts a
 		JOIN credentials c ON c.account_id=a.id
 		WHERE a.platform=$1 AND a."group"=$2 AND a.status='active'
+		  AND (a.cooldown_until IS NULL OR a.cooldown_until <= now())
 		ORDER BY a.id`, platform, group)
 	if err != nil {
 		return nil, err
@@ -84,6 +86,7 @@ func (r PGSnapshotRepository) ListSnapshotAccounts(ctx context.Context, platform
 			baseURL, credentialKind            string
 			profileJSON, limitsJSON, quotaJSON []byte
 			capabilitiesJSON, encryptedSecret  []byte
+			excludedModelsJSON                 []byte
 			proxy                              string
 			databaseExpiresAt                  *time.Time
 			credentialVersion                  int64
@@ -91,7 +94,7 @@ func (r PGSnapshotRepository) ListSnapshotAccounts(ctx context.Context, platform
 		if err := rows.Scan(
 			&account.ID, &account.Provider, &account.Platform, &account.Group,
 			&account.Status, &account.FenceEpoch, &baseURL, &profileJSON,
-			&limitsJSON, &quotaJSON, &capabilitiesJSON, &proxy, &credentialKind,
+			&limitsJSON, &quotaJSON, &capabilitiesJSON, &proxy, &excludedModelsJSON, &credentialKind,
 			&encryptedSecret, &databaseExpiresAt, &credentialVersion,
 		); err != nil {
 			return nil, err
@@ -132,6 +135,9 @@ func (r PGSnapshotRepository) ListSnapshotAccounts(ctx context.Context, platform
 			return nil, err
 		}
 		if err := decodeSnapshotJSON(account.ID, "capabilities", capabilitiesJSON, &account.Capabilities); err != nil {
+			return nil, err
+		}
+		if err := decodeSnapshotJSON(account.ID, "excluded_models", excludedModelsJSON, &account.ExcludedModels); err != nil {
 			return nil, err
 		}
 		accounts = append(accounts, account)
@@ -181,6 +187,13 @@ func (l SnapshotLoop) RunOnce(ctx context.Context) error {
 	}
 	if l.Redis == nil {
 		return errors.New("snapshot redis client is nil")
+	}
+	if guard, ok := l.Repository.(StarvationGuard); ok {
+		if released, err := guard.ReleaseStarvedCooldowns(ctx, time.Now().UTC()); err != nil {
+			return fmt.Errorf("release starved cooldowns: %w", err)
+		} else if len(released) > 0 {
+			log.Printf("control released oldest cooldown on starved platforms: %v", released)
+		}
 	}
 	buckets, err := l.Repository.ListSnapshotBuckets(ctx)
 	if err != nil {

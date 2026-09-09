@@ -5,11 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
-	"path/filepath"
 	"testing"
 
 	"github.com/alicebob/miniredis/v2"
 	"github.com/elucid/gateway-platform/internal/snapshot"
+	"github.com/elucid/gateway-platform/migrations"
 	"github.com/elucid/gateway-platform/pkg/contracts"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
@@ -26,11 +26,7 @@ func TestP3PostgresQuotaOutboxReconcileAndFence(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	migration, err := os.ReadFile(filepath.Join("..", "..", "migrations", "001_initial.sql"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := db.Exec(ctx, string(migration)); err != nil {
+	if err := migrations.Apply(ctx, db); err != nil {
 		t.Fatal(err)
 	}
 	const accountID = "p3-quota-outbox"

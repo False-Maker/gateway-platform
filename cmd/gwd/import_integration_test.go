@@ -15,6 +15,7 @@ import (
 	"github.com/elucid/gateway-platform/internal/control/credentials"
 	"github.com/elucid/gateway-platform/internal/gateway"
 	"github.com/elucid/gateway-platform/internal/snapshot"
+	"github.com/elucid/gateway-platform/migrations"
 	"github.com/elucid/gateway-platform/pkg/contracts"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
@@ -31,11 +32,7 @@ func TestImportCommandPublishesSnapshotAndGatewayCanChooseAccount(t *testing.T) 
 		t.Fatal(err)
 	}
 	defer db.Close()
-	migration, err := os.ReadFile(filepath.Join("..", "..", "migrations", "001_initial.sql"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := db.Exec(ctx, string(migration)); err != nil {
+	if err := migrations.Apply(ctx, db); err != nil {
 		t.Fatal(err)
 	}
 

@@ -251,6 +251,13 @@ func quotaApplies(item contracts.QuotaItem, model string) bool {
 }
 
 func supports(account contracts.Account, model string) bool {
+	if model != "" {
+		for _, excluded := range account.ExcludedModels {
+			if excluded == model {
+				return false
+			}
+		}
+	}
 	if model == "" || len(account.Capabilities) == 0 {
 		return true
 	}

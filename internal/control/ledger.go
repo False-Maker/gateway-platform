@@ -15,6 +15,8 @@ import (
 type Ledger struct {
 	DB      *pgxpool.Pool
 	Metrics *observability.Registry
+	// Signals aggregates platform-level transport rejections. Optional.
+	Signals *PlatformSignals
 }
 
 func (l Ledger) HandleAttemptStarted(ctx context.Context, event contracts.AttemptStarted) error {
@@ -50,8 +52,7 @@ func (l Ledger) HandleRelease(ctx context.Context, release contracts.Release) er
 		return err
 	}
 	if result.RowsAffected() == 1 {
-		_, err = tx.Exec(ctx, `UPDATE accounts SET status=CASE WHEN $1::text='auth_invalid' THEN 'disabled' ELSE status END, last_error_class=CASE WHEN $1::text='ok' THEN NULL ELSE $1::text END, last_error_at=CASE WHEN $1::text='ok' THEN NULL ELSE $2::timestamptz END, updated_at=now() WHERE id=$3`, release.ErrorClass, release.OccurredAt, release.AccountID)
-		if err != nil {
+		if err := applyReleaseAuthority(ctx, tx, release); err != nil {
 			return err
 		}
 	}
@@ -62,6 +63,7 @@ func (l Ledger) HandleRelease(ctx context.Context, release contracts.Release) er
 		l.metrics().AddCounter("usage_ledger_duplicate_total", 1)
 	} else {
 		l.metrics().AddCounter("request_attempt_recovered_total", 1, "source", "gateway")
+		l.Signals.Observe(release)
 	}
 	return nil
 }

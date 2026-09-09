@@ -12,10 +12,9 @@
 >
 > 当前状态：**A1-A5、B1、B2、B3 已完成，2026-09-06 审查修复、B2 多模态切片与 B3 quota 精度扩展已收口。** A5 的数据库实跑仍按可选 PostgreSQL 环境执行；缺少环境不等于缺少 provider 凭据，也不阻塞本地转换验证。
 >
-> **2026-09-10 复盘新增 A6、A7、A8（均 `[no-cred]`），并给 D1 定了解法。** 复盘发现设计文档要求但代码中不存在、且 TODO 从未列出的三个缺口：gateway 鉴权面/多 bucket、utls TLS profile、文档与代码漂移。D1、A6、A7、A8 已于 2026-09-10 完成。§A 全部收口。**下一步候选（按序）**：
-> ① A9 control 侧 ErrorClass 权威层 + 平台级 `forbidden_transport`/`blocked` 速率告警（keyhive §5 两条未勾选项，`[no-cred]`）；
-> ② A10 粘滞会话 `SessionKey` 按 tenant 接线 + per-tenant 限流（A6 遗留，`[no-cred]`）；
-> ③ B4 P4 计费（依赖 A6 tenant 已就位）。 P4（B4）在 A6 之前不启动——没有 tenant 就没有可扣费主体。
+> **2026-09-10 复盘新增 A6、A7、A8（均 `[no-cred]`），并给 D1 定了解法。** 复盘发现设计文档要求但代码中不存在、且 TODO 从未列出的三个缺口：gateway 鉴权面/多 bucket、utls TLS profile、文档与代码漂移。D1、A6、A7、A8、A9 已于 2026-09-10 完成。**下一步候选（按序）**：
+> ① A10 粘滞会话 `SessionKey` 按 tenant 接线 + per-tenant 限流（A6 遗留，`[no-cred]`）；
+> ② B4 P4 计费（依赖 A6 tenant 已就位）。 P4（B4）在 A6 之前不启动——没有 tenant 就没有可扣费主体。
 
 ---
 
@@ -193,6 +192,27 @@ crypto/tls。证据见 `docs/EVIDENCE.md`。**未做**：真实上游是否接�
   P1 checklist 多项未勾选但 `docs/EVIDENCE.md` 已记录实现。
 - `docs/P2-ADMISSION.md` 末段仍写"仓库当前没有 AGENTS.md"。
 - `internal/control/run.go:131` quota tick 内的 reconcile 与 `run.go:138` 独立 reconcile tick 重叠，无害但冗余；顺手记录，是否合并由 A6 之后决定。
+
+### A9 `[no-cred]` control 侧 ErrorClass 权威层 + 平台级速率告警
+
+**状态：已完成（2026-09-10）。** 对应总览 §6.3.1 "control 持久处理" 列与规则 2/3：
+
+- `migrations/003_account_health.sql`：`accounts` 新增 `consecutive_failures`、`cooldown_until`、`excluded_models`。
+- `internal/control/health.go`：单条 SQL 在 ledger 事务内按 ErrorClass 落权威判罚——`ok` 清零；`auth_invalid`
+  禁用；`forbidden_capability` 按模型追加 `excluded_models`，不冷却整号；`rate_limited_unknown` 连续 3 次才
+  5 分钟冷却；`blocked` 60 秒冷却；`forbidden_transport` / `upstream_5xx` / `network_error` / `auth_expired` /
+  `rate_limited_known` 只记 last_error，不罚号。重复投递不重复判罚。
+- `PlatformSignals`：60 秒窗口内同平台 ≥2 个不同账号出现 `forbidden_transport`/`blocked` 即置
+  `control_platform_alert{provider,reason=transport_rejections}=1`，另有
+  `control_platform_error_total{provider,class}`、`control_platform_transport_rejections_accounts{provider}`。
+- 快照循环排除 `cooldown_until > now()` 的账号，并把 `excluded_models` 发布到快照；gateway chooser 对
+  `ExcludedModels` 中的模型不选该号。
+- 防饿死闸 `ReleaseStarvedCooldowns`：某平台冷却占比 >50% 时释放最早到期的一个冷却，每次快照 tick 执行，
+  计数 `control_platform_starvation_release_total{platform}`。
+- 所有 PG 测试改为 `migrations.Apply` 统一应用全部迁移。
+
+证据见 `docs/EVIDENCE.md`。**未做**：告警规则本身（Prometheus alert / 通知）属部署侧；`auth_expired` 由
+refresh loop 结果驱动的语义已存在于 `refresh.go`，本轮未改；冷却时长为文档定值，未经真实上游回调。
 
 ---
 
