@@ -101,6 +101,12 @@ func Run(cfg Config) error {
 	if err := snapshotLoop.RunOnce(ctx); err != nil {
 		log.Printf("control initial snapshot publish failed: %v", err)
 	}
+	tokenLoop := TokenLoop{Repository: PGTenantRepository{DB: db}, Redis: rdb}
+	tokenTicker := time.NewTicker(tokenRefreshInterval)
+	defer tokenTicker.Stop()
+	if err := tokenLoop.RunOnce(ctx); err != nil {
+		log.Printf("control initial token publish failed: %v", err)
+	}
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 	trimTicker := time.NewTicker(time.Minute)
@@ -127,6 +133,10 @@ func Run(cfg Config) error {
 		case <-snapshotC:
 			if err := snapshotLoop.RunOnce(ctx); err != nil {
 				log.Printf("control snapshot publish failed: %v", err)
+			}
+		case <-tokenTicker.C:
+			if err := tokenLoop.RunOnce(ctx); err != nil {
+				log.Printf("control token publish failed: %v", err)
 			}
 		case <-quotaC:
 			if err := quotaLoop.RunOnce(ctx); err != nil {

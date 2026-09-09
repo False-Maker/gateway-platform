@@ -51,7 +51,10 @@ type Server struct {
 	HTTPClient     *http.Client
 	RequestTimeout time.Duration
 	Provider       string
-	snapshotFresh  func() bool
+	// ChooseAllPlatforms lets one gateway serve every bucket in its chooser.
+	// Provider then only acts as the fallback for leases without one.
+	ChooseAllPlatforms bool
+	snapshotFresh      func() bool
 }
 
 func NewServer(producer events.Producer, provider string) *Server {
@@ -59,6 +62,25 @@ func NewServer(producer events.Producer, provider string) *Server {
 		provider = "apikey"
 	}
 	return &Server{Chooser: NewChooser(nil), Producer: producer, Limiter: Limiter{Redis: producer.Redis}, HTTPClient: &http.Client{}, RequestTimeout: 120 * time.Second, Provider: provider}
+}
+
+// leaseProvider returns the provider that shapes upstream requests for a
+// lease. Multi-bucket gateways carry it on the lease; the process-level
+// Provider remains the fallback for single-provider deployments and tests.
+func leaseProvider(s *Server, lease contracts.Lease) string {
+	if lease.Provider != "" {
+		return lease.Provider
+	}
+	return s.Provider
+}
+
+// criteriaPlatform is the chooser filter. ChooseAllPlatforms selects across
+// every loaded bucket; otherwise the process-level provider pins one platform.
+func (s *Server) criteriaPlatform() string {
+	if s.ChooseAllPlatforms {
+		return ""
+	}
+	return s.Provider
 }
 
 func (s *Server) HandleNonStreaming(ctx context.Context, tenantID, group string, request ChatCompletionRequest) ([]byte, int, error) {
@@ -256,14 +278,14 @@ func (s *Server) handleProtocolStreaming(ctx context.Context, tenantID, group st
 	requestCtx, requestCancel := context.WithTimeout(ctx, deadline)
 	defer requestCancel()
 	requestID := newID("req")
-	lease, err := s.Chooser.Acquire(contracts.Criteria{Platform: s.Provider, Model: model, Group: group})
+	lease, err := s.Chooser.Acquire(contracts.Criteria{Platform: s.criteriaPlatform(), Model: model, Group: group})
 	if err != nil {
 		if errors.Is(err, ErrQuotaExhausted) {
 			return http.StatusTooManyRequests, err
 		}
 		return http.StatusServiceUnavailable, err
 	}
-	upstreamProtocol, err := selectedProtocol(s.Provider, lease.Profile)
+	upstreamProtocol, err := selectedProtocol(leaseProvider(s, lease), lease.Profile)
 	if err != nil {
 		return http.StatusBadGateway, err
 	}
@@ -273,7 +295,7 @@ func (s *Server) handleProtocolStreaming(ctx context.Context, tenantID, group st
 			return http.StatusBadRequest, err
 		}
 	}
-	payload, err = prepareProviderPayload(s.Provider, lease.Profile, model, payload)
+	payload, err = prepareProviderPayload(leaseProvider(s, lease), lease.Profile, model, payload)
 	if err != nil {
 		return http.StatusBadGateway, err
 	}
@@ -284,7 +306,7 @@ func (s *Server) handleProtocolStreaming(ctx context.Context, tenantID, group st
 	defer releaseLimiter()
 	attemptID := newID("attempt")
 	startedAt := time.Now().UTC()
-	started := contracts.AttemptStarted{SchemaVersion: contracts.SchemaVersion, EventID: newID("start"), RequestID: requestID, AttemptID: attemptID, AttemptNo: 1, ProducerID: s.Producer.ProducerID, OccurredAt: startedAt, AccountID: lease.AccountID, Provider: s.Provider, Model: model, TenantID: tenantID, DeadlineAt: startedAt.Add(deadline)}
+	started := contracts.AttemptStarted{SchemaVersion: contracts.SchemaVersion, EventID: newID("start"), RequestID: requestID, AttemptID: attemptID, AttemptNo: 1, ProducerID: s.Producer.ProducerID, OccurredAt: startedAt, AccountID: lease.AccountID, Provider: leaseProvider(s, lease), Model: model, TenantID: tenantID, DeadlineAt: startedAt.Add(deadline)}
 	startedEvent, err := contracts.NewStreamEvent(contracts.EventTypeAttemptStarted, started.EventID, requestID, attemptID, s.Producer.ProducerID, startedAt, started)
 	if err != nil {
 		return http.StatusInternalServerError, err
@@ -308,7 +330,7 @@ func (s *Server) handleProtocolStreaming(ctx context.Context, tenantID, group st
 			path = "/v1/chat/completions"
 		}
 	}
-	path = providerStreamingPath(s.Provider, path)
+	path = providerStreamingPath(leaseProvider(s, lease), path)
 	endpoint := strings.TrimRight(lease.Profile.BaseURL, "/") + resolveInferencePath(path, model)
 	upstreamRequest, err := http.NewRequestWithContext(upstreamCtx, http.MethodPost, endpoint, bytes.NewReader(payload))
 	if err != nil {
@@ -330,7 +352,7 @@ func (s *Server) handleProtocolStreaming(ctx context.Context, tenantID, group st
 	for key, value := range lease.Profile.ExtraHeaders {
 		upstreamRequest.Header.Set(key, value)
 	}
-	applyProviderRequestHeaders(upstreamRequest.Header, s.Provider, payload)
+	applyProviderRequestHeaders(upstreamRequest.Header, leaseProvider(s, lease), payload)
 	if upstreamProtocol == protokit.AnthropicMessages {
 		upstreamRequest.Header.Set("anthropic-version", "2023-06-01")
 	}
@@ -373,10 +395,10 @@ func (s *Server) handleProtocolStreaming(ctx context.Context, tenantID, group st
 	var parsedUsage *usage
 	var partial bool
 	var readErr error
-	if strings.EqualFold(s.Provider, "kiro") {
+	if strings.EqualFold(leaseProvider(s, lease), "kiro") {
 		parsedUsage, partial, _, readErr = drainKiroStream(ctx, response.Body, dst, flusher, model)
 	} else {
-		parsedUsage, partial, _, readErr = drainSSEProtocol(ctx, response.Body, dst, flusher, upstreamProtocol, inboundProtocol, model, s.Provider)
+		parsedUsage, partial, _, readErr = drainSSEProtocol(ctx, response.Body, dst, flusher, upstreamProtocol, inboundProtocol, model, leaseProvider(s, lease))
 	}
 	if readErr != nil {
 		class := contracts.ErrorNetwork
@@ -1165,7 +1187,7 @@ func (s *Server) finishStreamingRelease(ctx context.Context, tenantID, requestID
 }
 
 func (s *Server) writeStreamingRelease(ctx context.Context, tenantID, requestID, attemptID string, startedAt time.Time, lease contracts.Lease, request ChatCompletionRequest, status int, parsedUsage *usage, partial bool, class contracts.ErrorClass, callErr error) error {
-	release := contracts.Release{SchemaVersion: contracts.SchemaVersion, EventID: contracts.TerminalEventID(attemptID), RequestID: requestID, AttemptID: attemptID, AttemptNo: 1, ProducerID: s.Producer.ProducerID, OccurredAt: time.Now().UTC(), AccountID: lease.AccountID, Provider: s.Provider, StatusCode: status, LatencyMS: int(time.Since(startedAt).Milliseconds()), Model: request.Model, TenantID: tenantID, ErrorClass: class, UsageSource: contracts.UsageSourceMissing, Partial: partial}
+	release := contracts.Release{SchemaVersion: contracts.SchemaVersion, EventID: contracts.TerminalEventID(attemptID), RequestID: requestID, AttemptID: attemptID, AttemptNo: 1, ProducerID: s.Producer.ProducerID, OccurredAt: time.Now().UTC(), AccountID: lease.AccountID, Provider: leaseProvider(s, lease), StatusCode: status, LatencyMS: int(time.Since(startedAt).Milliseconds()), Model: request.Model, TenantID: tenantID, ErrorClass: class, UsageSource: contracts.UsageSourceMissing, Partial: partial}
 	if parsedUsage != nil {
 		release.TokensIn, release.TokensOut, release.CacheReadTokens, release.CacheWriteTokens = parsedUsage.Input, parsedUsage.Output, parsedUsage.CacheRead, parsedUsage.CacheWrite
 		release.UsageSource = contracts.UsageSourceUpstream
@@ -1206,7 +1228,7 @@ func (s *Server) handleNonStreaming(ctx context.Context, tenantID, group string,
 	var lastErr error
 	attemptedAccounts := make(map[string]struct{})
 	for attemptNo := 1; attemptNo <= 2; attemptNo++ {
-		lease, err := s.Chooser.AcquireExcluding(contracts.Criteria{Platform: s.Provider, Model: request.Model, Group: group}, attemptedAccounts)
+		lease, err := s.Chooser.AcquireExcluding(contracts.Criteria{Platform: s.criteriaPlatform(), Model: request.Model, Group: group}, attemptedAccounts)
 		if err != nil {
 			if lastErr != nil {
 				if lastStatus == 0 {
@@ -1226,7 +1248,7 @@ func (s *Server) handleNonStreaming(ctx context.Context, tenantID, group string,
 		}
 		attemptID := newID("attempt")
 		startedAt := time.Now().UTC()
-		started := contracts.AttemptStarted{SchemaVersion: contracts.SchemaVersion, EventID: newID("start"), RequestID: requestID, AttemptID: attemptID, AttemptNo: attemptNo, ProducerID: s.Producer.ProducerID, OccurredAt: startedAt, AccountID: lease.AccountID, Provider: s.Provider, Model: request.Model, TenantID: tenantID, DeadlineAt: startedAt.Add(deadline)}
+		started := contracts.AttemptStarted{SchemaVersion: contracts.SchemaVersion, EventID: newID("start"), RequestID: requestID, AttemptID: attemptID, AttemptNo: attemptNo, ProducerID: s.Producer.ProducerID, OccurredAt: startedAt, AccountID: lease.AccountID, Provider: leaseProvider(s, lease), Model: request.Model, TenantID: tenantID, DeadlineAt: startedAt.Add(deadline)}
 		startedEvent, err := contracts.NewStreamEvent(contracts.EventTypeAttemptStarted, started.EventID, requestID, attemptID, s.Producer.ProducerID, startedAt, started)
 		if err != nil {
 			releaseLimiter()
@@ -1237,7 +1259,7 @@ func (s *Server) handleNonStreaming(ctx context.Context, tenantID, group string,
 			return nil, http.StatusServiceUnavailable, ErrAttemptFailed
 		}
 		body, status, usage, networkErr, reset, callErr := s.callUpstream(ctx, lease, request, inboundProtocol)
-		release := contracts.Release{SchemaVersion: contracts.SchemaVersion, EventID: contracts.TerminalEventID(attemptID), RequestID: requestID, AttemptID: attemptID, AttemptNo: attemptNo, ProducerID: s.Producer.ProducerID, OccurredAt: time.Now().UTC(), AccountID: lease.AccountID, Provider: s.Provider, StatusCode: status, LatencyMS: int(time.Since(startedAt).Milliseconds()), Model: request.Model, TenantID: tenantID, ErrorClass: contracts.ErrorOK, UsageSource: contracts.UsageSourceMissing, Partial: false}
+		release := contracts.Release{SchemaVersion: contracts.SchemaVersion, EventID: contracts.TerminalEventID(attemptID), RequestID: requestID, AttemptID: attemptID, AttemptNo: attemptNo, ProducerID: s.Producer.ProducerID, OccurredAt: time.Now().UTC(), AccountID: lease.AccountID, Provider: leaseProvider(s, lease), StatusCode: status, LatencyMS: int(time.Since(startedAt).Milliseconds()), Model: request.Model, TenantID: tenantID, ErrorClass: contracts.ErrorOK, UsageSource: contracts.UsageSourceMissing, Partial: false}
 		if usage != nil {
 			release.TokensIn, release.TokensOut, release.CacheReadTokens, release.CacheWriteTokens = usage.Input, usage.Output, usage.CacheRead, usage.CacheWrite
 			release.UsageSource = contracts.UsageSourceUpstream
@@ -1337,7 +1359,7 @@ func (s *Server) callUpstream(ctx context.Context, lease contracts.Lease, reques
 	if err != nil {
 		return nil, http.StatusBadRequest, nil, false, 0, err
 	}
-	upstreamProtocol, err := selectedProtocol(s.Provider, lease.Profile)
+	upstreamProtocol, err := selectedProtocol(leaseProvider(s, lease), lease.Profile)
 	if err != nil {
 		return nil, http.StatusBadGateway, nil, false, 0, err
 	}
@@ -1347,7 +1369,7 @@ func (s *Server) callUpstream(ctx context.Context, lease contracts.Lease, reques
 			return nil, http.StatusBadRequest, nil, false, 0, err
 		}
 	}
-	payload, err = prepareProviderPayload(s.Provider, lease.Profile, request.Model, payload)
+	payload, err = prepareProviderPayload(leaseProvider(s, lease), lease.Profile, request.Model, payload)
 	if err != nil {
 		return nil, http.StatusBadGateway, nil, false, 0, err
 	}
@@ -1383,7 +1405,7 @@ func (s *Server) callUpstream(ctx context.Context, lease contracts.Lease, reques
 	for key, value := range lease.Profile.ExtraHeaders {
 		upstreamRequest.Header.Set(key, value)
 	}
-	applyProviderRequestHeaders(upstreamRequest.Header, s.Provider, payload)
+	applyProviderRequestHeaders(upstreamRequest.Header, leaseProvider(s, lease), payload)
 	if upstreamProtocol == protokit.AnthropicMessages {
 		upstreamRequest.Header.Set("anthropic-version", "2023-06-01")
 	}
@@ -1408,7 +1430,7 @@ func (s *Server) callUpstream(ctx context.Context, lease contracts.Lease, reques
 	if response.StatusCode >= 400 {
 		return body, response.StatusCode, nil, false, reset, fmt.Errorf("upstream returned HTTP %d", response.StatusCode)
 	}
-	body, err = normalizeProviderResponse(s.Provider, request.Model, body)
+	body, err = normalizeProviderResponse(leaseProvider(s, lease), request.Model, body)
 	if err != nil {
 		return nil, http.StatusBadGateway, nil, false, reset, err
 	}

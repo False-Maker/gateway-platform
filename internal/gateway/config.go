@@ -8,8 +8,10 @@ type Config struct {
 	RedisPassword string
 	ListenAddr    string
 	ProducerID    string
-	TenantID      string
-	Provider      string
+	// Provider is only the fallback for leases that carry no provider; the
+	// gateway serves every bucket control publishes. Tenant identity comes
+	// from verified bearer tokens, never from configuration.
+	Provider string
 }
 
 func ConfigFromEnv() Config {
@@ -19,7 +21,6 @@ func ConfigFromEnv() Config {
 		RedisPassword: os.Getenv("GATEWAY_REDIS_PASSWORD"),
 		ListenAddr:    getenv("GATEWAY_LISTEN_ADDR", ":8080"),
 		ProducerID:    getenv("GATEWAY_PRODUCER_ID", "gateway-1"),
-		TenantID:      getenv("GATEWAY_TENANT_ID", "p1-synthetic"),
 		Provider:      getenv("GATEWAY_PROVIDER", "apikey"),
 	}
 }

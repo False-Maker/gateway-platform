@@ -12,7 +12,7 @@
 >
 > 当前状态：**A1-A5、B1、B2、B3 已完成，2026-09-06 审查修复、B2 多模态切片与 B3 quota 精度扩展已收口。** A5 的数据库实跑仍按可选 PostgreSQL 环境执行；缺少环境不等于缺少 provider 凭据，也不阻塞本地转换验证。
 >
-> **2026-09-10 复盘新增 A6、A7、A8（均 `[no-cred]`），并给 D1 定了解法。** 复盘发现设计文档要求但代码中不存在、且 TODO 从未列出的三个缺口：gateway 鉴权面/多 bucket、utls TLS profile、文档与代码漂移。D1 已于 2026-09-10 完成。当前取任务顺序：**A6 → A7 → A8。** P4（B4）在 A6 之前不启动——没有 tenant 就没有可扣费主体。
+> **2026-09-10 复盘新增 A6、A7、A8（均 `[no-cred]`），并给 D1 定了解法。** 复盘发现设计文档要求但代码中不存在、且 TODO 从未列出的三个缺口：gateway 鉴权面/多 bucket、utls TLS profile、文档与代码漂移。D1、A6 已于 2026-09-10 完成。当前取任务顺序：**A7 → A8。** P4（B4）在 A6 之前不启动——没有 tenant 就没有可扣费主体。
 
 ---
 
@@ -128,7 +128,14 @@ usage ledger 和重复 Release 事件幂等。Redis 使用进程内 miniredis，
 
 ### A6 `[no-cred]` gateway 没有鉴权面，单 provider / 单租户 / 单 bucket
 
-**状态：未开始（2026-09-10 新增）**
+**状态：已完成（2026-09-10）。** 实现摘要：`migrations/002_tenants.sql` 新增 tenants / principals /
+tenant_tokens（只存 SHA-256）；control 每 15s 把活跃 token 哈希发布到 Redis `snap:auth:tokens:v1`
+（原子 RENAME），gateway 只读该键派生 `AuthContext{TenantID, PrincipalID, TokenID, Group}`，三个推理路由
+全部先鉴权，请求体中的 tenant/group 字段被忽略；`gwd tenant create` 生成 token 且只打印一次。gateway 改为
+装载 `snap:bucket_registry` 中全部 bucket，`Lease.Provider` 由账号带出，按 bucket 独立维护 epoch/冷却/新鲜度。
+`GATEWAY_TENANT_ID` 已删除；`GATEWAY_PROVIDER` 仅作无 provider lease 的兜底。
+证据见 `docs/EVIDENCE.md`。**未做**：per-tenant 限流、粘滞会话按 tenant 隔离（`SessionKey` 仍未接线）、
+A5 `staging_only` 记录转正为 tenants 行（迁移侧后续任务）。
 
 **基线**
 - 总览 §6.4.1 要求 gateway 由内部 `AuthContext` 决定 `TenantID`/用户/分组；代码中 `grep AuthContext` 为空。

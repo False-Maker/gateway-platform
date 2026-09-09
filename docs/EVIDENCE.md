@@ -7,6 +7,46 @@
 > 阅读规则：本文的每一条都是**对已发生事实的描述**。不要从本文推断"项目是否可以继续开发"——
 > 那个问题由 `docs/TODO.md` 和 `AGENTS.md` §0 回答。
 
+## A6 gateway 鉴权面与多 bucket（2026-09-10）
+
+本轮实现 `docs/TODO.md` A6。改动：
+
+- `migrations/002_tenants.sql`：tenants、principals、tenant_tokens（`token_hash` UNIQUE，无明文列）；
+  `migrations/migrations.go` 以 `embed` 提供有序 `Apply`，测试与运维共用同一 schema 来源。
+- `internal/snapshot/auth.go`：`snap:auth:tokens:v1` Hash（field = SHA-256(token)，value = `TokenRecord`
+  JSON），`PublishTokens` 在 staging key 上构建后 `RENAME` 原子替换，空集合也发布以传播撤销；键前缀落在
+  `snap:*` 使 gateway 只读 ACL 即可覆盖。
+- `internal/control/tenants.go`：`PGTenantRepository.ListActiveTokens` 过滤 revoked/expired/suspended，
+  `TokenLoop` 每 15s 发布，`CreateTenantToken` 单事务建 tenant/principal/token 并校验 principal 归属。
+- `internal/gateway/auth.go`：`Authenticator` 从 Redis 快照校验 Bearer 或 `x-api-key`，派生
+  `AuthContext`；空/未知/过期 token 与非 Bearer scheme 均 401；刷新失败保留 last-known-good。
+- `internal/gateway/run.go`：`NewRouter` 三个推理路由先鉴权，TenantID/Group 只来自 `AuthContext`；
+  `BucketLoader.RefreshAll` 按 `snap:bucket_registry` 装载全部 bucket 并移除已注销 bucket。
+- `internal/gateway/chooser.go`：`ReplaceBucket`/`RemoveBucket`/`Buckets`，每 bucket 独立 epoch、
+  冷却清除与 `validUntil` 新鲜度门；`Criteria.Platform` 为空时跨全部 platform 选号；`Lease.Provider`
+  由账号填充，`server.go` 的 provider 相关整形逻辑全部改读 lease。
+- `cmd/gwd`：新增 `tenant create` 子命令；`GATEWAY_TENANT_ID` 删除。A4 进程级 e2e 改为先断言无 token
+  401 且上游零命中，再以 `CreateTenantToken` 生成的真实 token 走通全链路。
+
+本轮实际执行并通过：
+
+- 无基础设施：`go test -count=1 ./...` 23 个包全部通过。
+- `source configs/test-infra/test.env && go test -count=1 -p 1 ./...`：全部通过，其中
+  `TestProcessE2EControlGatewayRelease`（含 401 断言与真实 token）、`TestPGTenantTokensPublishAndRevoke`
+  （PG 落库只存哈希、过期不发布、撤销与租户 suspended 后下一轮消失、跨租户 principal 拒绝）真实执行通过。
+- `go vet ./...`、`go test -race` 覆盖 contracts/control/gateway/snapshot、`git diff --check` 通过。
+- 新增本地回归：`TestChooserServesMultipleBucketsAndIsolatesGroups`、`TestBucketLoaderTracksRegistry`、
+  `TestRouterAuthenticatesAndDerivesTenantFromToken`（两租户两 bucket，请求体伪造 tenant/group 被忽略，
+  Release 的 TenantID/AccountID 跟随 token）、`TestAuthenticator*`、`TestPublishAndLoadTokens*`。
+
+Redis ACL 边界在 Docker Redis 7.0.15 上以 `redis-cli` 实测：`test-control` 可 HSET staging 键并
+`RENAME` 到 `snap:auth:tokens:v1`（ACL 已补 `+rename`）；`test-gateway` 可 `HGETALL` 该键、`HSET` 被
+NOPERM 拒绝；`test-wrapper` `HGETALL` 被 NOPERM 拒绝。
+
+`go fmt ./...` 顺带改动了 `cmd/new-api-migrate/main_test.go` 的一处格式，已还原，不计入本轮。
+本轮未执行真实 provider 请求、生产写入、部署或切流。最高剩余风险：token 传播依赖 control 15s tick 与
+gateway 5s 轮询，撤销最坏延迟约 20s；per-tenant 限流与粘滞会话隔离尚未实现。
+
 ## D1 Docker PostgreSQL + Redis 7.0.15 全量集成验收（2026-09-10）
 
 本轮 Docker daemon 已可连接（`docker info` 正常）。新增 `configs/test-infra/` 三个文件：

@@ -3,6 +3,7 @@ package gateway
 import (
 	"crypto/rand"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -16,9 +17,20 @@ type cooldown struct {
 	credentialVersion int64
 }
 
+// bucketState is what the chooser remembers per platform+group bucket when
+// it is fed by ReplaceBucket. validUntil mirrors the Redis data-key TTL so a
+// bucket whose refresh stopped is excluded instead of serving stale leases.
+type bucketState struct {
+	epoch      int64
+	validUntil time.Time
+	ids        map[string]struct{}
+}
+
 type Chooser struct {
 	mu       sync.RWMutex
 	accounts map[string]contracts.Account
+	buckets  map[string]bucketState
+	owner    map[string]string // account ID -> bucket key
 	cooling  map[cooldownKey]cooldown
 	failures map[cooldownKey]int
 	now      func() time.Time
@@ -29,7 +41,76 @@ func NewChooser(now func() time.Time) *Chooser {
 	if now == nil {
 		now = time.Now
 	}
-	return &Chooser{accounts: make(map[string]contracts.Account), cooling: make(map[cooldownKey]cooldown), failures: make(map[cooldownKey]int), now: now}
+	return &Chooser{accounts: make(map[string]contracts.Account), buckets: make(map[string]bucketState), owner: make(map[string]string), cooling: make(map[cooldownKey]cooldown), failures: make(map[cooldownKey]int), now: now}
+}
+
+func bucketKey(platform, group string) string { return platform + "\x00" + group }
+
+// ReplaceBucket installs one bucket's accounts without disturbing others.
+// A changed bucket epoch clears only that bucket's local cooldowns. A zero
+// validUntil means "no freshness bound" (tests / static configurations).
+func (c *Chooser) ReplaceBucket(platform, group string, accounts []contracts.Account, epoch int64, validUntil time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	key := bucketKey(platform, group)
+	previous, existed := c.buckets[key]
+	if existed && epoch > 0 && previous.epoch > 0 && epoch != previous.epoch {
+		for cooling := range c.cooling {
+			if _, mine := previous.ids[cooling.accountID]; mine {
+				delete(c.cooling, cooling)
+				delete(c.failures, cooling)
+			}
+		}
+	}
+	for id := range previous.ids {
+		delete(c.accounts, id)
+		delete(c.owner, id)
+	}
+	next := bucketState{epoch: epoch, validUntil: validUntil, ids: make(map[string]struct{}, len(accounts))}
+	for _, account := range accounts {
+		if account.Platform != platform || account.Group != group {
+			continue
+		}
+		account.Limits = account.Limits.WithDefaults()
+		if owner, taken := c.owner[account.ID]; taken && owner != key {
+			continue
+		}
+		c.accounts[account.ID] = account
+		c.owner[account.ID] = key
+		next.ids[account.ID] = struct{}{}
+		for cooling, value := range c.cooling {
+			if cooling.accountID == account.ID && value.credentialVersion != account.Credential.Version {
+				delete(c.cooling, cooling)
+				delete(c.failures, cooling)
+			}
+		}
+	}
+	c.buckets[key] = next
+}
+
+// RemoveBucket drops a bucket that control no longer publishes.
+func (c *Chooser) RemoveBucket(platform, group string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	key := bucketKey(platform, group)
+	for id := range c.buckets[key].ids {
+		delete(c.accounts, id)
+		delete(c.owner, id)
+	}
+	delete(c.buckets, key)
+}
+
+// Buckets lists the bucket identities currently installed via ReplaceBucket.
+func (c *Chooser) Buckets() [][2]string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	out := make([][2]string, 0, len(c.buckets))
+	for key := range c.buckets {
+		platform, group, _ := strings.Cut(key, "\x00")
+		out = append(out, [2]string{platform, group})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i][0]+out[i][1] < out[j][0]+out[j][1] })
+	return out
 }
 
 func (c *Chooser) Replace(snapshot []contracts.Account) {
@@ -44,6 +125,8 @@ func (c *Chooser) ReplaceAtEpoch(snapshot []contracts.Account, epoch int64) {
 		c.failures = make(map[cooldownKey]int)
 	}
 	next := make(map[string]contracts.Account, len(snapshot))
+	c.buckets = make(map[string]bucketState)
+	c.owner = make(map[string]string)
 	for _, account := range snapshot {
 		account.Limits = account.Limits.WithDefaults()
 		next[account.ID] = account
@@ -70,11 +153,18 @@ func (c *Chooser) AcquireExcluding(criteria contracts.Criteria, excluded map[str
 	now := c.now()
 	ids := make([]string, 0)
 	quotaExcluded := false
+	staleExcluded := false
 	for id, account := range c.accounts {
 		if _, skip := excluded[id]; skip {
 			continue
 		}
-		if account.Provider != criteria.Platform && account.Platform != criteria.Platform {
+		if owner, ok := c.owner[id]; ok {
+			if bucket := c.buckets[owner]; !bucket.validUntil.IsZero() && !bucket.validUntil.After(now) {
+				staleExcluded = true
+				continue
+			}
+		}
+		if criteria.Platform != "" && account.Provider != criteria.Platform && account.Platform != criteria.Platform {
 			continue
 		}
 		if account.Group != criteria.Group || account.Status != "active" {
@@ -99,6 +189,9 @@ func (c *Chooser) AcquireExcluding(criteria contracts.Criteria, excluded map[str
 		if quotaExcluded {
 			return contracts.Lease{}, ErrQuotaExhausted
 		}
+		if staleExcluded {
+			return contracts.Lease{}, ErrSnapshotStale
+		}
 		return contracts.Lease{}, ErrNoAccount
 	}
 	sort.Strings(ids)
@@ -112,7 +205,7 @@ func (c *Chooser) AcquireExcluding(criteria contracts.Criteria, excluded map[str
 			ttl = 0
 		}
 	}
-	return contracts.Lease{AccountID: account.ID, Credential: account.Credential, Profile: account.Profile, Limits: account.Limits.WithDefaults(), TTL: ttl}, nil
+	return contracts.Lease{AccountID: account.ID, Provider: account.Provider, Credential: account.Credential, Profile: account.Profile, Limits: account.Limits.WithDefaults(), TTL: ttl}, nil
 }
 
 func hasQuota(account contracts.Account, model string) bool {

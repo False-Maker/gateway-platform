@@ -119,7 +119,10 @@ func (l AccountLimits) Valid() bool {
 }
 
 type Lease struct {
-	AccountID  string          `json:"account_id"`
+	AccountID string `json:"account_id"`
+	// Provider is the account's provider kind. Gateway derives per-provider
+	// request shaping from it so one process can serve mixed buckets.
+	Provider   string          `json:"provider,omitempty"`
 	Credential Credential      `json:"credential"`
 	Profile    UpstreamProfile `json:"profile"`
 	Limits     AccountLimits   `json:"limits"`

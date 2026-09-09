@@ -30,6 +30,7 @@ import (
 	"github.com/elucid/gateway-platform/internal/control/provider/codex"
 	"github.com/elucid/gateway-platform/internal/events"
 	"github.com/elucid/gateway-platform/internal/snapshot"
+	"github.com/elucid/gateway-platform/migrations"
 	"github.com/elucid/gateway-platform/pkg/contracts"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
@@ -61,6 +62,9 @@ func TestProcessE2EControlGatewayRelease(t *testing.T) {
 	if _, err := db.Exec(ctx, string(migration)); err != nil {
 		t.Fatal(err)
 	}
+	if err := migrations.Apply(ctx, db); err != nil {
+		t.Fatal(err)
+	}
 
 	const sourceSystem = "a4-process-e2e"
 	const sourceID = "codex-local"
@@ -69,6 +73,15 @@ func TestProcessE2EControlGatewayRelease(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = cleanupProcessE2EAccount(context.Background(), db, accountID) }()
+	const tenantID = "a4-tenant"
+	if _, err := db.Exec(ctx, `DELETE FROM tenants WHERE id=$1`, tenantID); err != nil {
+		t.Fatal(err)
+	}
+	defer db.Exec(context.Background(), `DELETE FROM tenants WHERE id=$1`, tenantID)
+	_, tenantToken, err := control.CreateTenantToken(ctx, db, tenantID, "A4", tenantID+"-default", "default", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	key := bytes.Repeat([]byte{0x41}, 32)
 	cipher, err := credentials.NewCipher(key)
@@ -149,6 +162,10 @@ func TestProcessE2EControlGatewayRelease(t *testing.T) {
 		loaded, err := loader.Load(ctx, providerapi.KindCodex, "default")
 		return err == nil && len(loaded.Accounts) == 1 && loaded.Accounts[0].ID == accountID
 	})
+	waitForProcessE2E(t, 15*time.Second, func() bool {
+		tokens, err := snapshot.LoadTokens(ctx, rdb)
+		return err == nil && tokens[snapshot.HashToken(tenantToken)].TenantID == tenantID
+	})
 
 	gatewayProcess := startProcess(t, binary, processEnv(map[string]string{
 		"GATEWAY_REDIS_ADDR":     mini.Addr(),
@@ -156,7 +173,6 @@ func TestProcessE2EControlGatewayRelease(t *testing.T) {
 		"GATEWAY_REDIS_PASSWORD": "",
 		"GATEWAY_LISTEN_ADDR":    gatewayListen,
 		"GATEWAY_PRODUCER_ID":    "a4-gateway",
-		"GATEWAY_TENANT_ID":      "a4-tenant",
 		"GATEWAY_PROVIDER":       providerapi.KindCodex,
 	}), "--role", "gateway")
 	defer gatewayProcess.stop()
@@ -171,7 +187,24 @@ func TestProcessE2EControlGatewayRelease(t *testing.T) {
 
 	requestBody := []byte(`{"model":"fixture-model","messages":[{"role":"user","content":"hello"}]}`)
 	client := &http.Client{Timeout: 10 * time.Second}
-	response, err := client.Post("http://"+gatewayListen+"/v1/chat/completions", "application/json", bytes.NewReader(requestBody))
+	unauthenticated, err := client.Post("http://"+gatewayListen+"/v1/chat/completions", "application/json", bytes.NewReader(requestBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	unauthenticated.Body.Close()
+	if unauthenticated.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("request without tenant token: status=%d", unauthenticated.StatusCode)
+	}
+	if got := upstreamHits.Load(); got != 0 {
+		t.Fatalf("unauthenticated request reached upstream %d times", got)
+	}
+	authenticated, err := http.NewRequest(http.MethodPost, "http://"+gatewayListen+"/v1/chat/completions", bytes.NewReader(requestBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	authenticated.Header.Set("Content-Type", "application/json")
+	authenticated.Header.Set("Authorization", "Bearer "+tenantToken)
+	response, err := client.Do(authenticated)
 	if err != nil {
 		t.Fatal(err)
 	}

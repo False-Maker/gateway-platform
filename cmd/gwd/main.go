@@ -30,6 +30,12 @@ func main() {
 		}
 		return
 	}
+	if len(os.Args) > 2 && os.Args[1] == "tenant" && os.Args[2] == "create" {
+		if err := runTenantCreateCommand(os.Args[3:], os.Stdout); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
 	role := flag.String("role", "", "runtime role: gateway, control, or wrapper")
 	flag.Parse()
 
@@ -48,7 +54,7 @@ func main() {
 			break
 		}
 		flag.Usage()
-		fmt.Fprintln(os.Stderr, "--role must be gateway, control, or wrapper (or use: wrapper run)")
+		fmt.Fprintln(os.Stderr, "--role must be gateway, control, or wrapper (or use: wrapper run | import | tenant create)")
 		os.Exit(2)
 	}
 	if err != nil {
