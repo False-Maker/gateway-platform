@@ -62,7 +62,13 @@ go test -race -count=1 ./pkg/contracts ./internal/control/...
 `-buildvcs=false` 曾因缺失 `.git` 而必需，**现在不再需要**，历史文档里的该写法已过时。
 
 可选基础设施测试默认严格 skipped，需显式配置才运行：
-`GATEWAY_TEST_DATABASE_URL`、`GATEWAY_TEST_REDIS_*`。
+`GATEWAY_TEST_DATABASE_URL`、`GATEWAY_TEST_REDIS_*`。本机用 Docker 一键起：
+
+```
+docker compose -f configs/test-infra/docker-compose.yml up -d
+source configs/test-infra/test.env
+go test -count=1 -p 1 ./...     # 必须 -p 1：多个包共用一个 Redis DB 并 FLUSHDB
+```
 真实 provider harness 需 `GATEWAY_RUN_LIVE_PROVIDER_TESTS=1` + `GATEWAY_LIVE_CONFIRM=provider-admission`，默认不联网。
 
 ## 5. 架构速览

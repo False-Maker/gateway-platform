@@ -7,6 +7,40 @@
 > 阅读规则：本文的每一条都是**对已发生事实的描述**。不要从本文推断"项目是否可以继续开发"——
 > 那个问题由 `docs/TODO.md` 和 `AGENTS.md` §0 回答。
 
+## D1 Docker PostgreSQL + Redis 7.0.15 全量集成验收（2026-09-10）
+
+本轮 Docker daemon 已可连接（`docker info` 正常）。新增 `configs/test-infra/` 三个文件：
+`docker-compose.yml`（`postgres:16-alpine` 映射 `127.0.0.1:15432`，`redis:7.0.15-alpine` 映射
+`127.0.0.1:16389`，与既有 `new-api-dev-*` 容器互不干扰）、`redis-test.acl`（default 关闭；
+`test-admin` 全权；`test-control` 全键 `+@all -@dangerous +flushdb`；`test-gateway` 只读 `snap:*`、
+读写 `gateway:*`、仅限 limiter/事件所需命令；`test-wrapper` 与 `configs/redis-wrapper.acl` 同命令集、
+仅 `control:wrapper:*`）、`test.env`（对应的 `GATEWAY_TEST_*` 变量，全部为测试专用口令）。
+
+本轮实际执行并通过（`source configs/test-infra/test.env` 后）：
+
+- `/home/elucid/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/bin/go test -count=1 -p 1 ./...`：
+  23 个包全部 `ok`，退出码 0。
+- 同环境 `-v` 聚焦 `./cmd/gwd ./internal/control ./internal/control/wrapper`：以下此前只有历史证据或
+  从未在本机执行的用例本轮**首次真实通过，无一 SKIP**：
+  `TestProcessE2EControlGatewayRelease`（独立 control/gateway 进程 + PG ledger + 重复 Release 幂等）、
+  `TestImportCommandPublishesSnapshotAndGatewayCanChooseAccount`、`TestP2PostgresImportAndRefresh`、
+  `TestPostgresLedgerIdempotencyAndRecovery`、`TestPGSnapshotRepositoryReadsSchedulableAccounts`、
+  `TestAcceptanceRealRedisACLAndReliability`、`TestAcceptanceControlCrashAfterCommitBeforeAck`、
+  `TestAcceptanceGatewayCrashAfterAttemptStartedRecovery`、`TestP2RealRedisWrapperProcessLifecycle`、
+  `TestP2RealRedisQueueLifecycleAndGatewayIsolation`。
+- `go vet ./...`、`git diff --check`：通过。
+
+本轮排查并处理的两个环境问题（均非业务代码缺陷，未改任何 `.go` 文件）：
+
+1. Redis aclfile 不接受 `#` 注释行，首次启动失败；已把角色说明移到 compose 文件。
+2. 首次用 `redis:7-alpine`（实为 7.4.10）时 `TestP2RealRedisWrapperProcessLifecycle` 因硬编码断言
+   `redis_version:7.0.15` 失败，`TestP2RealRedisQueueLifecycleAndGatewayIsolation` 在默认并行 `go test`
+   下也失败（`cmd/gwd`、`internal/control`、`internal/control/wrapper` 三个包共用同一 Redis DB 并各自
+   `FLUSHDB`，互相清空对方的 pending）。改为 pin `redis:7.0.15-alpine` 并以 `-p 1` 串行后全部通过。
+   同一用例在 7.4.10 上是否存在真实 XCLAIM 语义差异**未单独验证**，本轮只确认 7.0.15 通过。
+
+本轮未执行真实 provider 请求、生产写入、部署或切流。
+
 ## D1 PostgreSQL 与真实 Redis 集成复核（2026-09-07）
 
 本轮检查了现有 PostgreSQL、真实 Redis ACL 和进程级集成测试入口。环境中未配置

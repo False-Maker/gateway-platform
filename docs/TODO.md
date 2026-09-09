@@ -12,7 +12,7 @@
 >
 > 当前状态：**A1-A5、B1、B2、B3 已完成，2026-09-06 审查修复、B2 多模态切片与 B3 quota 精度扩展已收口。** A5 的数据库实跑仍按可选 PostgreSQL 环境执行；缺少环境不等于缺少 provider 凭据，也不阻塞本地转换验证。
 >
-> **2026-09-10 复盘新增 A6、A7、A8（均 `[no-cred]`），并给 D1 定了解法。** 复盘发现设计文档要求但代码中不存在、且 TODO 从未列出的三个缺口：gateway 鉴权面/多 bucket、utls TLS profile、文档与代码漂移。当前取任务顺序：**先 D1，再 A6 → A7 → A8。** P4（B4）在 A6 之前不启动——没有 tenant 就没有可扣费主体。
+> **2026-09-10 复盘新增 A6、A7、A8（均 `[no-cred]`），并给 D1 定了解法。** 复盘发现设计文档要求但代码中不存在、且 TODO 从未列出的三个缺口：gateway 鉴权面/多 bucket、utls TLS profile、文档与代码漂移。D1 已于 2026-09-10 完成。当前取任务顺序：**A6 → A7 → A8。** P4（B4）在 A6 之前不启动——没有 tenant 就没有可扣费主体。
 
 ---
 
@@ -225,13 +225,13 @@ harness 默认严格 skipped，只接受已审计官方 base URL，不接受 fix
 - **D1** `[no-cred]` PostgreSQL + 真实 Redis 集成测试的复现。这些测试已存在但默认 skipped
   （`GATEWAY_TEST_DATABASE_URL` / `GATEWAY_TEST_REDIS_*`）。2026-09-02 有历史通过证据，
   之后未复现。**这需要的是本地容器，不是 provider 凭据**，因此是 `[no-cred]`。
-  **状态：2026-09-07 已复核，待测试基础设施可用后复现。** 本轮本地集成入口与 fixture 全部通过，
-  PostgreSQL/真实 Redis 用例因环境变量未配置而按设计严格 skipped；Docker CLI 可见但 WSL 中无法连接
-  Docker daemon，尚未获得真实 PG/Redis 验收证据。
-  **2026-09-10 定解法**：二选一，不再等 Docker——① 启用 Docker Desktop 的 WSL 集成；② 在 WSL 内直接
-  `apt install postgresql redis-server`，本地起服务后设置 `GATEWAY_TEST_DATABASE_URL` /
-  `GATEWAY_TEST_REDIS_*` 跑一次 `go test -count=1 ./...`。**D1 排在 A6 之前**：A4 的进程级 e2e、
-  ledger 幂等、fencing 至今只有 2026-09-02 一次历史证据，A6 会改这些路径，先要有基线。
+  **状态：已完成（2026-09-10）。** Docker daemon 已可用；`configs/test-infra/` 提供 compose、ACL 与
+  `test.env`。`source configs/test-infra/test.env && go test -count=1 -p 1 ./...` 23 个包全部通过，
+  A4 进程级 e2e、PG ledger 幂等、crash 恢复、真实 Redis ACL 与 wrapper 进程用例首次在本机真实跑通，
+  证据见 `docs/EVIDENCE.md`。**注意**：必须 `-p 1`（三个包共用 Redis DB 并 FLUSHDB），
+  Redis 镜像 pin 在 `7.0.15`（进程用例硬编码断言该版本）。
+  **遗留**：wrapper 进程用例对 7.0.15 的硬编码断言使其无法在更新的 Redis 上运行，是否放宽属后续决定；
+  `TestP2RealRedisQueueLifecycleAndGatewayIsolation` 在 7.4.10 上的失败未与并行干扰分离验证。
 - **D2** 生产 AES 密钥的 KMS / secret 托管与轮换。属部署边界，非仓库内工程任务。
 - **D3** Redis HA 拓扑与演练参数（部署侧）。冷启动拉不到快照即无法加入，无降级路径。
 - **D4** utls JA3 指纹跟随上游客户端版本更新 —— 目前是人工流程，无自动化

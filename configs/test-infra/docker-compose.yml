@@ -1,0 +1,44 @@
+# Local integration-test infrastructure for docs/TODO.md D1.
+# Independent of the new-api-dev-* containers; uses non-default host ports.
+#
+#   docker compose -f configs/test-infra/docker-compose.yml up -d
+#   source configs/test-infra/test.env
+#   go test -count=1 -p 1 ./...      # -p 1 is required: infra suites share one Redis DB and FLUSHDB it
+#   docker compose -f configs/test-infra/docker-compose.yml down -v
+#
+# redis-test.acl (Redis aclfile format forbids comments, so the roles are documented here;
+# secrets are test-only and must never be reused in deployment):
+#   test-admin   : test harness (FLUSHDB, ACL inspection, forced XCLAIM).
+#   test-control : full data access minus @dangerous (snapshot publish, stream consumer, wrapper enqueue).
+#   test-gateway : read-only snap:*, read/write gateway:* (limiter Lua, release stream).
+#                  Cannot publish snapshots, cannot read credentials:* or control:wrapper:*.
+#   test-wrapper : control:wrapper:* only, same command set as configs/redis-wrapper.acl.
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: gateway-test-pg
+    environment:
+      POSTGRES_USER: gateway
+      POSTGRES_PASSWORD: gateway-test
+      POSTGRES_DB: gateway_test
+    ports:
+      - "127.0.0.1:15432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gateway -d gateway_test"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+  redis:
+    # Pinned: internal/control/wrapper/process_integration_test.go asserts redis_version:7.0.15.
+    image: redis:7.0.15-alpine
+    container_name: gateway-test-redis
+    command: ["redis-server", "--aclfile", "/etc/redis/test.acl", "--appendonly", "no", "--save", ""]
+    volumes:
+      - ./redis-test.acl:/etc/redis/test.acl:ro
+    ports:
+      - "127.0.0.1:16389:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "--user", "test-admin", "--pass", "test-admin-secret", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
