@@ -331,18 +331,26 @@ Go 1.23 + Gin + pgx + Redis。**单一 Go module,一个二进制,`--role=gateway
 
 ```
 gateway-platform/            # 单 repo,单 module
-  cmd/gwd/main.go            # 入口,--role=gateway|control 分派
-  pkg/contracts/            # Criteria/Lease/UpstreamProfile/AccountLimits/Release + 六个 P0 类型(进程内共享)
-  internal/control/         # keyhive 角色:provider 隔离 / refresh / 产快照 / 每账号 fencing(internal/modules/* 分层)
-  internal/gateway/         # fluxgate 角色:选号 / 反代 / protokit / 运行时限流 + 负缓存
-  internal/snapshot/        # 快照读写(Redis,fencing/版本/grace-TTL),两角色共用
-  migrations/               # 独立 .sql 迁移文件(control 用;gateway 无 DB)
+  cmd/gwd/                   # 入口:--role=gateway|control|wrapper,子命令 import / tenant create
+  cmd/new-api-migrate/       # 一次性 new-api 迁移 CLI(默认 dry-run)
+  pkg/contracts/             # Criteria/Lease/UpstreamProfile/AccountLimits/Release/Quota + wrapper job 契约(进程内共享)
+  pkg/protokit/              # OpenAI Chat / Anthropic / Responses / Gemini 协议互转
+  internal/control/          # keyhive 角色:import / refresh / quota / 产快照 / 租户 token 发布 / 每账号 fencing(扁平包)
+  internal/control/provider/ # 一渠道一包 + registry + 共享 EndpointProfile
+  internal/control/wrapper/  # OAuth 执行器:Redis Stream 租约队列 / worker / PKCE
+  internal/control/credentials/ # AES-GCM 凭据信封
+  internal/gateway/          # fluxgate 角色:鉴权 / 多 bucket 选号 / 反代 / utls 指纹 / 运行时限流 + 负缓存
+  internal/snapshot/         # 快照与 token 哈希读写(Redis,fencing/版本/grace-TTL),两角色共用
+  internal/events/           # Redis Stream producer / consumer(attempt_started / release / DLQ)
+  internal/migration/newapi/ # new-api schema 读取与映射
+  migrations/                # 独立 .sql 迁移文件 + embed Apply(control 用;gateway 无 DB)
 ```
 
-- control:`internal/modules/*` 分层(service/repository/types/doc),独立 `.sql` 迁移。
+- control:目前是扁平包按文件划分,未采用 `internal/modules/*` 分层;独立 `.sql` 迁移。
 - gateway:无 DB;utls 做 JA3 伪装;Redis 消费快照 + 原子限流 + 事件产出。
 - 每账号 fencing 由 PG 的 `fence_epoch` 权威控制;Redis 只保存快照 bucket epoch/version。若保留任何全局 singleton 锁(定时任务),优先 PG 会话级 advisory lock(断连自动释放)。
 - **文档仍分三份,`fluxgate`/`keyhive` 作为角色名保留**;目录 `keyhive/`、`fluxgate/` 现阶段只放各自 doc,代码统一在 `internal/{control,gateway}`。
+- 第三个角色 `--role=wrapper`(OAuth 执行器)在 §1/§2 的两角色表述之外,以独立进程和独立 Redis ACL 身份运行,见 keyhive doc §3.3。
 
 ## 9. 参考项目总表
 

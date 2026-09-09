@@ -19,27 +19,31 @@ control 做三件事:
 
 一个上游渠道 = OAuth 策略 + upstream profile + quota adapter 三件事绑定。隔离到一个包里。
 
+实际布局(2026-09-10 对齐代码):
+
 ```
 internal/control/provider/
-  provider.go        // 只放接口 + registry,零依赖
-  codex/  claude/  gemini/  kiro/  github_copilot/  antigravity/  grok/  windsurf/
-    <name>.go        // 实现 Provider,init() 自注册
-    strategy.go      // OAuth: authorize / refresh / revoke
-    profile.go       // 产出 UpstreamProfile(反代配方,给 gateway)
-    quota.go         // 额度查询
-    const.go         // client_id / scope / cli 版本等魔数,全锁在此
+  provider.go        // 接口 + registry(按 provider kind + auth mode 解析)
+  profile.go         // 各渠道 EndpointProfile:官方 base URL / OAuth endpoint / client_id / TLS 指纹名 —— 魔数集中在此,不是每包一个 const.go
+  http.go            // 共享 OAuth code exchange / refresh / revoke HTTP 客户端(含 proxy)
+  quota.go           // QuotaInfo 归一化与 1 MiB 响应边界
+  builtin/           // RegisterAll:显式注册全部内置 provider(不是 init() 自注册)
+  codex/  claude/  gemini/  kiro/  copilot/  antigravity/  grok/  windsurf/
+    <name>.go        // 实现 Provider;OAuth 策略、Profile() 同在此文件
+    quota.go         // 有账号级额度 adapter 的渠道才有(codex / claude / antigravity / kiro)
 ```
 
 ```go
 type Provider interface {
     Kind() string
     Authorize(ctx context.Context, req ImportRequest) (TokenBundle, error)
-    Refresh(ctx context.Context, cred Credential) (TokenBundle, error)
+    Refresh(ctx context.Context, cred Credential) (TokenBundle, error) // 仅 static 退化路径;OAuth 用下方可选接口
     Revoke(ctx context.Context, cred Credential) error
     Profile(acc Account) UpstreamProfile
     Quota(ctx context.Context, cred Credential) (QuotaInfo, error)
 }
-func init() { provider.Register(&Codex{}) } // 新增渠道 = 加一个目录 + 一行 import
+// 可选能力接口:OAuthRefresher / OAuthRevoker(持 TokenBundle,refresh token 不出 control)、
+// AuthModeProvider、ImportProfileProvider。同一 kind 可同时注册 OAuth 与 API-key 两个实现。
 ```
 
 隔离硬边界:
@@ -84,7 +88,7 @@ func init() { provider.Register(&Codex{}) } // 新增渠道 = 加一个目录 + 
 ### 3.3 wrapper(OAuth 执行器):混合语言,lease 契约语言无关(评审 F6)
 wrapper 通过 **lease job 队列**(claim → 执行 → complete/fail)与 control 主进程解耦。job 契约定成**语言无关**(JSON over Redis/PG),因此执行器可混合语言:
 
-- **Go 侧**(`keyhive wrapper run` 子命令,即 `--role=control` 的 wrapper 子模式):pow、sentinel、pkce、device code、cli 驱动——这些是 browserless 纯算法/流程,Go 移植便宜(pow ~1-2 天、sentinel ~1 天)。
+- **Go 侧**(`gwd --role=wrapper`,兼容写法 `gwd wrapper run`;独立进程、独立 Redis ACL 身份):pow、sentinel、pkce、device code、cli 驱动——这些是 browserless 纯算法/流程,Go 移植便宜(pow ~1-2 天、sentinel ~1 天)。
 - **保留 Python turnstile 求解器**:Cloudflare Turnstile 是混淆 opcode 虚拟机的手写解释器(异构寄存器 + 一等 callable + JS 强制类型转换),Go 忠实移植 1-2+ 周且**静默失败**(未知 opcode 被吞、不报错只是登录被拒),每次 Cloudflare 轮换要重新逆向。作为独立 Python job worker 挂在同一 lease 契约后面,不阻塞 P2,不拖累主二进制。
 
 wrapper 通用性质:无状态、可多开;control 主进程仍是唯一 DB 写者(配合每账号 fencing);隔离脏活(跑 cli 子进程、开临时 PKCE 回调 http)。
@@ -102,7 +106,9 @@ v2 用**每账号 fencing token** 替代 v1 的全局单 leader:
 **控制状态(单写者 PG,随账号数增长)**
 - **accounts** —— 账号记录。上游凭据字段对齐 new-api channel(key / base_url / type / 模型映射 / **proxy** / 分组),供一次性导入无损;留 status 变更时间戳(账号健康看板用);带每账号 fencing 的 epoch/generation 列
 - **credentials** —— 凭据,加密存储(static secret / oauth token_bundle)
-- **import_templates** —— 导入模板
+- **quota_snapshot_outbox** —— quota 写入与 Redis 发布同事务的 outbox,发布失败时异步重试
+- **tenants / principals / tenant_tokens**(`002_tenants.sql`)—— 租户身份;token 只存 SHA-256,control 定期发布哈希到 Redis 供 gateway 鉴权
+- ~~import_templates~~ —— 未建表;导入模板目前由 `ImportRequest` JSON 文件 + `gwd import` 承担
 
 **计量(可靠 + 可聚合,计费必需)**
 - **usage_ledger** —— 消费 Release 落计量流水(tokens_in/out + model + account_id + tenant_id + **usage_source**),P4 计费读它;可按窗口聚合
@@ -112,7 +118,7 @@ v2 用**每账号 fencing token** 替代 v1 的全局单 leader:
 - **request_attempts** —— `attempt_id` 主键、`request_id`、`started_at`、`deadline_at`、`terminal_event_id`、`state`、`reconciled_at`。消费 `attempt_started` 后落库;超出 `attempt_lease` 且没有终态 Release 时,回收器写入唯一的 `missing/partial` 终态并关闭尝试。
 
 **请求明细(独立、可丢/可抽样存储,不进控制 PG)**
-- **request_logs** —— 请求明细,消费 Release 落明细(实时请求日志用);走 ClickHouse 风格独立存储或抽样,**不经过单写者、不与控制状态共库**
+- **request_logs** —— 请求明细,消费 Release 落明细(实时请求日志用);走 ClickHouse 风格独立存储或抽样,**不经过单写者、不与控制状态共库**。**当前未实现**:仓库内没有该存储,属 P6 控制台前置。
 
 **迁移 staging(新系统首次设计,不复用线上旧 migration map)**
 - `migration_runs` —— 源库快照时间、批次状态、校验摘要、dry-run/正式导入标记。
@@ -137,12 +143,12 @@ P0 索引与回收约束固定为:
 - [x] `internal/control/provider/provider.go`:接口 + registry
 - [x] **每账号 fencing** 写者骨架 + 周期任务 singleton 锁(PG advisory 优先);PG 是 `fence_epoch` 唯一权威,Redis 不承担账号写者权威
 - [x] 快照写入 + Redis Stream consumer 的空跑通道(无真实 provider),含 pending reclaim(60s)、最多 5 次重试、死信和坏版本处理。本地/miniredis 已覆盖，真实 Redis 验收 pending。
-- [ ] P1:PG `usage_ledger` 幂等写入,事务提交后 ACK,并通过重复投递与 control 崩溃恢复测试
-- [ ] P1:事件消费指标 `control_stream_pending` / `control_stream_reclaim_total` / `control_stream_dlq_total{reason}` / `usage_ledger_duplicate_total` / `request_attempt_recovered_total{source}`;合成终态和 `UsageSource=missing` 超阈值告警
+- [x] P1:PG `usage_ledger` 幂等写入,事务提交后 ACK,并通过重复投递与 control 崩溃恢复测试(`TestPostgresLedgerIdempotencyAndRecovery`、`TestAcceptanceControlCrashAfterCommitBeforeAck`、`TestAcceptanceGatewayCrashAfterAttemptStartedRecovery`,2026-09-10 在 Docker PG/Redis 真实通过)
+- [x] P1:事件消费指标 `control_stream_pending` / `control_stream_reclaim_total` / `control_stream_dlq_total{reason}` / `usage_ledger_duplicate_total` / `request_attempt_recovered_total{source}` / `request_attempt_open_age_seconds` / `release_xadd_total{result}` 已在 `internal/events`、`internal/control` 暴露(`/metrics` :9091)。**未做**:合成终态和 `UsageSource=missing` 的超阈值告警规则(部署侧 alerting)。
 - [ ] **平台级速率告警**:消费 Release 时按平台聚合 `forbidden_transport` / `blocked` 速率,超阈值告警——这是 R4(TLS 指纹时效)与出口 IP 被标记的**唯一探测机制**,不能只做账号级处理(总览 §6.3.1 规则 2)
-- [x] `keyhive wrapper run` 子命令骨架 + **语言无关** claim/complete/fail lease 契约(Go 与 Python worker 都能领)。本地进程与 Python fixture 已覆盖；临时 Redis 7.0.15 ACL/进程验收已有历史通过证据，本轮是否复现及当前边界以 `docs/EVIDENCE.md` 为准。
-- [ ] 建表:accounts / credentials / import_templates(控制 PG)+ usage_ledger(计量)+ request_logs(独立存储)+ migration staging——分表落地
+- [x] `gwd --role=wrapper` 进程 + **语言无关** claim/complete/fail lease 契约(Go 与 Python worker 都能领)。本地进程与 Python fixture 已覆盖；Redis 7.0.15 与 7.4.11 ACL/进程验收 2026-09-10 在 Docker 上通过。
+- [x] 建表(部分):accounts / credentials / quota_snapshot_outbox / tenants / principals / tenant_tokens(控制 PG)+ usage_ledger / request_attempts(计量与尝试)+ migration_runs / migration_records(staging)。**未建**:import_templates、request_logs(独立存储)。
 
 ## 6. 技术栈
 
-Go 1.23 + Gin + pgx + Redis;独立 `.sql` 迁移文件;`internal/control/modules/*` 分层(service/repository/types/doc);每账号 fencing 由 PG `fence_epoch` 权威控制;周期任务 singleton 锁优先 PG 会话级 advisory lock。turnstile 求解器为独立 Python job worker(挂 lease 契约)。
+Go 1.23 + Gin + pgx + Redis;独立 `.sql` 迁移文件(`migrations/`,由 `migrations.Apply` 按序 embed 应用);`internal/control` 目前为扁平包(service/repository 在同一包内按文件划分,如 `import.go`、`refresh.go`、`snapshot_loop.go`、`tenants.go`),未采用 `modules/*` 分层;每账号 fencing 由 PG `fence_epoch` 权威控制;周期任务 singleton 锁优先 PG 会话级 advisory lock。turnstile 求解器为独立 Python job worker(挂 lease 契约)。

@@ -7,6 +7,24 @@
 > 阅读规则：本文的每一条都是**对已发生事实的描述**。不要从本文推断"项目是否可以继续开发"——
 > 那个问题由 `docs/TODO.md` 和 `AGENTS.md` §0 回答。
 
+## A8 设计文档与代码对齐（2026-09-10，仅文档）
+
+对照仓库当前代码修正描述性内容，未改任何 `.go` 文件、设计决策或阶段计划：
+
+- `keyhive/docs/architecture.md`：§2 目录树改为实际布局（`profile.go` 集中魔数、`builtin.RegisterAll` 显式
+  注册、每 provider 单文件 + 可选 `quota.go`、`copilot/` 而非 `github_copilot/`），补充可选能力接口；§3.3
+  `keyhive wrapper run` → `gwd --role=wrapper`；§4 建表清单标注 `quota_snapshot_outbox`、tenants 三表已建，
+  `import_templates`、`request_logs` 未建；§5 checklist 依 2026-09-10 Docker 真实通过的用例勾选 ledger 幂等/
+  崩溃恢复与八项 P0 指标，建表项改为"部分"；§6 明确当前为扁平包而非 `modules/*` 分层。
+- `docs/fluxgate-keyhive-overview.md` §8：目录树补全 `cmd/new-api-migrate`、`pkg/protokit`、
+  `internal/{events,migration,control/wrapper,control/credentials}`，去掉 `modules/*` 描述，补 wrapper 第三角色说明。
+- `fluxgate/docs/architecture.md` §5：P1 验收项勾选并指向测试文件，新增入站鉴权交付项；§8 utls 版本与
+  `SessionKey` 未接线说明。
+- `docs/P2-ADMISSION.md`："仓库当前没有 AGENTS.md" 改为带日期的历史注记。
+
+核对方法：`ls internal/control/provider/`、`grep` 八个指标名、`grep forbidden_transport internal/control/*.go`
+（无非测试命中，平台级告警确未实现）。本轮无命令执行结果需要记录。
+
 ## A7 utls TLS 指纹注册表（2026-09-10）
 
 本轮实现 `docs/TODO.md` A7。`go.mod` 新增 `github.com/refraction-networking/utls v1.6.7`（间接引入

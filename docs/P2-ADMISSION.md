@@ -119,6 +119,6 @@ provider 验收外，可以准备进入 P3。Codex/Claude 真实 OAuth、refresh
 行为仍为 pending，不能据此准入生产流量。生产 AES key 的 KMS/secret 托管与轮换仍是
 部署门槛。真实 provider 账号、生产连接、账号登录、切流和生产写入本轮均未执行。
 
-仓库当前没有 `AGENTS.md`；本轮按全局规则继续。最高剩余风险是未验证真实 Codex/Claude
+（本记录写于 2026-09-02，当时仓库尚无 `AGENTS.md`；该文件已于 2026-09-03 建立，本段保留为历史。）最高剩余风险是未验证真实 Codex/Claude
 服务端 OAuth/refresh/推理行为，以及生产密钥托管/轮换；这些不属于本轮 fixture worker
 闭环的证据范围。

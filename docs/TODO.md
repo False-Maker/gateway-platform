@@ -12,7 +12,10 @@
 >
 > 当前状态：**A1-A5、B1、B2、B3 已完成，2026-09-06 审查修复、B2 多模态切片与 B3 quota 精度扩展已收口。** A5 的数据库实跑仍按可选 PostgreSQL 环境执行；缺少环境不等于缺少 provider 凭据，也不阻塞本地转换验证。
 >
-> **2026-09-10 复盘新增 A6、A7、A8（均 `[no-cred]`），并给 D1 定了解法。** 复盘发现设计文档要求但代码中不存在、且 TODO 从未列出的三个缺口：gateway 鉴权面/多 bucket、utls TLS profile、文档与代码漂移。D1、A6、A7 已于 2026-09-10 完成。当前取任务顺序：**A8。** P4（B4）在 A6 之前不启动——没有 tenant 就没有可扣费主体。
+> **2026-09-10 复盘新增 A6、A7、A8（均 `[no-cred]`），并给 D1 定了解法。** 复盘发现设计文档要求但代码中不存在、且 TODO 从未列出的三个缺口：gateway 鉴权面/多 bucket、utls TLS profile、文档与代码漂移。D1、A6、A7、A8 已于 2026-09-10 完成。§A 全部收口。**下一步候选（按序）**：
+> ① A9 control 侧 ErrorClass 权威层 + 平台级 `forbidden_transport`/`blocked` 速率告警（keyhive §5 两条未勾选项，`[no-cred]`）；
+> ② A10 粘滞会话 `SessionKey` 按 tenant 接线 + per-tenant 限流（A6 遗留，`[no-cred]`）；
+> ③ B4 P4 计费（依赖 A6 tenant 已就位）。 P4（B4）在 A6 之前不启动——没有 tenant 就没有可扣费主体。
 
 ---
 
@@ -178,7 +181,9 @@ crypto/tls。证据见 `docs/EVIDENCE.md`。**未做**：真实上游是否接�
 
 ### A8 `[no-cred]` 设计文档与代码漂移
 
-**状态：未开始（2026-09-10 新增）**
+**状态：已完成（2026-09-10）。** 下列各条已在对应文档改为与代码一致；设计决策未动。`run.go` 的 reconcile
+重叠 tick 仅记录，未改代码。仍未勾选的 checklist 项（control 侧 ErrorClass 权威层、平台级速率告警、
+`UsageSource=missing` 告警规则）是真实缺口，不是文档漂移。
 
 已核对的不一致（只改与代码不符的描述，不改设计决策）：
 - `keyhive/docs/architecture.md` §2：目录写成每 provider 四文件（strategy/profile/quota/const）和
