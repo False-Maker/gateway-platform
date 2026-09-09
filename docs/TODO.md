@@ -12,9 +12,8 @@
 >
 > 当前状态：**A1-A5、B1、B2、B3 已完成，2026-09-06 审查修复、B2 多模态切片与 B3 quota 精度扩展已收口。** A5 的数据库实跑仍按可选 PostgreSQL 环境执行；缺少环境不等于缺少 provider 凭据，也不阻塞本地转换验证。
 >
-> **2026-09-10 复盘新增 A6、A7、A8（均 `[no-cred]`），并给 D1 定了解法。** 复盘发现设计文档要求但代码中不存在、且 TODO 从未列出的三个缺口：gateway 鉴权面/多 bucket、utls TLS profile、文档与代码漂移。D1、A6、A7、A8、A9 已于 2026-09-10 完成。**下一步候选（按序）**：
-> ① A10 粘滞会话 `SessionKey` 按 tenant 接线 + per-tenant 限流（A6 遗留，`[no-cred]`）；
-> ② B4 P4 计费（依赖 A6 tenant 已就位）。 P4（B4）在 A6 之前不启动——没有 tenant 就没有可扣费主体。
+> **2026-09-10 复盘新增 A6、A7、A8（均 `[no-cred]`），并给 D1 定了解法。** 复盘发现设计文档要求但代码中不存在、且 TODO 从未列出的三个缺口：gateway 鉴权面/多 bucket、utls TLS profile、文档与代码漂移。D1、A6、A7、A8、A9、A10 已于 2026-09-10 完成。§A 全部收口。**下一步：B4 P4 计费**（tenant、
+> per-tenant 限流、ledger 幂等均已就位；先定计费模型再动代码，见 B4 条目）。 P4（B4）在 A6 之前不启动——没有 tenant 就没有可扣费主体。
 
 ---
 
@@ -213,6 +212,25 @@ crypto/tls。证据见 `docs/EVIDENCE.md`。**未做**：真实上游是否接�
 
 证据见 `docs/EVIDENCE.md`。**未做**：告警规则本身（Prometheus alert / 通知）属部署侧；`auth_expired` 由
 refresh loop 结果驱动的语义已存在于 `refresh.go`，本轮未改；冷却时长为文档定值，未经真实上游回调。
+
+### A10 `[no-cred]` 粘滞会话按 tenant 接线 + per-tenant 限流
+
+**状态：已完成（2026-09-10）。**
+
+- **粘滞会话**：客户端可选带 `X-Session-Key` 头；gateway 以 `gateway:sticky:<tenant>:<sha256(session)[:16]>`
+  在 Redis 记 pin，TTL 取账号 `AccountLimits.StickyTTL`，为 0 时默认 5 分钟。选号时若 pin 的账号仍可调度
+  （未冷却、未排除、未被 failover 排除）则优先它，否则正常选号并重新 pin。键按 tenant 命名空间，同一
+  session key 在另一 tenant 下无效；原始 session key 不落 Redis；超长或含控制字符的 key 返回 400。
+  Redis 不可用时粘滞退化为普通选号，不影响正确性。
+- **per-tenant 限流**：`tenants.max_concurrency` / `tenants.rpm`（`004_tenant_limits.sql`，0 = 不限）随
+  token 快照下发到 `AuthContext.Limits`；gateway 在选号前用同一段原子 Lua 对
+  `gateway:tenant:concurrency:<tenant>` / `gateway:tenant:rpm:<tenant>:<minute>` 计数，超限 429 且错误
+  文案标明 tenant。tenant 限流始终 fail-closed（Redis 失联不放行）。`gwd tenant create` 新增
+  `--max-concurrency` / `--rpm`，缺省不改既有值。
+- `AuthContext` 经 request context 传入 handler，未改 `Handle*` 签名。测试 ACL 的 gateway 身份补 `+set`。
+
+证据见 `docs/EVIDENCE.md`。**未做**：按 principal 或按 token 的更细粒度限流；粘滞 pin 在 gateway 多实例
+间天然共享（Redis），但未做 pin 与账号删除的主动清理，靠 TTL 过期。
 
 ---
 

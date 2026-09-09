@@ -148,6 +148,13 @@ func (c *Chooser) Acquire(criteria contracts.Criteria) (contracts.Lease, error) 
 }
 
 func (c *Chooser) AcquireExcluding(criteria contracts.Criteria, excluded map[string]struct{}) (contracts.Lease, error) {
+	return c.AcquirePreferring(criteria, "", excluded)
+}
+
+// AcquirePreferring selects preferred when it is eligible (sticky sessions);
+// otherwise it falls back to normal deterministic selection. A pin to an
+// account that is cooling, excluded, or gone is simply ignored.
+func (c *Chooser) AcquirePreferring(criteria contracts.Criteria, preferred string, excluded map[string]struct{}) (contracts.Lease, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	now := c.now()
@@ -195,9 +202,16 @@ func (c *Chooser) AcquireExcluding(criteria contracts.Criteria, excluded map[str
 		return contracts.Lease{}, ErrNoAccount
 	}
 	sort.Strings(ids)
-	if criteria.SessionKey != "" { /* sticky mapping is enforced by Redis in production; local order stays deterministic */
+	chosen := ids[0]
+	if preferred != "" {
+		for _, id := range ids {
+			if id == preferred {
+				chosen = id
+				break
+			}
+		}
 	}
-	account := c.accounts[ids[0]]
+	account := c.accounts[chosen]
 	ttl := 0
 	if !account.Credential.ExpiresAt.IsZero() {
 		ttl = int(account.Credential.ExpiresAt.Sub(now).Seconds())

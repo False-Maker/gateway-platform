@@ -197,6 +197,7 @@ func TestProcessE2EControlGatewayRelease(t *testing.T) {
 	}
 	authenticated.Header.Set("Content-Type", "application/json")
 	authenticated.Header.Set("Authorization", "Bearer "+tenantToken)
+	authenticated.Header.Set("X-Session-Key", "a4-conversation")
 	response, err := client.Do(authenticated)
 	if err != nil {
 		t.Fatal(err)
@@ -221,6 +222,10 @@ func TestProcessE2EControlGatewayRelease(t *testing.T) {
 	default:
 	}
 
+	pinned, err := rdb.Get(ctx, "gateway:sticky:"+tenantID+":"+processE2ESessionHash("a4-conversation")).Result()
+	if err != nil || pinned != accountID {
+		t.Fatalf("session was not pinned by the gateway process: pinned=%q err=%v", pinned, err)
+	}
 	row := waitForProcessE2ELedger(t, db, accountID)
 	if row.StatusCode != http.StatusOK || contracts.ErrorClass(row.ErrorClass) != contracts.ErrorOK || row.TokensIn != 3 || row.TokensOut != 5 || row.UsageSource != contracts.UsageSourceUpstream || row.Partial {
 		t.Fatalf("unexpected usage ledger row: %#v", row)
@@ -439,6 +444,11 @@ func sourceDir(t *testing.T) string {
 		t.Fatal("cannot resolve test source directory")
 	}
 	return filepath.Dir(file)
+}
+
+func processE2ESessionHash(session string) string {
+	sum := sha256.Sum256([]byte(session))
+	return hex.EncodeToString(sum[:16])
 }
 
 func importedAccountIDForTest(sourceSystem, sourceID string) string {

@@ -21,6 +21,30 @@ type AuthContext struct {
 	PrincipalID string
 	TokenID     string
 	Group       string
+	Limits      TenantLimits
+	// SessionKey is the client's opaque conversation handle (X-Session-Key).
+	// It is only meaningful inside this tenant; the router fills it per request.
+	SessionKey string
+}
+
+// TenantLimits are tenant-wide ceilings published by control; 0 = unlimited.
+type TenantLimits struct {
+	MaxConcurrency int
+	RPM            int
+}
+
+type authContextKey struct{}
+
+// WithAuth attaches a verified AuthContext to the request context so the
+// handlers can read tenant limits and the session key without a signature
+// change on every Handle* entry point.
+func WithAuth(ctx context.Context, auth AuthContext) context.Context {
+	return context.WithValue(ctx, authContextKey{}, auth)
+}
+
+func authFromContext(ctx context.Context) (AuthContext, bool) {
+	auth, ok := ctx.Value(authContextKey{}).(AuthContext)
+	return auth, ok
 }
 
 // Authenticator resolves bearer tokens against the control-published token
@@ -90,7 +114,7 @@ func (a *Authenticator) Authenticate(raw string) (AuthContext, error) {
 	if group == "" {
 		group = "default"
 	}
-	return AuthContext{TenantID: record.TenantID, PrincipalID: record.PrincipalID, TokenID: record.TokenID, Group: group}, nil
+	return AuthContext{TenantID: record.TenantID, PrincipalID: record.PrincipalID, TokenID: record.TokenID, Group: group, Limits: TenantLimits{MaxConcurrency: record.MaxConcurrency, RPM: record.RPM}}, nil
 }
 
 // AuthenticateRequest extracts the bearer token from the Authorization header

@@ -10,7 +10,10 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-var ErrRateLimited = errors.New("rate limit exceeded")
+var (
+	ErrRateLimited       = errors.New("rate limit exceeded")
+	ErrTenantRateLimited = errors.New("tenant rate limit exceeded")
+)
 
 type Limiter struct{ Redis redis.UniversalClient }
 
@@ -44,16 +47,42 @@ return redis.call('DECR', KEYS[1])
 
 var noopRelease = func() {}
 
+// Acquire enforces the per-account limits carried on the lease.
 func (l Limiter) Acquire(ctx context.Context, lease contracts.Lease) (func(), error) {
-	if l.Redis == nil {
-		return l.fallback(lease.Limits)
-	}
+	limits := lease.Limits.WithDefaults()
 	key := fmt.Sprintf("gateway:concurrency:%s", lease.AccountID)
 	rpmKey := fmt.Sprintf("gateway:rpm:%s:%d", lease.AccountID, time.Now().Unix()/60)
-	limits := lease.Limits.WithDefaults()
-	result, err := acquireScript.Run(ctx, l.Redis, []string{key, rpmKey}, limits.MaxConcurrency, limits.RPM, (2 * time.Minute).Milliseconds()).Int64()
+	release, err := l.acquireKeys(ctx, key, rpmKey, limits.MaxConcurrency, limits.RPM, limits.DegradePolicy == contracts.DegradeFailOpen)
+	if errors.Is(err, ErrRateLimited) {
+		return nil, ErrRateLimited
+	}
+	return release, err
+}
+
+// AcquireTenant enforces the tenant's own concurrency/RPM ceiling, independent
+// of which account serves the request. Zero limits are unlimited and cost no
+// Redis round-trip. Tenant limits always fail closed: a tenant ceiling exists
+// to protect the pool from one caller, so losing Redis must not lift it.
+func (l Limiter) AcquireTenant(ctx context.Context, tenantID string, limits TenantLimits) (func(), error) {
+	if tenantID == "" || (limits.MaxConcurrency <= 0 && limits.RPM <= 0) {
+		return noopRelease, nil
+	}
+	key := fmt.Sprintf("gateway:tenant:concurrency:%s", tenantID)
+	rpmKey := fmt.Sprintf("gateway:tenant:rpm:%s:%d", tenantID, time.Now().Unix()/60)
+	release, err := l.acquireKeys(ctx, key, rpmKey, limits.MaxConcurrency, limits.RPM, false)
+	if errors.Is(err, ErrRateLimited) {
+		return nil, ErrTenantRateLimited
+	}
+	return release, err
+}
+
+func (l Limiter) acquireKeys(ctx context.Context, key, rpmKey string, maxConcurrency, rpm int, failOpen bool) (func(), error) {
+	if l.Redis == nil {
+		return l.fallback(failOpen)
+	}
+	result, err := acquireScript.Run(ctx, l.Redis, []string{key, rpmKey}, maxConcurrency, rpm, (2 * time.Minute).Milliseconds()).Int64()
 	if err != nil {
-		return l.fallback(limits)
+		return l.fallback(failOpen)
 	}
 	if result < 0 {
 		return nil, ErrRateLimited
@@ -65,8 +94,8 @@ func (l Limiter) Acquire(ctx context.Context, lease contracts.Lease) (func(), er
 	}, nil
 }
 
-func (l Limiter) fallback(limits contracts.AccountLimits) (func(), error) {
-	if limits.WithDefaults().DegradePolicy == contracts.DegradeFailOpen {
+func (l Limiter) fallback(failOpen bool) (func(), error) {
+	if failOpen {
 		return noopRelease, nil
 	}
 	return nil, errors.New("redis unavailable and rate limiting is fail_closed")

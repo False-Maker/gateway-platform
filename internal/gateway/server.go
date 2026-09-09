@@ -51,6 +51,8 @@ type Server struct {
 	HTTPClient     *http.Client
 	RequestTimeout time.Duration
 	Provider       string
+	// Sticky pins (tenant, session) -> account. Zero value disables stickiness.
+	Sticky Sticky
 	// ChooseAllPlatforms lets one gateway serve every bucket in its chooser.
 	// Provider then only acts as the fallback for leases without one.
 	ChooseAllPlatforms bool
@@ -72,6 +74,17 @@ func leaseProvider(s *Server, lease contracts.Lease) string {
 		return lease.Provider
 	}
 	return s.Provider
+}
+
+// pinSession refreshes the sticky pin for the account that actually served
+// this attempt. On failover the new account replaces the old pin, so a
+// cooling account is not re-selected by the same conversation.
+func (s *Server) pinSession(ctx context.Context, tenantID, sessionKey, pinned string, lease contracts.Lease) {
+	if sessionKey == "" {
+		return
+	}
+	ttl := time.Duration(lease.Limits.StickyTTL) * time.Second
+	s.Sticky.Pin(ctx, tenantID, sessionKey, lease.AccountID, ttl)
 }
 
 // criteriaPlatform is the chooser filter. ChooseAllPlatforms selects across
@@ -278,13 +291,21 @@ func (s *Server) handleProtocolStreaming(ctx context.Context, tenantID, group st
 	requestCtx, requestCancel := context.WithTimeout(ctx, deadline)
 	defer requestCancel()
 	requestID := newID("req")
-	lease, err := s.Chooser.Acquire(contracts.Criteria{Platform: s.criteriaPlatform(), Model: model, Group: group})
+	auth, _ := authFromContext(ctx)
+	releaseTenant, err := s.Limiter.AcquireTenant(requestCtx, tenantID, auth.Limits)
+	if err != nil {
+		return http.StatusTooManyRequests, err
+	}
+	defer releaseTenant()
+	pinned := s.Sticky.Lookup(requestCtx, tenantID, auth.SessionKey)
+	lease, err := s.Chooser.AcquirePreferring(contracts.Criteria{Platform: s.criteriaPlatform(), Model: model, Group: group}, pinned, nil)
 	if err != nil {
 		if errors.Is(err, ErrQuotaExhausted) {
 			return http.StatusTooManyRequests, err
 		}
 		return http.StatusServiceUnavailable, err
 	}
+	s.pinSession(requestCtx, tenantID, auth.SessionKey, pinned, lease)
 	upstreamProtocol, err := selectedProtocol(leaseProvider(s, lease), lease.Profile)
 	if err != nil {
 		return http.StatusBadGateway, err
@@ -1228,11 +1249,18 @@ func (s *Server) handleNonStreaming(ctx context.Context, tenantID, group string,
 	ctx, cancel := context.WithTimeout(ctx, deadline)
 	defer cancel()
 	requestID := newID("req")
+	auth, _ := authFromContext(ctx)
+	releaseTenant, err := s.Limiter.AcquireTenant(ctx, tenantID, auth.Limits)
+	if err != nil {
+		return nil, http.StatusTooManyRequests, err
+	}
+	defer releaseTenant()
+	pinned := s.Sticky.Lookup(ctx, tenantID, auth.SessionKey)
 	var lastStatus int
 	var lastErr error
 	attemptedAccounts := make(map[string]struct{})
 	for attemptNo := 1; attemptNo <= 2; attemptNo++ {
-		lease, err := s.Chooser.AcquireExcluding(contracts.Criteria{Platform: s.criteriaPlatform(), Model: request.Model, Group: group}, attemptedAccounts)
+		lease, err := s.Chooser.AcquirePreferring(contracts.Criteria{Platform: s.criteriaPlatform(), Model: request.Model, Group: group}, pinned, attemptedAccounts)
 		if err != nil {
 			if lastErr != nil {
 				if lastStatus == 0 {
@@ -1246,6 +1274,7 @@ func (s *Server) handleNonStreaming(ctx context.Context, tenantID, group string,
 			return nil, http.StatusServiceUnavailable, err
 		}
 		attemptedAccounts[lease.AccountID] = struct{}{}
+		s.pinSession(ctx, tenantID, auth.SessionKey, pinned, lease)
 		releaseLimiter, err := s.Limiter.Acquire(ctx, lease)
 		if err != nil {
 			return nil, http.StatusTooManyRequests, err

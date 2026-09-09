@@ -17,6 +17,10 @@ import (
 
 const snapshotPollInterval = 5 * time.Second
 
+// SessionKeyHeader carries the client's sticky-session handle. It is optional;
+// without it every request is scheduled independently.
+const SessionKeyHeader = "X-Session-Key"
+
 func Run(cfg Config) error {
 	rdb := redis.NewClient(&redis.Options{Addr: cfg.RedisAddr, Username: cfg.RedisUsername, Password: cfg.RedisPassword})
 	defer rdb.Close()
@@ -26,6 +30,7 @@ func Run(cfg Config) error {
 	}
 	server := NewServer(eventsProducer(rdb, cfg.ProducerID), provider)
 	server.ChooseAllPlatforms = true
+	server.Sticky = Sticky{Redis: rdb}
 	ctx := context.Background()
 	loader := BucketLoader{Redis: rdb, Chooser: server.Chooser}
 	if err := loader.RefreshAll(ctx); err != nil {
@@ -95,7 +100,14 @@ func NewRouter(server *Server, auth *Authenticator) *gin.Engine {
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": ErrUnauthorized.Error()})
 			return
 		}
+		sessionKey, err := normalizeSessionKey(c.GetHeader(SessionKeyHeader))
+		if err != nil {
+			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		authCtx.SessionKey = sessionKey
 		c.Set("auth", authCtx)
+		c.Request = c.Request.WithContext(WithAuth(c.Request.Context(), authCtx))
 		c.Next()
 	})
 	authenticated.POST("/v1/chat/completions", func(c *gin.Context) {

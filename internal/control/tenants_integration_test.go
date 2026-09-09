@@ -64,8 +64,27 @@ func TestPGTenantTokensPublishAndRevoke(t *testing.T) {
 		t.Fatal(err)
 	}
 	live, ok := published[snapshot.HashToken(liveToken)]
-	if !ok || live.TenantID != tenantID || live.Group != "vip" || live.PrincipalID != tenantID+"-p" {
+	if !ok || live.TenantID != tenantID || live.Group != "vip" || live.PrincipalID != tenantID+"-p" || live.MaxConcurrency != 0 || live.RPM != 0 {
 		t.Fatalf("live token record=%#v ok=%t", live, ok)
+	}
+	// A10: limits set at creation are published; nil fields keep existing values.
+	four, sixty := 4, 60
+	if _, _, err := CreateTenantTokenWithLimits(ctx, db, tenantID, "", tenantID+"-p", "vip", nil, TenantLimitSpec{MaxConcurrency: &four, RPM: &sixty}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := CreateTenantTokenWithLimits(ctx, db, tenantID, "", tenantID+"-p", "vip", nil, TenantLimitSpec{RPM: &four}); err != nil {
+		t.Fatal(err)
+	}
+	negative := -1
+	if _, _, err := CreateTenantTokenWithLimits(ctx, db, tenantID, "", tenantID+"-p", "vip", nil, TenantLimitSpec{RPM: &negative}); err == nil {
+		t.Fatal("negative tenant limit accepted")
+	}
+	if err := loop.RunOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	published, _ = snapshot.LoadTokens(ctx, rdb)
+	if live := published[snapshot.HashToken(liveToken)]; live.MaxConcurrency != 4 || live.RPM != 4 {
+		t.Fatalf("tenant limits not published (concurrency kept, rpm updated): %#v", live)
 	}
 	if _, ok := published[snapshot.HashToken(expiredToken)]; ok {
 		t.Fatal("expired token was published")

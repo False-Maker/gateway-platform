@@ -28,6 +28,9 @@ type TokenRecord struct {
 	PrincipalID string    `json:"principal_id"`
 	Group       string    `json:"group"`
 	ExpiresAt   time.Time `json:"expires_at,omitempty"`
+	// Tenant-wide ceilings; 0 = unlimited.
+	MaxConcurrency int `json:"max_concurrency,omitempty"`
+	RPM            int `json:"rpm,omitempty"`
 }
 
 func (r TokenRecord) Validate() error {
@@ -35,6 +38,9 @@ func (r TokenRecord) Validate() error {
 		if strings.TrimSpace(value) == "" {
 			return fmt.Errorf("token record missing %s", name)
 		}
+	}
+	if r.MaxConcurrency < 0 || r.RPM < 0 {
+		return errors.New("token record limits must be non-negative")
 	}
 	return nil
 }

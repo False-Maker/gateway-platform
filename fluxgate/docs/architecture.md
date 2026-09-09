@@ -76,6 +76,7 @@ gateway 是纯执行器 —— 渠道的业务逻辑(client_id、refresh)全在 
 - [x] P1:Release `XADD` 成功后才确认非流式请求,包含 tokens/model/account/tenant + **UsageSource + Partial**
 - [x] P1 验收:按总览 §7.1 注入 `XADD`→`XACK` 间 control 崩溃、重复 event/attempt 重放、`attempt_started`→终态 Release 间 gateway 崩溃;分别断言至少一次投递、ledger 单行幂等和 synthetic `missing/partial` 终态回收(`internal/control/acceptance_integration_test.go`、`cmd/gwd/process_e2e_test.go`,2026-09-10 在 Docker PG/Redis 真实通过)
 - [x] 入站鉴权:三个推理路由先验 Bearer / `x-api-key`,`AuthContext` 派生 tenant/group,请求体同名字段忽略;gateway 装载全部 bucket(`internal/gateway/auth.go`、`run.go`)
+- [x] P1:粘滞会话(`X-Session-Key`,按 tenant 命名空间,pin 到冷却账号时自动换号重 pin)+ per-tenant 并发/RPM 限流(fail-closed)(`sticky.go`、`limiter.go`)
 - [x] P0:TLS profile 注册表 + `codex_rustls` / `node24` 从 relay 搬入(`internal/gateway/tlsprofile.go`,未知名 fail-closed;真实上游接受度属 live-gate)
 - [x] P0:`protokit` module 接口与本地协议转换实现(usage 字段 + UsageSource 贯穿约束)
 - [x] P1:运行时限流(Redis 原子)骨架 + **按渠道读 `AccountLimits.DegradePolicy` 的降级分支**(§6,默认 fail_closed)
@@ -99,4 +100,4 @@ gateway 无 DB,但 Redis 在热路径上承担三件事:**消费快照(唯一数
 
 ## 8. 技术栈
 
-Go 1.23 + Gin;utls(github.com/refraction-networking/utls v1.6.7)做 JA3 伪装;Redis 客户端(消费快照 + token 哈希 + 原子限流 + 事件产出)。无 DB —— gateway 无持久状态。粘滞会话映射(`Criteria.SessionKey`)尚未接线。
+Go 1.23 + Gin;utls(github.com/refraction-networking/utls v1.6.7)做 JA3 伪装;Redis 客户端(消费快照 + token 哈希 + 原子限流(账号级 + tenant 级) + 粘滞映射 `gateway:sticky:<tenant>:<hash>` + 事件产出)。无 DB —— gateway 无持久状态。

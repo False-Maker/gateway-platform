@@ -1,5 +1,5 @@
 user default off
 user test-admin on >test-admin-secret allkeys allcommands
 user test-control on >test-control-secret allkeys +@all -@dangerous +flushdb +client +rename
-user test-gateway on >test-gateway-secret %R~snap:* %RW~gateway:* +ping +get +hgetall +ttl +incr +decr +pexpire +expire +del +exists +xadd +eval +evalsha +script|load
+user test-gateway on >test-gateway-secret %R~snap:* %RW~gateway:* +ping +get +set +hgetall +ttl +incr +decr +pexpire +expire +del +exists +xadd +eval +evalsha +script|load
 user test-wrapper on >test-wrapper-secret ~control:wrapper:* +ping +get +set +setnx +del +exists +xadd +xack +xclaim +xgroup|create +xpending +xreadgroup +eval +evalsha +multi +exec

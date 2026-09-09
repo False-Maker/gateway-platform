@@ -7,6 +7,26 @@
 > 阅读规则：本文的每一条都是**对已发生事实的描述**。不要从本文推断"项目是否可以继续开发"——
 > 那个问题由 `docs/TODO.md` 和 `AGENTS.md` §0 回答。
 
+## A10 粘滞会话 + per-tenant 限流（2026-09-10）
+
+实现见 `docs/TODO.md` A10。本轮实际执行并通过：
+
+- Docker Redis 7.0.15 上 `redis-cli` 实测 ACL：`test-gateway` 可 `SET gateway:sticky:*`，对 `snap:*` 的 `SET`
+  被 NOPERM 拒绝。
+- 无基础设施 `go test -count=1 ./...` 全部通过；`source configs/test-infra/test.env && go test -count=1 -p 1 ./...`
+  连续两轮全部通过；`go vet ./...`、`go test -race` 覆盖 gateway/control/snapshot、`git diff --check` 通过。
+- 新增回归：`TestStickyIsTenantScopedAndDegradesWithoutRedis`（跨 tenant 不可见、原始 key 不落 Redis、TTL、
+  重 pin、零值 Sticky 惰性、key 校验）；`TestChooserPrefersPinnedAccountOnlyWhenEligible`（pin 命中、pin 到
+  排除/未知/冷却账号被忽略、pin 不覆盖 failover 排除）；`TestTenantLimiterIsIndependentOfAccountLimits`
+  （0 限额不碰 Redis、并发/RPM 上限、租户间与账号限流互不影响、无 Redis fail-closed）；
+  `TestRouterAppliesStickySessionsAndTenantLimits`（HTTP 层：pin 到非默认账号后三次连续命中、其他 session
+  与其他 tenant 不受影响、首个请求自动 pin、超长 key 400、并发上限时第二请求 429 而其他 tenant 正常、RPM
+  上限）。`TestPGTenantTokensPublishAndRevoke` 增补：创建时设限额并发布、nil 字段保留旧值、负数拒绝。
+  `TestProcessE2EControlGatewayRelease` 增补：带 `X-Session-Key` 的真实请求后 Redis 出现对应 pin 且指向
+  实际服务账号。
+
+未执行真实 provider 请求、生产写入或部署。
+
 ## A9 control 侧 ErrorClass 权威层 + 平台级速率告警（2026-09-10）
 
 实现见 `docs/TODO.md` A9 摘要。本轮实际执行并通过：

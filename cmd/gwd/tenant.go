@@ -37,6 +37,8 @@ func runTenantCreateCommand(args []string, output io.Writer) error {
 	principalID := flags.String("principal", "", "principal ID (defaults to <tenant>-default)")
 	group := flags.String("group", "default", "account group this token schedules from")
 	ttl := flags.Duration("ttl", 0, "token lifetime, e.g. 720h (0 = no expiry)")
+	maxConcurrency := flags.Int("max-concurrency", -1, "tenant-wide concurrent request ceiling (0 = unlimited; omit to keep existing)")
+	rpm := flags.Int("rpm", -1, "tenant-wide requests per minute (0 = unlimited; omit to keep existing)")
 	if err := flags.Parse(args); err != nil {
 		return fmt.Errorf("parse tenant flags: %w", err)
 	}
@@ -66,7 +68,14 @@ func runTenantCreateCommand(args []string, output io.Writer) error {
 		expiresAt = &at
 		result.ExpiresAt = at.Format(time.RFC3339)
 	}
-	tokenID, raw, err := control.CreateTenantToken(ctx, db, *tenantID, *name, *principalID, *group, expiresAt)
+	var limits control.TenantLimitSpec
+	if *maxConcurrency >= 0 {
+		limits.MaxConcurrency = maxConcurrency
+	}
+	if *rpm >= 0 {
+		limits.RPM = rpm
+	}
+	tokenID, raw, err := control.CreateTenantTokenWithLimits(ctx, db, *tenantID, *name, *principalID, *group, expiresAt, limits)
 	if err != nil {
 		return err
 	}
