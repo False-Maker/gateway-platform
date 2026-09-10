@@ -195,6 +195,10 @@ func startWrapperProcess(t *testing.T, binary string, cfg processRedisConfig, wo
 		"GATEWAY_WRAPPER_LEASE_TTL_SECONDS="+itoa(leaseTTL),
 		"GATEWAY_WRAPPER_POLL_INTERVAL_MS=10",
 		"GATEWAY_WRAPPER_EXECUTOR=fixture",
+		// E2: the fixture executor now needs a second, independent confirmation
+		// that this worker is not production. This acceptance test is exactly
+		// the case the flag exists for, so it opts in explicitly.
+		"GATEWAY_WRAPPER_ALLOW_FIXTURE=true",
 		"GATEWAY_WRAPPER_FIXTURE_DELAY_MS="+itoa(fixtureDelayMS),
 	)
 	if err := cmd.Start(); err != nil {

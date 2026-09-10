@@ -105,6 +105,18 @@ func (c AuthorizeClient) Authorize(ctx context.Context, providerName string) (co
 }
 
 func (c AuthorizeClient) AuthorizeWithProxy(ctx context.Context, providerName, proxy string) (contracts.TokenBundle, error) {
+	return c.authorize(ctx, providerName, proxy, "pkce")
+}
+
+// AuthorizeDevice enqueues the device-authorization variant. The producer side
+// is identical to PKCE -- same queue, same envelope, same terminal contract --
+// and only the auth_mode inside the encrypted input differs, which is what
+// routes the job to DeviceExecutor on the worker.
+func (c AuthorizeClient) AuthorizeDevice(ctx context.Context, providerName, proxy string) (contracts.TokenBundle, error) {
+	return c.authorize(ctx, providerName, proxy, deviceAuthMode)
+}
+
+func (c AuthorizeClient) authorize(ctx context.Context, providerName, proxy, authMode string) (contracts.TokenBundle, error) {
 	if c.Queue.Redis == nil || c.Cipher == nil {
 		return contracts.TokenBundle{}, errors.New("wrapper authorize client is not configured")
 	}
@@ -115,7 +127,7 @@ func (c AuthorizeClient) AuthorizeWithProxy(ctx context.Context, providerName, p
 	if err != nil {
 		return contracts.TokenBundle{}, err
 	}
-	plaintext, err := json.Marshal(authorizeInput{AuthMode: "pkce", Proxy: strings.TrimSpace(proxy)})
+	plaintext, err := json.Marshal(authorizeInput{AuthMode: authMode, Proxy: strings.TrimSpace(proxy)})
 	if err != nil {
 		return contracts.TokenBundle{}, err
 	}

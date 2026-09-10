@@ -26,7 +26,9 @@
 > **§B4 到此闭合。**~~下一步在 `B5 控制台` 与并行项 A12 / E1 / E2 / C6(no-cred 部分) 之间取。~~
 > `A12 请求明细存储` 2026-09-11 完成（见 `docs/A12-REQUEST-DETAIL.md`），**§A 到此闭合**。
 > 下一步在 `B5 控制台` 与并行项 E1 / E2 / C6(no-cred 部分) 之间取。
-> `E1 告警规则落点` 2026-09-11 完成。下一步在 `B5 控制台` 与 `E2` / `C6(no-cred 部分)` 之间取。
+> `E1 告警规则落点` 2026-09-11 完成。
+> `E2 wrapper 其余 executor（no-cred 部分）` 2026-09-11 完成。
+> 下一步在 `B5 控制台` 与 `C6(no-cred 部分)` 之间取。
 > A12/E1/E2 不阻塞 B4，可并行取。P4（B4）在 A11 之前不进入编码——迁移来的用户还停在 staging，没有可扣费主体。
 
 ---
@@ -529,17 +531,31 @@ harness 默认严格 skipped，只接受已审计官方 base URL，不接受 fix
   - `control_billing_held_rows` 有了告警，但 held 行仍无人工处理入口（既有未决项）。
 
 - **E2** `[no-cred]` **wrapper 其余 executor 的 no-cred 部分**。
-  **状态：未开始。**
+  **状态：2026-09-11 完成。**详见 `docs/E2-WRAPPER-EXECUTORS.md`。
   **基线**：A3 的 DoD 是"至少打通一个 provider 的一种模式"，PKCE 已达标，A3 的验收成立。
-  但 device / CLI / PoW / turnstile executor 一个都没有实现，
-  `internal/control/wrapper/run.go:43` 在无配置时仍回落到 `FixtureExecutor`
-  （其自述为 "test-only"，注释已声明"Production configuration uses PKCEExecutor"）。
+  但 device / CLI / PoW / turnstile executor 一个都没有实现。
+  ~~`internal/control/wrapper/run.go:43` 在无配置时仍回落到 `FixtureExecutor`。~~
+  **该基线描述有误，本轮更正**：`executorFromConfig` 早已把 `""` 与 `"oauth"` 映射到 `PKCEExecutor`，
+  `ConfigFromEnv` 默认值也是 `ExecutorOAuth`，"无配置回落 stub"在本轮开始前就不成立。
+  真实缺口是 `GATEWAY_WRAPPER_EXECUTOR=fixture` **在生产里依然可选且无任何护栏**。
   **结论**：这与当初 A3 是同一性质的缺口——**参数生成、job 分发、错误归类这些不需要真实账号的部分
   现在不在任何清单上**，只有端到端授权属 live-gate。
   **DoD**
-  - 按 A3 已建立的模式，为 device flow 补 executor 骨架：参数生成、回调 / 轮询处理、错误归类，
-    用本地 fixture HTTP server 验证；真实授权码交换属 C4，不在本任务内。
-  - `FixtureExecutor` 的生产回落路径收紧：生产配置下选不到真实 executor 应**显式失败**，
-    而不是静默跑 stub（这正是 A3 基线里"永远收不到活、收到也只跑 stub"的成因）。
-  - CLI / PoW / turnstile：先只确认各自需要哪些 no-cred 前置（总览 §9 标注 turnstile 保留 Python），
-    写进文档，不在本任务内实现。
+  - ~~按 A3 已建立的模式，为 device flow 补 executor 骨架~~ 完成：`internal/control/wrapper/device.go`，
+    RFC 8628 参数生成 / 轮询（含 `slow_down` +5s）/ 六类错误归类，本地 fixture HTTP server 验证。
+  - ~~`FixtureExecutor` 的生产回落路径收紧~~ 完成：改为**两个独立 env 确认**
+    （`GATEWAY_WRAPPER_EXECUTOR=fixture` + `GATEWAY_WRAPPER_ALLOW_FIXTURE=true`），缺一即启动失败；
+    并新增 `authModeRouter` 按加密 input 里的 `auth_mode` 分发，无人认领即显式失败。
+  - ~~CLI / PoW / turnstile：先只确认各自需要哪些 no-cred 前置~~ 完成：写入
+    `docs/E2-WRAPPER-EXECUTORS.md` §3。
+  **本轮未做（有意）**
+  - `defaultDeviceProfile` 的 copilot `TokenURL` **留空**，生产路径必然 `device_profile_pending` 失败。
+    端点在蓝本里有记载，但只轮询它拿到的是 GitHub token 而非 Copilot 凭据；
+    缺的第二次交换（`copilot_internal/v2/token`）本轮未实现。**C4 必须两者同时补**，
+    否则 job 会"成功"并返回无法服务流量的 token。
+  - 真实 device 授权**一次都没跑过**（无凭据，属 live-gate）。
+  - CLI / PoW / turnstile 未实现；`WrapperJob` / `TokenBundle` 未扩字段——
+    等 `docs/E2-WRAPPER-EXECUTORS.md` §3.1 第 1 条的架构决定（CLI 类会把 worker 绑死在具体主机上）。
+  **顺带推进**：总览附录 P2 未决问题"codex CLI 端点是否需要每请求 PoW/turnstile"，
+  蓝本证据指向**不需要**（`/backend-api/codex/responses` 只带 Bearer，不走 sentinel）。
+  未经真实上游验证，P2 落地前需实测复核。

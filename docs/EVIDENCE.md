@@ -7,6 +7,69 @@
 > 阅读规则：本文的每一条都是**对已发生事实的描述**。不要从本文推断"项目是否可以继续开发"——
 > 那个问题由 `docs/TODO.md` 和 `AGENTS.md` §0 回答。
 
+## E2 wrapper 其余 executor（no-cred 部分）（2026-09-11）
+
+本轮做三件事：device flow executor 骨架、收紧 `FixtureExecutor` 生产回落、
+把 CLI/PoW/turnstile 的 no-cred 前置写进文档。真实授权交换属 C4，不在本轮。
+详见 `docs/E2-WRAPPER-EXECUTORS.md`。
+
+### 改动
+- 新增 `internal/control/wrapper/device.go`：RFC 8628 device flow executor
+  （参数生成、轮询含 `slow_down` +5s、六类错误归类）。
+- 新增 `internal/control/wrapper/device_test.go`：本地 RFC 8628 fixture server，9 个测试。
+- 新增 `docs/E2-WRAPPER-EXECUTORS.md`。
+- `run.go`：`fixture` 改为需两个独立 env 确认；新增 `authModeRouter` 按加密 input 的
+  `auth_mode` 分发。
+- `config.go` / `config_test.go`：新增 `AllowFixtureExecutor`（严格等于 `"true"`）。
+- `oauth.go`：拆出 `AuthorizeDevice`，与 PKCE 共用同一队列与信封，只差 `auth_mode`。
+- `process_integration_test.go`：该验收测试起真实 wrapper 进程跑 fixture，
+  **本轮的新门禁把它挡掉了**，因此为它显式加上 `GATEWAY_WRAPPER_ALLOW_FIXTURE=true`。
+
+### 本轮执行（命令与结果）
+- `gofmt -l .` → 仅 `internal/control/health.go`、`cmd/new-api-migrate/main_test.go` 命中，
+  两者均为**既有**问题，本轮未改动这两个文件。本轮新增/修改的文件全部干净。
+- `go build ./...`、`go vet ./...` → 通过。
+- 无凭据基线 `env -u GATEWAY_TEST_DATABASE_URL -u GATEWAY_TEST_REDIS_ADDR
+  -u GATEWAY_TEST_CLICKHOUSE_URL go test -count=1 ./...` → 24 个包全绿。
+- 带凭据 `set -a; source configs/test-infra/test.env; set +a; go test -count=1 -p 1 ./...`
+  → **全绿**。
+  - 首次运行出现两处 FAIL，均已查明：
+    ① `TestP2RealRedisWrapperProcessLifecycle` —— **本轮引入的真实回归**，
+       新门禁使 wrapper 进程启动即退出、终态未写。这正是门禁该有的行为，
+       是该测试的环境早于门禁；补 `GATEWAY_WRAPPER_ALLOW_FIXTURE=true` 后通过。
+    ② `TestBillingJobSettlesLedgerRowsAndWalletInOneTransaction` —— 既有的
+       共享库污染型顺序依赖失败（`cmd/gwd` 集成测试遗留 `usage_ledger` 行，
+       而该断言用的是全局计数）。**本次复跑通过**，说明它是间歇性的，不是稳定失败。
+       本轮未改动计费代码。
+- **对 `slow_down` 守卫做了变异验证**：删掉 `interval += increment` 后，
+  `TestDeviceExecutorSlowsDownWhenAsked` 如期失败
+  （`second poll came after 1.709375ms, want at least 80ms`）；还原后重新通过。
+  即这条断言确实会红，不是恒真。
+
+### 明确未由本轮证实
+- **真实 GitHub device 授权一次都没跑过。**全部验证都对着本地 fixture HTTP server，
+  它是照 RFC 8628 写的，不是 GitHub 的实际行为。"协议实现正确"不等于"上游接受"。
+- `defaultDeviceProfile` 的 copilot `TokenURL` **有意留空**，生产路径必然以
+  `device_profile_pending` 失败。端点在蓝本（elucid-relay `deviceDefaults`）里有记载，
+  但只轮询它拿到的是 GitHub token 而非 Copilot 凭据，缺的第二次交换
+  （`copilot_internal/v2/token`）本轮未实现。**故意不填**：填了 job 会"成功"
+  并返回无法服务流量的 token，正是本轮要消除的静默成功。
+- `docs/E2-WRAPPER-EXECUTORS.md` §3 的全部结论来自**本地参考实现**
+  （chatgpt2api / elucid-relay），**未对真实上游实测**。其中包括那条推进了总览附录
+  P2 未决问题的结论（codex `/backend-api/codex/responses` 只带 Bearer、不走 sentinel，
+  故不需要每请求 PoW/turnstile）——**这是蓝本证据，不是实测**，P2 落地前需复核。
+- CLI / PoW / turnstile 未实现，其架构前提（CLI executor 会把 worker 绑死在具体主机上，
+  且引入命令执行入口）尚未决策。
+- 无 CI，以上命令均为手动执行。
+
+### 最高剩余风险
+device executor 的正确性只被**自己写的 fixture** 验证过。fixture 是照我对 RFC 8628 的
+理解构造的，因此凡是"我理解错了协议"的地方，fixture 会以同样的方式错，测试照样全绿——
+这类错误本轮的验证结构**探测不到**。真正的判据只有 C4 拿真实账号跑一次。
+在那之前，"device flow 已实现"只应读作"骨架与错误分类已就位"，不能读作"可用"。
+
+---
+
 ## E1 告警规则落点（2026-09-11）
 
 本轮只做一件事：给自 A9 起一路埋下、但从来没有消费方的指标接上告警规则。

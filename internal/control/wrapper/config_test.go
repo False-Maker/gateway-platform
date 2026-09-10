@@ -1,6 +1,7 @@
 package wrapper
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -43,7 +44,35 @@ func TestExecutorFromConfigRequiresEnvelopeKeyOutsideFixtureMode(t *testing.T) {
 	if _, err := executorFromConfig(Config{ExecutorMode: ExecutorOAuth, LeaseTTLSeconds: 600}); err == nil {
 		t.Fatal("OAuth executor accepted an empty envelope key")
 	}
-	if _, err := executorFromConfig(Config{ExecutorMode: ExecutorFixture}); err != nil {
-		t.Fatalf("fixture executor should be explicitly selectable: %v", err)
+	if _, err := executorFromConfig(Config{ExecutorMode: ExecutorFixture, AllowFixtureExecutor: true}); err != nil {
+		t.Fatalf("fixture executor should be selectable once explicitly confirmed: %v", err)
+	}
+}
+
+// E2: a single misconfigured env var must not be enough to put a worker on the
+// stub. The stub completes every job, so the failure is silent -- the whole
+// point of this check is that it happens at startup instead.
+func TestFixtureExecutorRequiresASecondExplicitConfirmation(t *testing.T) {
+	executor, err := executorFromConfig(Config{ExecutorMode: ExecutorFixture})
+	if err == nil {
+		t.Fatalf("fixture executor was selected without confirmation: %#v", executor)
+	}
+	if !strings.Contains(err.Error(), "GATEWAY_WRAPPER_ALLOW_FIXTURE") {
+		t.Fatalf("refusal does not name the confirmation it wants: %v", err)
+	}
+}
+
+func TestConfigFromEnvDoesNotAllowFixtureByDefault(t *testing.T) {
+	t.Setenv("GATEWAY_WRAPPER_ALLOW_FIXTURE", "")
+	if ConfigFromEnv().AllowFixtureExecutor {
+		t.Fatal("fixture executor is allowed by default")
+	}
+	t.Setenv("GATEWAY_WRAPPER_ALLOW_FIXTURE", "1")
+	if ConfigFromEnv().AllowFixtureExecutor {
+		t.Fatal("a truthy-looking value other than \"true\" enabled the fixture executor")
+	}
+	t.Setenv("GATEWAY_WRAPPER_ALLOW_FIXTURE", "true")
+	if !ConfigFromEnv().AllowFixtureExecutor {
+		t.Fatal("explicit confirmation was not honoured")
 	}
 }

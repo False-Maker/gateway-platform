@@ -20,6 +20,9 @@ type Config struct {
 	EnvelopeKey     string
 	CallbackTimeout time.Duration
 	FixtureDelay    time.Duration
+	// AllowFixtureExecutor is the second, independent confirmation required
+	// before the stub executor can run. See executorFromConfig.
+	AllowFixtureExecutor bool
 }
 
 func ConfigFromEnv() Config {
@@ -34,6 +37,8 @@ func ConfigFromEnv() Config {
 		EnvelopeKey:     os.Getenv("GATEWAY_WRAPPER_ENVELOPE_KEY"),
 		CallbackTimeout: time.Duration(getenvInt("GATEWAY_WRAPPER_CALLBACK_TIMEOUT_SECONDS", 300)) * time.Second,
 		FixtureDelay:    time.Duration(getenvInt("GATEWAY_WRAPPER_FIXTURE_DELAY_MS", 0)) * time.Millisecond,
+
+		AllowFixtureExecutor: os.Getenv("GATEWAY_WRAPPER_ALLOW_FIXTURE") == "true",
 	}
 }
 
