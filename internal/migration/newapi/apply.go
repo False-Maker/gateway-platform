@@ -40,6 +40,16 @@ func Apply(ctx context.Context, db *pgxpool.Pool, cipher *credentials.Cipher, pl
 			return err
 		}
 	}
+	for _, planned := range plan.Tenants {
+		if err := applyTenant(ctx, tx, plan.SourceSystem, planned); err != nil {
+			return err
+		}
+	}
+	for _, planned := range plan.TenantTokens {
+		if err := applyTenantToken(ctx, tx, planned); err != nil {
+			return err
+		}
+	}
 	for _, record := range plan.Records {
 		if err := applyRecord(ctx, tx, runID, plan.SourceSystem, record); err != nil {
 			return err
@@ -103,6 +113,51 @@ func applyAccount(ctx context.Context, tx pgx.Tx, cipher *credentials.Cipher, so
 		return fmt.Errorf("link credential for %s: %w", accountID, err)
 	} else if result.RowsAffected() != 1 {
 		return fmt.Errorf("fence lost while linking credential for %s", accountID)
+	}
+	return nil
+}
+
+// applyTenant upserts the tenant and its default principal. Name and status
+// follow the source on every run; max_concurrency / rpm (A10) are operator
+// settings on the target and are deliberately left untouched by a re-apply.
+func applyTenant(ctx context.Context, tx pgx.Tx, sourceSystem string, planned PlannedTenant) error {
+	if _, err := tx.Exec(ctx, `INSERT INTO tenants (id,name,status,source_system,source_id)
+		VALUES ($1,$2,$3,$4,$5)
+		ON CONFLICT (id) DO UPDATE SET name=EXCLUDED.name,status=EXCLUDED.status,
+			source_system=EXCLUDED.source_system,source_id=EXCLUDED.source_id,updated_at=now()`,
+		planned.TenantID, planned.Name, planned.Status, sourceSystem, planned.SourceID); err != nil {
+		return fmt.Errorf("upsert tenant %s: %w", planned.SourceID, err)
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO principals (id,tenant_id,kind,status)
+		VALUES ($1,$2,'user',$3)
+		ON CONFLICT (id) DO UPDATE SET status=EXCLUDED.status`,
+		planned.PrincipalID, planned.TenantID, planned.Status); err != nil {
+		return fmt.Errorf("upsert principal %s: %w", planned.SourceID, err)
+	}
+	// ON CONFLICT never moves a principal between tenants, so verify ownership
+	// explicitly rather than silently attaching tokens to someone else's tenant.
+	var owner string
+	if err := tx.QueryRow(ctx, `SELECT tenant_id FROM principals WHERE id=$1`, planned.PrincipalID).Scan(&owner); err != nil {
+		return fmt.Errorf("verify principal %s: %w", planned.SourceID, err)
+	}
+	if owner != planned.TenantID {
+		return fmt.Errorf("principal %s belongs to tenant %s, not %s", planned.PrincipalID, owner, planned.TenantID)
+	}
+	return nil
+}
+
+// applyTenantToken upserts one tenant_tokens row. revoked_at keeps its first
+// value across re-applies so a repeat run does not rewrite history; a token
+// that the source re-enabled clears it.
+func applyTenantToken(ctx context.Context, tx pgx.Tx, planned PlannedTenantToken) error {
+	revoked := planned.Status == "revoked"
+	if _, err := tx.Exec(ctx, `INSERT INTO tenant_tokens (id,tenant_id,principal_id,token_hash,"group",status,expires_at,revoked_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,CASE WHEN $8 THEN now() END)
+		ON CONFLICT (id) DO UPDATE SET tenant_id=EXCLUDED.tenant_id,principal_id=EXCLUDED.principal_id,
+			token_hash=EXCLUDED.token_hash,"group"=EXCLUDED."group",status=EXCLUDED.status,expires_at=EXCLUDED.expires_at,
+			revoked_at=CASE WHEN $8 THEN COALESCE(tenant_tokens.revoked_at, now()) END`,
+		planned.TokenID, planned.TenantID, planned.PrincipalID, planned.TokenHash, planned.Group, planned.Status, planned.ExpiresAt, revoked); err != nil {
+		return fmt.Errorf("upsert tenant token %s: %w", planned.SourceID, err)
 	}
 	return nil
 }

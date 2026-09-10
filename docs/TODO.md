@@ -20,7 +20,7 @@
 > 同时把原来只有一行字的 B4 拆成 **B4.0–B4.5**，每项带 DoD。
 >
 > **下一步顺序（已定）**：~~`B4.0 定计费模型（不写代码）`~~（2026-09-10 完成，见 `docs/B4-BILLING-MODEL.md`）
-> → `A11 迁移 tenant 转正` → `B4.1+ 计费编码`。
+> → ~~`A11 迁移 tenant 转正`~~（2026-09-11 完成）→ `B4.1+ 计费编码`。
 > A12/E1/E2 不阻塞 B4，可并行取。P4（B4）在 A11 之前不进入编码——迁移来的用户还停在 staging，没有可扣费主体。
 
 ---
@@ -242,7 +242,12 @@ refresh loop 结果驱动的语义已存在于 `refresh.go`，本轮未改；冷
 
 ### A11 `[no-cred]` A5 迁移的 `staging_only` 记录转正为 tenants / principals 行
 
-**状态：未开始。B4 编码的硬前置。**
+**状态：已完成（2026-09-11）。** `BuildPlan` 产出 `Plan.Tenants` / `Plan.TenantTokens`，`Apply` 在同一事务内 upsert
+tenants / principals / tenant_tokens；摘要新增 `tenant_count` / `principal_count` / `tenant_token_count`。
+两点需要知道的取舍：(1) token hash 取的是 **`sk-<key>`** 形式——new-api 库里存的是不带前缀的裸 key，客户端拿到的是
+`sk-` 前缀形式，其鉴权中间件会剥掉前缀；只迁这一种形式，**不**复刻 new-api 同时接受裸 key 的宽松回退，否则一份凭据有两个
+撤销点。(2) tenant / principal / token 的 id 是 `source_system + source_id` 的哈希，不是 `tenant-<user id>`，避免与
+`gwd tenant create` 手工选的 id 撞车。证据见 `docs/EVIDENCE.md`。
 
 **基线**
 - A5 实现时目标库还没有 tenants 表，因此 `internal/migration/newapi/plan.go` 的 `addSourceRecords`

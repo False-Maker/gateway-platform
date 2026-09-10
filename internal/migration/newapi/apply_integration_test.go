@@ -6,8 +6,11 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/elucid/gateway-platform/internal/control"
 	"github.com/elucid/gateway-platform/internal/control/credentials"
+	authsnapshot "github.com/elucid/gateway-platform/internal/snapshot"
 	"github.com/elucid/gateway-platform/migrations"
 	"github.com/elucid/gateway-platform/pkg/contracts"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -38,7 +41,7 @@ func openTargetTestPool(t *testing.T) (context.Context, *pgxpool.Pool) {
 	if err := migrations.Apply(ctx, db); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Exec(ctx, `TRUNCATE migration_records, migration_runs, usage_ledger, request_attempts, credentials, accounts RESTART IDENTITY CASCADE`); err != nil {
+	if _, err := db.Exec(ctx, `TRUNCATE migration_records, migration_runs, usage_ledger, request_attempts, credentials, accounts, tenant_tokens, principals, tenants RESTART IDENTITY CASCADE`); err != nil {
 		t.Fatal(err)
 	}
 	// Clean up on the way out as well. The test database is shared across
@@ -50,6 +53,7 @@ func openTargetTestPool(t *testing.T) (context.Context, *pgxpool.Pool) {
 		for _, statement := range []string{
 			`DELETE FROM accounts WHERE source_system=$1`,
 			`DELETE FROM migration_runs WHERE source_system=$1`,
+			`DELETE FROM tenants WHERE source_system=$1`,
 		} {
 			if _, err := db.Exec(background, statement, SourceSystem); err != nil {
 				t.Errorf("clean up %q: %v", statement, err)
@@ -84,8 +88,11 @@ func applyTestPlan(t *testing.T) Plan {
 				Key: `{"access_token":"` + testCodexAccess + `","refresh_token":"` + testCodexRefres + `","account_id":"acct-1","email":"a@example.test"}`,
 			},
 		},
-		Users:  []SourceUser{{ID: 3, Username: "alice", Status: 1, Quota: "500000"}},
-		Tokens: []SourceToken{{ID: 11, UserID: 3, Status: 1, Key: "plaintext-token-key"}},
+		Users: []SourceUser{{ID: 3, Username: "alice", Status: 1, Quota: "500000", Group: "vip"}},
+		Tokens: []SourceToken{
+			{ID: 11, UserID: 3, Status: 1, Key: "plaintext-token-key", ExpiredTime: "-1"},
+			{ID: 12, UserID: 3, Status: 2, Key: "plaintext-revoked-key", ExpiredTime: "1800000000"},
+		},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -210,12 +217,15 @@ func TestApplyNeverWritesPlaintextSecretsToAnyColumn(t *testing.T) {
 	// the fixture secrets. This is deliberately blunt: it catches a plaintext
 	// leak into profile, raw_summary or conversion_result, not just into
 	// encrypted_secret.
-	secrets := []string{testClaudeKey, testCodexAccess, testCodexRefres, "plaintext-token-key"}
+	secrets := []string{testClaudeKey, testCodexAccess, testCodexRefres, "plaintext-token-key", "plaintext-revoked-key"}
 	for _, query := range []string{
 		`SELECT accounts::text FROM accounts`,
 		`SELECT credentials::text FROM credentials`,
 		`SELECT migration_records::text FROM migration_records`,
 		`SELECT migration_runs::text FROM migration_runs`,
+		`SELECT tenants::text FROM tenants`,
+		`SELECT principals::text FROM principals`,
+		`SELECT tenant_tokens::text FROM tenant_tokens`,
 	} {
 		rows, err := db.Query(ctx, query)
 		if err != nil {
@@ -366,5 +376,100 @@ func TestApplyGeneratesARunIDWhenNoneIsSupplied(t *testing.T) {
 	}
 	if recordsWithRun == 0 {
 		t.Error("records were not tagged with the generated run id")
+	}
+}
+
+// A11: users/tokens are promoted to real tenants / principals / tenant_tokens
+// rows. The row must be exactly what control's ListActiveTokens filters on,
+// keyed by the hash of the bearer form new-api clients actually send.
+func TestApplyPromotesTenantsPrincipalsAndTokensIdempotently(t *testing.T) {
+	ctx, db := openTargetTestPool(t)
+	cipher := testCipher(t)
+	plan := applyTestPlan(t)
+	if len(plan.Tenants) != 1 || len(plan.TenantTokens) != 2 {
+		t.Fatalf("fixture drifted: %d tenants / %d tokens", len(plan.Tenants), len(plan.TenantTokens))
+	}
+	tenant, active, revoked := plan.Tenants[0], plan.TenantTokens[0], plan.TenantTokens[1]
+
+	if err := Apply(ctx, db, cipher, plan, "run-1"); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	var name, status, sourceID string
+	if err := db.QueryRow(ctx, `SELECT name, status, source_id FROM tenants WHERE id=$1 AND source_system=$2`, tenant.TenantID, SourceSystem).Scan(&name, &status, &sourceID); err != nil {
+		t.Fatalf("tenant row: %v", err)
+	}
+	if name != "alice" || status != "active" || sourceID != "user:3" {
+		t.Errorf("tenant row = %q %q %q", name, status, sourceID)
+	}
+	var principalTenant string
+	if err := db.QueryRow(ctx, `SELECT tenant_id FROM principals WHERE id=$1`, tenant.PrincipalID).Scan(&principalTenant); err != nil {
+		t.Fatalf("principal row: %v", err)
+	}
+	if principalTenant != tenant.TenantID {
+		t.Errorf("principal belongs to %q, want %q", principalTenant, tenant.TenantID)
+	}
+
+	// The stored hash is over "sk-<key>", so an unchanged new-api client key
+	// authenticates against the gateway without redistribution.
+	var storedHash, storedGroup, storedStatus string
+	var expiresAt, revokedAt *time.Time
+	if err := db.QueryRow(ctx, `SELECT token_hash, "group", status, expires_at, revoked_at FROM tenant_tokens WHERE id=$1`, active.TokenID).Scan(&storedHash, &storedGroup, &storedStatus, &expiresAt, &revokedAt); err != nil {
+		t.Fatalf("active token row: %v", err)
+	}
+	if storedHash != authsnapshot.HashToken("sk-plaintext-token-key") {
+		t.Error("active token hash is not over the sk- bearer form")
+	}
+	if storedGroup != "vip" || storedStatus != "active" || expiresAt != nil || revokedAt != nil {
+		t.Errorf("active token row = group %q status %q expires %v revoked %v", storedGroup, storedStatus, expiresAt, revokedAt)
+	}
+	var firstRevokedAt *time.Time
+	if err := db.QueryRow(ctx, `SELECT status, expires_at, revoked_at FROM tenant_tokens WHERE id=$1`, revoked.TokenID).Scan(&storedStatus, &expiresAt, &firstRevokedAt); err != nil {
+		t.Fatalf("revoked token row: %v", err)
+	}
+	if storedStatus != "revoked" || firstRevokedAt == nil || expiresAt == nil || expiresAt.Unix() != 1800000000 {
+		t.Errorf("revoked token row = status %q expires %v revoked %v", storedStatus, expiresAt, firstRevokedAt)
+	}
+
+	// Exactly the active token must be visible to control's publisher; the
+	// revoked one must not. This is the query gateway auth ultimately depends on.
+	records, err := control.PGTenantRepository{DB: db}.ListActiveTokens(ctx, time.Now())
+	if err != nil {
+		t.Fatalf("ListActiveTokens: %v", err)
+	}
+	published, ok := records[authsnapshot.HashToken("sk-plaintext-token-key")]
+	if len(records) != 1 || !ok || published.TokenID != active.TokenID || published.TenantID != tenant.TenantID || published.PrincipalID != tenant.PrincipalID {
+		t.Fatalf("ListActiveTokens returned %+v", records)
+	}
+	if published.Group != "vip" {
+		t.Errorf("published group = %q", published.Group)
+	}
+
+	// An operator-set A10 limit must survive a re-apply; the migration only
+	// owns identity and status.
+	if _, err := db.Exec(ctx, `UPDATE tenants SET rpm=42 WHERE id=$1`, tenant.TenantID); err != nil {
+		t.Fatal(err)
+	}
+	if err := Apply(ctx, db, cipher, plan, "run-2"); err != nil {
+		t.Fatalf("second Apply: %v", err)
+	}
+	var tenantCount, principalCount, tokenCount, rpm int
+	var secondRevokedAt *time.Time
+	if err := db.QueryRow(ctx, `SELECT
+			(SELECT count(*) FROM tenants WHERE source_system=$1),
+			(SELECT count(*) FROM principals),
+			(SELECT count(*) FROM tenant_tokens),
+			(SELECT rpm FROM tenants WHERE id=$2),
+			(SELECT revoked_at FROM tenant_tokens WHERE id=$3)`, SourceSystem, tenant.TenantID, revoked.TokenID).Scan(&tenantCount, &principalCount, &tokenCount, &rpm, &secondRevokedAt); err != nil {
+		t.Fatal(err)
+	}
+	if tenantCount != 1 || principalCount != 1 || tokenCount != 2 {
+		t.Errorf("re-apply produced %d tenants / %d principals / %d tokens", tenantCount, principalCount, tokenCount)
+	}
+	if rpm != 42 {
+		t.Errorf("re-apply reset tenants.rpm to %d", rpm)
+	}
+	if secondRevokedAt == nil || !secondRevokedAt.Equal(*firstRevokedAt) {
+		t.Errorf("re-apply moved revoked_at from %v to %v", firstRevokedAt, secondRevokedAt)
 	}
 }

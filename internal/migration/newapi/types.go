@@ -96,10 +96,38 @@ type MigrationRecord struct {
 	Status          string
 }
 
+// PlannedTenant is one new-api user promoted to a tenants row plus its single
+// default principal. Quota and balance are deliberately absent: A11 migrates
+// identity only, and B4 owns every unit conversion.
+type PlannedTenant struct {
+	SourceID     string
+	SourceUserID int64
+	TenantID     string
+	PrincipalID  string
+	Name         string
+	Status       string // active | suspended
+}
+
+// PlannedTenantToken carries only what tenant_tokens stores. The plaintext key
+// is hashed inside BuildPlan and never leaves it.
+type PlannedTenantToken struct {
+	SourceID     string
+	TokenID      string
+	TenantID     string
+	PrincipalID  string
+	TokenHash    string
+	Group        string
+	Status       string // active | revoked
+	SourceStatus int
+	ExpiresAt    *time.Time
+}
+
 type Plan struct {
 	SourceSystem string
 	Snapshot     SourceSnapshot
 	Accounts     []PlannedAccount
+	Tenants      []PlannedTenant
+	TenantTokens []PlannedTenantToken
 	Records      []MigrationRecord
 	Summary      Summary
 }
@@ -110,6 +138,9 @@ type Summary struct {
 	SourceDigest        string         `json:"source_digest"`
 	RecordCount         int            `json:"record_count"`
 	AccountCount        int            `json:"account_count"`
+	TenantCount         int            `json:"tenant_count"`
+	PrincipalCount      int            `json:"principal_count"`
+	TenantTokenCount    int            `json:"tenant_token_count"`
 	ImportedCount       int            `json:"imported_count"`
 	RejectedCount       int            `json:"rejected_count"`
 	ProviderCounts      map[string]int `json:"provider_counts"`

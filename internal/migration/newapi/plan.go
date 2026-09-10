@@ -15,6 +15,7 @@ import (
 	"github.com/elucid/gateway-platform/internal/control/provider/codex"
 	"github.com/elucid/gateway-platform/internal/control/provider/gemini"
 	"github.com/elucid/gateway-platform/internal/control/provider/grok"
+	authsnapshot "github.com/elucid/gateway-platform/internal/snapshot"
 	"github.com/elucid/gateway-platform/pkg/contracts"
 )
 
@@ -369,14 +370,193 @@ func (p *Plan) addImportedRecord(sourceID, kind, targetID string, raw, conversio
 	p.Summary.ImportedCount++
 }
 
+// new-api status constants (common/constants.go in new-api). Anything outside
+// these sets is rejected rather than guessed.
+const (
+	newAPIUserEnabled    = 1
+	newAPIUserDisabled   = 2
+	newAPITokenEnabled   = 1
+	newAPITokenDisabled  = 2
+	newAPITokenExpired   = 3
+	newAPITokenExhausted = 4
+)
+
+func mapUserStatus(status int) (string, error) {
+	switch status {
+	case newAPIUserEnabled:
+		return "active", nil
+	case newAPIUserDisabled:
+		return "suspended", nil
+	default:
+		return "", fmt.Errorf("unsupported user status %d", status)
+	}
+}
+
+// mapTokenStatus folds every non-enabled new-api state into revoked. Expired
+// and exhausted tokens cannot authenticate in new-api either, so this loses no
+// access; the source status is kept on the record for B4 to revisit exhausted.
+func mapTokenStatus(status int) (string, error) {
+	switch status {
+	case newAPITokenEnabled:
+		return "active", nil
+	case newAPITokenDisabled, newAPITokenExpired, newAPITokenExhausted:
+		return "revoked", nil
+	default:
+		return "", fmt.Errorf("unsupported token status %d", status)
+	}
+}
+
+// parseTokenExpiry maps new-api's tokens.expired_time (unix seconds, -1 for
+// never) to a nullable expiry. Zero is treated as never as well: it is the
+// column default on installations that predate the -1 sentinel.
+func parseTokenExpiry(raw string) (*time.Time, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return nil, nil
+	}
+	seconds, err := strconv.ParseInt(trimmed, 10, 64)
+	if err != nil {
+		return nil, fmt.Errorf("unparseable expired_time %q", raw)
+	}
+	if seconds <= 0 {
+		return nil, nil
+	}
+	expires := time.Unix(seconds, 0).UTC()
+	return &expires, nil
+}
+
+// bearerForm returns the value a client actually sends. new-api stores the
+// bare 48-char key and hands users `sk-<key>`; its auth middleware strips the
+// prefix on the way in. Only the prefixed form is migrated -- new-api also
+// accepts the bare key, but mirroring that would create two revocation points
+// for one credential.
+func bearerForm(key string) string {
+	if strings.HasPrefix(key, "sk-") {
+		return key
+	}
+	return "sk-" + key
+}
+
+func importedTenantID(sourceSystem, sourceID string) string {
+	return "tenant-" + importedHex(sourceSystem, sourceID)
+}
+
+func importedPrincipalID(sourceSystem, sourceID string) string {
+	return "principal-" + importedHex(sourceSystem, sourceID)
+}
+
+func importedTenantTokenID(sourceSystem, sourceID string) string {
+	return "token-" + importedHex(sourceSystem, sourceID)
+}
+
 func (p *Plan) addSourceRecords(snapshot SourceSnapshot) {
+	// Tenant ids are hashed rather than "tenant-<user id>" so they cannot
+	// collide with ids an operator picked by hand via `gwd tenant create`.
+	tenantsByUser := map[int64]PlannedTenant{}
+	userGroups := map[int64]string{}
 	for _, user := range snapshot.Users {
+		sourceID := fmt.Sprintf("user:%d", user.ID)
 		raw := map[string]any{"user_id": user.ID, "username": user.Username, "email": user.Email, "status": user.Status, "quota_raw": user.Quota, "used_quota_raw": user.UsedQuota, "group": user.Group}
-		p.addImportedRecord(fmt.Sprintf("user:%d", user.ID), "tenant", "tenant-"+strconv.FormatInt(user.ID, 10), raw, map[string]any{"staging_only": true, "default_principal_id": "principal-" + strconv.FormatInt(user.ID, 10)})
+		if user.ID <= 0 {
+			p.addRejected(sourceID, "tenant", "user id is not usable", raw)
+			continue
+		}
+		if _, dup := tenantsByUser[user.ID]; dup {
+			p.addRejected(sourceID, "tenant", "duplicate user id", raw)
+			continue
+		}
+		status, err := mapUserStatus(user.Status)
+		if err != nil {
+			p.addRejected(sourceID, "tenant", err.Error(), raw)
+			continue
+		}
+		name := strings.TrimSpace(user.Username)
+		if name == "" {
+			name = sourceID
+		}
+		planned := PlannedTenant{
+			SourceID:     sourceID,
+			SourceUserID: user.ID,
+			TenantID:     importedTenantID(p.SourceSystem, sourceID),
+			PrincipalID:  importedPrincipalID(p.SourceSystem, sourceID),
+			Name:         name,
+			Status:       status,
+		}
+		tenantsByUser[user.ID] = planned
+		userGroups[user.ID] = user.Group
+		p.Tenants = append(p.Tenants, planned)
+		p.Summary.TenantCount++
+		p.Summary.PrincipalCount++
+		p.addImportedRecord(sourceID, "tenant", planned.TenantID, raw, map[string]any{
+			"status":               status,
+			"default_principal_id": planned.PrincipalID,
+			// quota stays in source units until B4 defines the conversion.
+			"quota_staging_only": true,
+		})
 	}
 	for _, token := range snapshot.Tokens {
+		sourceID := fmt.Sprintf("token:%d", token.ID)
+		// key_sha256 is a digest of the JSON-encoded bare key for dry-run
+		// comparison only; it is deliberately not the auth hash tenant_tokens
+		// stores, so a records dump does not double as a credential verifier.
 		raw := map[string]any{"token_id": token.ID, "user_id": token.UserID, "status": token.Status, "expired_time_raw": token.ExpiredTime, "remain_quota_raw": token.RemainQuota, "group": token.Group, "key_sha256": digestString(token.Key)}
-		p.addImportedRecord(fmt.Sprintf("token:%d", token.ID), "token", "token-"+strconv.FormatInt(token.ID, 10), raw, map[string]any{"staging_only": true, "revoked": token.Status != 1})
+		if token.ID <= 0 {
+			p.addRejected(sourceID, "token", "token id is not usable", raw)
+			continue
+		}
+		tenant, ok := tenantsByUser[token.UserID]
+		if !ok {
+			p.addRejected(sourceID, "token", "token references a user that was not planned as a tenant", raw)
+			continue
+		}
+		if strings.TrimSpace(token.Key) == "" {
+			p.addRejected(sourceID, "token", "token key is empty", raw)
+			continue
+		}
+		status, err := mapTokenStatus(token.Status)
+		if err != nil {
+			p.addRejected(sourceID, "token", err.Error(), raw)
+			continue
+		}
+		expiresAt, err := parseTokenExpiry(token.ExpiredTime)
+		if err != nil {
+			p.addRejected(sourceID, "token", err.Error(), raw)
+			continue
+		}
+		group := strings.TrimSpace(token.Group)
+		if group == "" {
+			group = strings.TrimSpace(userGroups[token.UserID])
+		}
+		if group == "" {
+			group = "default"
+		}
+		planned := PlannedTenantToken{
+			SourceID:     sourceID,
+			TokenID:      importedTenantTokenID(p.SourceSystem, sourceID),
+			TenantID:     tenant.TenantID,
+			PrincipalID:  tenant.PrincipalID,
+			TokenHash:    authsnapshot.HashToken(bearerForm(strings.TrimSpace(token.Key))),
+			Group:        group,
+			Status:       status,
+			SourceStatus: token.Status,
+			ExpiresAt:    expiresAt,
+		}
+		p.TenantTokens = append(p.TenantTokens, planned)
+		p.Summary.TenantTokenCount++
+		conversion := map[string]any{
+			"status":        status,
+			"source_status": token.Status,
+			"tenant_id":     tenant.TenantID,
+			"principal_id":  tenant.PrincipalID,
+			"group":         group,
+			"hash_form":     "sk-prefixed",
+			// remain_quota stays in source units until B4 defines the conversion.
+			"quota_staging_only": true,
+		}
+		if expiresAt != nil {
+			conversion["expires_at"] = expiresAt.Format(time.RFC3339)
+		}
+		p.addImportedRecord(sourceID, "token", planned.TokenID, raw, conversion)
 	}
 	for _, quota := range snapshot.Quota {
 		raw := map[string]any{"quota_id": quota.ID, "user_id": quota.UserID, "model": quota.Model, "created_at_raw": quota.CreatedAt, "token_used_raw": quota.TokenUsed, "count_raw": quota.Count, "quota_raw": quota.Quota, "group": quota.Group}
@@ -404,8 +584,12 @@ func (p *Plan) addSourceRecords(snapshot SourceSnapshot) {
 }
 
 func importedAccountID(sourceSystem, sourceID string) string {
+	return "account-" + importedHex(sourceSystem, sourceID)
+}
+
+func importedHex(sourceSystem, sourceID string) string {
 	sum := sha256.Sum256([]byte(sourceSystem + "\x00" + sourceID))
-	return "account-" + hex.EncodeToString(sum[:16])
+	return hex.EncodeToString(sum[:16])
 }
 
 func digestString(value string) string { return digestJSON(value) }

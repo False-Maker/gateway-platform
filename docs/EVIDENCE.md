@@ -7,6 +7,48 @@
 > 阅读规则：本文的每一条都是**对已发生事实的描述**。不要从本文推断"项目是否可以继续开发"——
 > 那个问题由 `docs/TODO.md` 和 `AGENTS.md` §0 回答。
 
+## A11 迁移 tenant 转正（2026-09-11）
+
+本轮只做一件事：让 `internal/migration/newapi` 把 new-api 的 users / tokens 转正为目标库的
+tenants / principals / tenant_tokens 行。**非目标**：不做任何 quota 换算或扣费（B4）、不动 gateway / control、不改 A6 快照通道。
+
+**改动**
+- `types.go`：新增 `PlannedTenant` / `PlannedTenantToken`，`Plan` 增加 `Tenants` / `TenantTokens`，
+  `Summary` 增加 `tenant_count` / `principal_count` / `tenant_token_count`（dry-run JSON 自动带出）。
+- `plan.go`：`addSourceRecords` 的 users / tokens 分支不再是 `staging_only`。用户状态 1→active、2→suspended；
+  token 状态 1→active、2/3/4→revoked（源状态保留在 record 的 `source_status`，供 B4 回看 exhausted）；
+  `expired_time` ≤0 → NULL；group 回退链 token.group → user.group → `default`；id 为 `source_system+"\0"+source_id`
+  的 sha256 前 16 字节（与 `importedAccountID` 同法）。凡 id ≤0、状态未知、key 为空、expired_time 不可解析、
+  user 未被规划为 tenant 的，一律 `addRejected` 记原因，不补默认租户。quota / remain_quota 仍只保留原始值。
+- `apply.go`：同一事务内 `applyTenant`（tenants + principals upsert，`ON CONFLICT (id)`，**不碰** A10 的
+  `max_concurrency` / `rpm`，并校验 principal 归属）与 `applyTenantToken`（`ON CONFLICT (id)`，`revoked_at`
+  用 `COALESCE` 保留首次时间，源侧重新启用则清空）。
+
+**核实过的上游事实（读 `/home/elucid/projects/new-api` 源码，不是猜）**
+- `common/utils.go:254` `GenerateKey()` 生成 48 位随机串，**不带 `sk-`**；`middleware/auth.go:293` 对入站 bearer
+  `TrimPrefix(key, "sk-")`；前端 `api-keys-cells.tsx:56` / `api-keys-provider.tsx:86` 发给用户的是 `` `sk-${key}` ``。
+  因此 `tenant_tokens.token_hash = HashToken("sk-" + key)`（已带前缀的值不重复加）。**明确收窄**：new-api 同时接受
+  裸 key，本迁移不复刻这一回退——一份凭据两个撤销点是安全隐患，此收窄写在 `bearerForm` 注释与 TODO 里。
+- `common/constants.go:226-234`：UserStatusEnabled=1 / Disabled=2；TokenStatusEnabled=1 / Disabled=2 / Expired=3 /
+  Exhausted=4。`model/token.go:22,236`：`expired_time=-1` 表示永不过期。
+- `migration_records.raw_summary.key_sha256` 仍是 JSON 编码裸 key 的 digest，**刻意不等于** auth hash，records 转储
+  不能当凭据校验器用；`TestBuildPlanStagesUsersTokensQuotaWithoutSecrets` 新增断言 auth hash 不出现在 records 中。
+
+**本轮执行**
+- `go build ./cmd/gwd && go vet ./... && go test -count=1 ./...`：全部 ok。
+- `source configs/test-infra/test.env && go test -count=1 -p 1 ./...`（Docker `gateway-test-pg` / `gateway-test-redis`
+  均 healthy）：全部 ok，其中 `internal/migration/newapi` 的 7 个 `TestApply*` 均实跑 PG（非 skip）。
+- 新增回归：`TestBuildPlanPromotesUsersAndTokensToTenantsPrincipalsAndTokens`（id 哈希、`sk-` 归一、状态/过期/group
+  映射）、`TestBuildPlanRejectsUnmappableUsersAndTokensWithoutGuessing`（9 种拒绝各有原因、拒绝行也不含明文）、
+  `TestApplyPromotesTenantsPrincipalsAndTokensIdempotently`（行落库、`control.PGTenantRepository.ListActiveTokens`
+  只看见 active token 且 hash 命中 `sk-` 形式、重复 apply 不增行、`revoked_at` 不漂移、手工设的 `rpm=42` 不被覆盖）；
+  `TestApplyNeverWritesPlaintextSecretsToAnyColumn` 扩到 tenants / principals / tenant_tokens 三表。
+
+**未由本轮证实**
+- 未对真实 new-api 库做 dry-run；上述前缀/状态语义来自源码，不是来自某个部署的实际数据。
+- 未验证 new-api 前端之外的分发渠道是否也只发 `sk-` 形式（例如第三方脚本直接读库）；若存在裸 key 用户，迁移后会认证失败，
+  需要在切流前用真实库 dry-run 的 `tenant_token_count` 与实际活跃 key 数对照。
+
 ## B4.0 计费模型决策记录（2026-09-10，仅文档）
 
 本轮只做一件事：产出 `docs/B4-BILLING-MODEL.md`。**非目标**：不写计费代码、不建表、不动 A11。
