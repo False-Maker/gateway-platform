@@ -24,15 +24,24 @@ func purgeAllTestPrices(ctx context.Context, db *pgxpool.Pool) error {
 	return deleteErr
 }
 
+// insertTestUsage writes a row for a request that was served: 200 with
+// error_class=ok. B4.3 keys its policy off the outcome as well as the usage
+// source, so the outcome has to be a real value here and not a placeholder.
 func insertTestUsage(ctx context.Context, t *testing.T, db *pgxpool.Pool, tenantID, eventID, model, usageSource string, partial bool, occurredAt time.Time, tokens [4]int64) {
+	t.Helper()
+	insertTestUsageWithOutcome(ctx, t, db, tenantID, eventID, model, usageSource, partial, occurredAt, tokens, 200, string(contracts.ErrorOK))
+}
+
+func insertTestUsageWithOutcome(ctx context.Context, t *testing.T, db *pgxpool.Pool, tenantID, eventID, model, usageSource string, partial bool, occurredAt time.Time, tokens [4]int64, statusCode int, errorClass string) {
 	t.Helper()
 	if _, err := db.Exec(ctx, `
 		INSERT INTO usage_ledger (event_id,attempt_id,request_id,tenant_id,account_id,provider,model,
 			status_code,error_class,tokens_in,tokens_out,cache_read_tokens,cache_write_tokens,
 			usage_source,partial,occurred_at)
-		VALUES ($1,$1||'-attempt',$1||'-request',$2,'b42-account','b42-provider',$3,200,'',
+		VALUES ($1,$1||'-attempt',$1||'-request',$2,'b42-account','b42-provider',$3,$11,$12,
 			$4,$5,$6,$7,$8,$9,$10)`,
-		eventID, tenantID, model, tokens[0], tokens[1], tokens[2], tokens[3], usageSource, partial, occurredAt); err != nil {
+		eventID, tenantID, model, tokens[0], tokens[1], tokens[2], tokens[3], usageSource, partial, occurredAt,
+		statusCode, errorClass); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -108,19 +117,30 @@ func TestBillingJobSettlesLedgerRowsAndWalletInOneTransaction(t *testing.T) {
 	insertTestUsage(ctx, t, db, tenantID, "b42-zero", "b42-model", "upstream", false, billable, [4]int64{0, 0, 0, 0})
 	insertTestUsage(ctx, t, db, tenantID, "b42-unpriced", "b42-other-model", "upstream", false, billable, [4]int64{100, 100, 0, 0})
 	insertTestUsage(ctx, t, db, tenantID, "b42-estimated", "b42-model", "estimated", false, billable, [4]int64{9999, 9999, 0, 0})
+	// A truncated stream that still carried upstream usage: charged in full.
 	insertTestUsage(ctx, t, db, tenantID, "b42-partial", "b42-model", "upstream", true, billable, [4]int64{9999, 9999, 0, 0})
+	// Served, but the token counts were lost: held for a human, never zeroed.
+	insertTestUsage(ctx, t, db, tenantID, "b42-missing-served", "b42-model", "missing", false, billable, [4]int64{0, 0, 0, 0})
+	// Upstream reported usage on a request that failed: deliberately free.
+	insertTestUsageWithOutcome(ctx, t, db, tenantID, "b42-failed", "b42-model", "upstream", false, billable,
+		[4]int64{7000, 3000, 0, 0}, 500, string(contracts.ErrorUpstream5xx))
 	insertTestUsage(ctx, t, db, tenantID, "b42-future", "b42-model", "upstream", false, now.Add(time.Hour), [4]int64{9999, 9999, 0, 0})
 
 	run, err := job.RunOnce(ctx, windowEnd)
 	if err != nil {
 		t.Fatal(err)
 	}
-	// (1000*3 + 500*15 + 2000*0.3 + 400*3.75) / 1e6 = 0.0126
-	if run.Skipped || run.RowsBilled != 2 || run.RowsUnpriced != 1 || run.TenantsFailed != 0 {
+	// b42-priced: (1000*3 + 500*15 + 2000*0.3 + 400*3.75) / 1e6 = 0.0126
+	// b42-partial: 9999*(3+15) / 1e6                            = 0.179982
+	const wantDebited = contracts.Decimal("0.192582000000")
+	if run.Skipped || run.RowsBilled != 3 || run.RowsUnpriced != 1 || run.TenantsFailed != 0 {
 		t.Fatalf("run = %+v", run)
 	}
-	if run.TotalDebited != contracts.Decimal("0.012600000000") {
-		t.Fatalf("total debited = %q, want 0.012600000000", run.TotalDebited)
+	if run.RowsHeld != 2 || run.RowsNotBillable != 1 || run.RowsUnknownClass != 0 {
+		t.Fatalf("B4.3 buckets = held %d, not billable %d, unknown %d", run.RowsHeld, run.RowsNotBillable, run.RowsUnknownClass)
+	}
+	if run.TotalDebited != wantDebited {
+		t.Fatalf("total debited = %q, want %q", run.TotalDebited, wantDebited)
 	}
 
 	states := map[string]string{}
@@ -140,12 +160,14 @@ func TestBillingJobSettlesLedgerRowsAndWalletInOneTransaction(t *testing.T) {
 	}
 	rows.Close()
 	want := map[string]string{
-		"b42-priced":    "billed",
-		"b42-zero":      "billed",
-		"b42-unpriced":  "unpriced",
-		"b42-estimated": "pending", // B4.3 decides; this job must not guess
-		"b42-partial":   "pending",
-		"b42-future":    "pending", // outside the window, deferred not lost
+		"b42-priced":         "billed",
+		"b42-zero":           "billed",
+		"b42-partial":        "billed",
+		"b42-unpriced":       "unpriced",
+		"b42-estimated":      "held",
+		"b42-missing-served": "held",
+		"b42-failed":         "not_billable",
+		"b42-future":         "pending", // outside the window, deferred not lost
 	}
 	for eventID, wantState := range want {
 		if states[eventID] != wantState {
@@ -158,17 +180,21 @@ func TestBillingJobSettlesLedgerRowsAndWalletInOneTransaction(t *testing.T) {
 	if amounts["b42-zero"] == nil || *amounts["b42-zero"] != "0.000000000000" {
 		t.Errorf("a zero-cost row must be settled at 0, got %v", amounts["b42-zero"])
 	}
-	// An unpriced row must not carry an amount: it was not charged.
-	if amounts["b42-unpriced"] != nil {
-		t.Errorf("unpriced row carries billed_amount %v", *amounts["b42-unpriced"])
+	// An unpriced row must not carry an amount: it was not charged. Neither
+	// must a held or not-billable one -- a 0 there would be indistinguishable
+	// from a row that genuinely cost nothing.
+	for _, eventID := range []string{"b42-unpriced", "b42-estimated", "b42-missing-served", "b42-failed"} {
+		if amounts[eventID] != nil {
+			t.Errorf("%s was not charged but carries billed_amount %v", eventID, *amounts[eventID])
+		}
 	}
 
 	balance, _, err := repo.Balance(ctx, tenantID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if balance != contracts.Decimal("9.987400000000") {
-		t.Fatalf("balance = %q, want 9.987400000000", balance)
+	if balance != contracts.Decimal("9.807418000000") {
+		t.Fatalf("balance = %q, want 9.807418000000", balance)
 	}
 
 	// Exactly one debit, and the wallet debit equals the sum of the
@@ -178,33 +204,40 @@ func TestBillingJobSettlesLedgerRowsAndWalletInOneTransaction(t *testing.T) {
 	if err := db.QueryRow(ctx, `SELECT count(*),COALESCE(sum(amount),0)::text FROM wallet_transactions WHERE tenant_id=$1 AND kind='debit' AND billing_run_id=$2`, tenantID, run.RunID).Scan(&debits, &debited); err != nil {
 		t.Fatal(err)
 	}
-	if debits != 1 || debited != "-0.012600000000" {
+	if debits != 1 || debited != "-"+string(wantDebited) {
 		t.Fatalf("debits = %d totalling %s", debits, debited)
 	}
 	var ledgerSum string
 	if err := db.QueryRow(ctx, `SELECT COALESCE(sum(billed_amount),0)::text FROM usage_ledger WHERE tenant_id=$1 AND billing_state='billed'`, tenantID).Scan(&ledgerSum); err != nil {
 		t.Fatal(err)
 	}
-	if ledgerSum != "0.012600000000" {
+	if ledgerSum != string(wantDebited) {
 		t.Errorf("ledger billed sum %s != wallet debit", ledgerSum)
 	}
 
 	var status string
-	var rowsBilled, rowsUnpriced int
+	var rowsBilled, rowsUnpriced, rowsHeld, rowsNotBillable int
 	var runTotal string
-	if err := db.QueryRow(ctx, `SELECT status,rows_billed,rows_unpriced,total_debited::text FROM billing_runs WHERE id=$1`, run.RunID).Scan(&status, &rowsBilled, &rowsUnpriced, &runTotal); err != nil {
+	if err := db.QueryRow(ctx, `SELECT status,rows_billed,rows_unpriced,rows_held,rows_not_billable,total_debited::text FROM billing_runs WHERE id=$1`, run.RunID).
+		Scan(&status, &rowsBilled, &rowsUnpriced, &rowsHeld, &rowsNotBillable, &runTotal); err != nil {
 		t.Fatal(err)
 	}
-	if status != "completed" || rowsBilled != 2 || rowsUnpriced != 1 || runTotal != "0.012600000000" {
+	if status != "completed" || rowsBilled != 3 || rowsUnpriced != 1 || runTotal != string(wantDebited) {
 		t.Errorf("billing_runs row = %s %d/%d %s", status, rowsBilled, rowsUnpriced, runTotal)
 	}
+	// The buckets are persisted separately: a run that held everything and
+	// billed nothing must not be readable as a healthy run.
+	if rowsHeld != 2 || rowsNotBillable != 1 {
+		t.Errorf("billing_runs buckets = held %d, not billable %d; want 2 and 1", rowsHeld, rowsNotBillable)
+	}
 
-	// Re-running must not charge anything again.
+	// Re-running must not charge anything again, and must not re-decide the
+	// held or not-billable rows either: all four states are terminal.
 	second, err := job.RunOnce(ctx, windowEnd)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if second.RowsBilled != 0 || second.RowsUnpriced != 0 {
+	if second.RowsBilled != 0 || second.RowsUnpriced != 0 || second.RowsHeld != 0 || second.RowsNotBillable != 0 {
 		t.Fatalf("re-run settled rows again: %+v", second)
 	}
 	after, _, err := repo.Balance(ctx, tenantID)

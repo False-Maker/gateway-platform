@@ -21,7 +21,8 @@
 >
 > **下一步顺序（已定）**：~~`B4.0 定计费模型（不写代码）`~~（2026-09-10 完成，见 `docs/B4-BILLING-MODEL.md`）
 > → ~~`A11 迁移 tenant 转正`~~（2026-09-11 完成）→ ~~`B4.1 计价表与钱包 schema`~~（2026-09-11 完成）
-> → ~~`B4.2 扣费作业`~~（2026-09-11 完成）→ `B4.3 UsageSource 可信度口径`。
+> → ~~`B4.2 扣费作业`~~（2026-09-11 完成）→ ~~`B4.3 UsageSource 可信度口径`~~（2026-09-11 完成）
+> → `B4.4 余额不足的执行点`。
 > A12/E1/E2 不阻塞 B4，可并行取。P4（B4）在 A11 之前不进入编码——迁移来的用户还停在 staging，没有可扣费主体。
 
 ---
@@ -313,7 +314,7 @@ tenants / principals / tenant_tokens；摘要新增 `tenant_count` / `principal_
   `getUsageLimits` 仅映射已核实字段，未知 envelope/缺失字段保持 missing。快照 JSON、PG quota/outbox
   与 gateway 选号保留精度；选号只在明确余量为零或负数时排除账号。真实 provider schema 对账仍属 C2。
 - **B4** P4 范围：真实用量扣减、调度深化、多租户计费。依赖 §A 打通后才有意义。
-  **状态：进行中。**B4.0–B4.2 已完成；下列子项按序取，下一项是 B4.3。
+  **状态：进行中。**B4.0–B4.3 已完成；下列子项按序取，下一项是 B4.4。
 
   - **B4.0** `[no-cred]` **定计费模型（只出文档，不写代码）**。
     **状态：已完成（2026-09-10）。决策记录见 `docs/B4-BILLING-MODEL.md`。**
@@ -359,10 +360,22 @@ tenants / principals / tenant_tokens；摘要新增 `tenant_count` / `principal_
     new-api quota 整数单位 ↔ 货币金额的换算比例**仍未核对**（B4-BILLING-MODEL D4 的遗留项）。
 
   - **B4.3** `[no-cred]` `UsageSource` 可信度口径。
+    **状态：已完成（2026-09-11）。** 证据见 `docs/EVIDENCE.md` 同名小节。
     总览 §6.2 要求计费层用 `UsageSource` 区分可信度，但**没定不可信时怎么办**——这是 B4.0 的遗留问题。
     **DoD**：`upstream` / `estimated` / `missing` 与 `Partial=true` 四种组合各自的计费行为明确落地
     （计费 / 不计费 / 挂起待人工），**不得由代码隐式默认**；`missing` 的量单独可查询、单独告警，
     不被计入正常收入。
+    结论摘要：处置表以 `(usage_source, partial, 是否成功)` 三元组为键、12 种组合逐条写死在
+    `internal/control/billing_policy.go`，穷举性由测试断言；表外的组合一律 `held` 并单独计数，
+    不猜、不按零补齐。用户拍板的三条口径：**流式截断但上游给了 usage → 照常计费**、
+    **请求失败但上游给了 usage → 不计费**、**请求成功但 usage 丢失 → 挂起待人工并单独告警**。
+    `billing_state` 增加 `not_billable`，与 `held` 分开：前者是"已判定为零"，后者是"等人判"，
+    合并会把真实漏收埋进网络错误堆里；`unpriced`（我们的配置问题）与 `missing`（上游的数据问题）
+    也保持两个桶不合并。
+    **本轮未做**：`estimated` 仍无生产者，只留口径不造数据；`held` 的人工处理入口未做，
+    只有 `control_billing_held_rows{usage_source}` 这个 gauge 和按 `usage_source` 的索引供查询；
+    余额扣成负数仍不拦（B4.4）；三方对账仍未做（B4.5）；
+    new-api quota 整数单位 ↔ 货币金额的换算比例**仍未核对**（B4-BILLING-MODEL D4 的遗留项）。
 
   - **B4.4** `[no-cred]` 余额不足的执行点。
     **DoD**：按 B4.0 的结论实现。若结论是"拒绝新请求"，则必须走**已有的 tenant 快照下发通道**

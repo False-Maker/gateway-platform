@@ -109,3 +109,34 @@ func TestUsageBillingSchemaIsAdditiveAndIdempotent(t *testing.T) {
 		t.Error("billing_runs.total_debited must be exact decimal")
 	}
 }
+
+func TestBillingStatesWidenIdempotently(t *testing.T) {
+	data, err := os.ReadFile("007_usage_billing_states.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	schema := string(data)
+	// 006 created a constraint of the same name, and every file is replayed on
+	// each boot, so 007 must drop before it adds or the second boot fails.
+	drop := strings.Index(schema, "DROP CONSTRAINT IF EXISTS usage_ledger_billing_state_check")
+	add := strings.Index(schema, "ADD CONSTRAINT usage_ledger_billing_state_check")
+	if drop < 0 || add < 0 || drop > add {
+		t.Error("007 must drop the 006 constraint before re-adding the widened one")
+	}
+	if !strings.Contains(schema, "billing_state IN ('pending', 'billed', 'unpriced', 'held', 'not_billable')") {
+		t.Error("the widened billing_state set must include not_billable")
+	}
+	// `held` and `not_billable` are counted separately per B4.3: one is an
+	// undecided row awaiting a human, the other a decision that it is free.
+	for _, column := range []string{"rows_held INTEGER NOT NULL DEFAULT 0", "rows_not_billable INTEGER NOT NULL DEFAULT 0"} {
+		if !strings.Contains(schema, "ADD COLUMN IF NOT EXISTS "+column) {
+			t.Errorf("missing idempotent column %q", column)
+		}
+	}
+	if !strings.Contains(schema, "CREATE INDEX IF NOT EXISTS usage_ledger_held_idx") {
+		t.Error("the held backlog must be indexed, and idempotently")
+	}
+	if strings.Contains(schema, "DROP TABLE") || strings.Contains(schema, "DROP COLUMN") {
+		t.Error("007 must be additive")
+	}
+}

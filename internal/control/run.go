@@ -107,7 +107,7 @@ func Run(cfg Config) error {
 	if err := tokenLoop.RunOnce(ctx); err != nil {
 		log.Printf("control initial token publish failed: %v", err)
 	}
-	billingJob := BillingJob{DB: db}
+	billingJob := BillingJob{DB: db, Metrics: observability.Default}
 	billingTicker := time.NewTicker(billingRunInterval)
 	defer billingTicker.Stop()
 	ticker := time.NewTicker(time.Second)
@@ -158,9 +158,13 @@ func Run(cfg Config) error {
 				log.Printf("control billing run %s failed: %v", billed.RunID, err)
 			} else if billed.Skipped {
 				log.Printf("control billing run %s skipped: %s", billed.RunID, billed.SkipReason)
-			} else if billed.RowsBilled > 0 || billed.RowsUnpriced > 0 {
-				log.Printf("control billing run %s: %d rows billed (%s debited), %d unpriced, %d tenants failed",
-					billed.RunID, billed.RowsBilled, billed.TotalDebited, billed.RowsUnpriced, billed.TenantsFailed)
+			} else if billed.RowsBilled > 0 || billed.RowsUnpriced > 0 || billed.RowsHeld > 0 || billed.RowsNotBillable > 0 {
+				log.Printf("control billing run %s: %d rows billed (%s debited), %d unpriced, %d held, %d not billable, %d tenants failed",
+					billed.RunID, billed.RowsBilled, billed.TotalDebited, billed.RowsUnpriced,
+					billed.RowsHeld, billed.RowsNotBillable, billed.TenantsFailed)
+			}
+			if billed.RowsUnknownClass > 0 {
+				log.Printf("control billing run %s saw %d usage rows with no policy entry; they were held, not billed", billed.RunID, billed.RowsUnknownClass)
 			}
 		case <-ticker.C:
 		}

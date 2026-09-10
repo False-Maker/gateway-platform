@@ -7,6 +7,72 @@
 > 阅读规则：本文的每一条都是**对已发生事实的描述**。不要从本文推断"项目是否可以继续开发"——
 > 那个问题由 `docs/TODO.md` 和 `AGENTS.md` §0 回答。
 
+## B4.3 `UsageSource` 可信度口径（2026-09-11）
+
+本轮只把"什么样的用量算不算钱"写成一张穷举表，接管 B4.2 里一律留 `pending` 的行。热路径不动。
+
+**改动**
+
+- `internal/control/billing_policy.go`（新增）：处置表 `usageDispositions`，键是
+  `(usage_source, partial, 是否成功)` 三元组——`是否成功` 必须进键，因为同一个 `usage_source`
+  在"回了响应"和"报了错"两种场景下含义完全不同。3 × 2 × 2 = 12 种组合逐条写死，
+  取值 `bill` / `hold` / `not_billable`。`dispositionFor` 对表外组合返回 `hold` + `known=false`，
+  既不计费也不核销。`releaseSucceeded` 只认 `error_class == "ok"` 且 2xx/3xx：
+  无法归类的错误类别按失败处理，因为"算不清还照收钱"是更坏的错。
+- 用户拍板的三条口径（其余九条按同一原则推）：
+  - 流式响应被截断、上游仍回了 usage（`upstream` + `partial=true` + 成功）→ **照常计费**。
+    截断改变的是客户端收到什么，不是上游花了什么。
+  - 请求失败、上游仍回了 usage（`upstream` + 失败）→ **不计费**，成本我们吃。
+  - 请求成功但 usage 完全丢失（`missing` + 成功）→ **挂起待人工 + 单独告警**。
+    这是真实漏收，不按零补齐（AGENTS.md §2 禁止伪造额度）。
+  - `estimated` 四种组合一律 **挂起**：本平台目前没有任何 `estimated` 的生产者，
+    真出现了也必须先过人。
+- `migrations/007_usage_billing_states.sql`（新增）：`billing_state` 放宽到
+  `pending`/`billed`/`unpriced`/`held`/`not_billable`；`billing_runs` 加 `rows_held`、
+  `rows_not_billable`。006 已用同名约束，且每次启动全量重放，所以 007 先 `DROP CONSTRAINT
+  IF EXISTS` 再 `ADD`。`usage_ledger_held_idx` 以 `usage_source` 打头做部分索引，
+  因为 held 行永远按"为什么被挂起"来查。
+- `internal/control/billing_job.go`：删掉 `billableUsageSource` 常量，`pendingTenants` 与
+  `selectBillableRows` 不再在 SQL 里过滤可信度——每行都进作业，由处置表给终态。
+  `BillingRunResult` 增加 `RowsHeld` / `RowsNotBillable` / `RowsUnknownClass`，与 `RowsBilled`
+  分开上报和落库。`held` / `not_billable` 行不写 `billed_amount`（留 NULL）：写 0 会和
+  "确实为零的已计费行"混淆。
+- `publishSignals`：`control_billing_rows_total{state}` 计数器、
+  `control_billing_unknown_usage_class_total` 计数器，以及
+  `control_billing_held_rows{usage_source}` gauge——按 `usage_source` 拆开，
+  并对三个已知 source 补零，让告警可以用阈值而不是"指标突然出现"。
+  `unpriced`（我们的计价配置缺失）与 `missing`（上游没给数）保持两个桶，不合并。
+
+**本轮执行**
+
+- `gofmt -l .`：只剩 `cmd/new-api-migrate/main_test.go`、`internal/control/health.go` 两个
+  既有未格式化文件，均不在本轮改动范围内，未动。
+- `go build ./... && go vet ./...`：通过。
+- 未开门禁 `go test -count=1 ./...`：全绿。
+- 开门禁 `set -a; source configs/test-infra/test.env; set +a; go test -count=1 -p 1 ./...`：全绿。
+- `go test -v -run 'Billing|UsageClass|Disposition|ReleaseSucceeded'` 确认新用例**真的跑了**
+  而不是 skip：`TestEveryUsageClassHasAnExplicitDisposition`（断言 12 种组合全覆盖且表里没有
+  够不着的条目）、`TestDispositionsMatchTheAgreedBillingPolicy`、
+  `TestAnUnknownUsageClassIsHeldRatherThanGuessed`、`TestReleaseSucceededOnlyAcceptsAnExplicitOK`、
+  `TestOnlyNonBillingDispositionsHaveATerminalState`、`TestBillingStatesWidenIdempotently`
+  以及两个 PG 门禁集成用例，全部 PASS。
+- `TestBillingJobSettlesLedgerRowsAndWalletInOneTransaction` 扩到 8 行 fixture，实跑验证
+  终态：`billed`×3（含截断那笔 0.179982）、`unpriced`×1、`held`×2（`estimated` 与
+  `missing`+成功）、`not_billable`×1（`upstream`+500）、窗口外 `pending`×1；
+  钱包余额 10 → 9.807418，`wallet_transactions` 恰好一条 `-0.192582000000`，
+  与 `billed_amount` 之和逐位相等；`billing_runs.rows_held=2`、`rows_not_billable=1`；
+  重跑不再改动任何一行、不再产生第二条扣费。
+  注：该 fixture 原先把 `error_class` 硬编码为 `''`，B4.3 之后那等于"全部失败"，本轮改为 `'ok'`。
+
+**未由本轮证实**
+
+- `estimated` 没有生产者，那四行口径**只有单测覆盖，没有端到端证据**。
+- `held` 只有 gauge 和索引，**没有人工处理入口**；谁看告警、多久内处理，本轮不涉及。
+- 告警规则本身没落地（属 E1），本轮只提供了可被告警的指标。
+- 余额扣成负数仍不拦截（B4.4）；三方对账仍未做（B4.5）。
+- new-api quota 整数单位 ↔ 货币金额的换算比例**仍未核对**（`docs/B4-BILLING-MODEL.md` D4）。
+- 全部为本地 PG/Redis 门禁环境的回归，**不构成任何真实 provider 或生产计费的准入结论**。
+
 ## B4.2 从 `usage_ledger` 到扣费的慢路径作业（2026-09-11）
 
 本轮只做扣费作业，不动 gateway 热路径。

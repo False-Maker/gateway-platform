@@ -70,12 +70,5 @@ func TestLineAmountRejectsUnusablePricesAndCounts(t *testing.T) {
 	}
 }
 
-func TestBillableUsageSourceIsExplicitlyNarrow(t *testing.T) {
-	// B4.3 owns the rest of the UsageSource policy. Until then this job must
-	// charge only for usage the upstream itself reported: silently billing
-	// `estimated` or `missing` usage would be the implicit default that
-	// B4.3's DoD forbids.
-	if billableUsageSource != "upstream" {
-		t.Fatalf("billable usage source = %q; widening it is B4.3's decision, not this job's", billableUsageSource)
-	}
-}
+// The UsageSource policy this job used to hard-code as a single narrow
+// constant now lives in billing_policy.go and is tested there.
