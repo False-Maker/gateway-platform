@@ -7,6 +7,62 @@
 > 阅读规则：本文的每一条都是**对已发生事实的描述**。不要从本文推断"项目是否可以继续开发"——
 > 那个问题由 `docs/TODO.md` 和 `AGENTS.md` §0 回答。
 
+## A12 请求明细存储（2026-09-11）
+
+本轮只做一件事：把高频请求明细从控制状态 PG 的单写者路径上挪走，落一条**异步、有界、可丢**的
+ClickHouse 写入路径，并先写决策记录（`docs/A12-REQUEST-DETAIL.md`）。
+
+### 改动
+- 新增 `internal/detail`：`schema.go`（`Record` / `FromRelease` / `DDL`）、`sink.go`
+  （`Writer` 接口 / `Sink` / `ClickHouseWriter`）。走 ClickHouse HTTP 接口 + `JSONEachRow`，
+  **未新增任何 Go 依赖**。
+- `internal/control/ledger.go`：`Ledger` 加 `Detail *detail.Sink`，在 `HandleRelease` 的
+  `tx.Commit()` **之后**、函数最后一行调用 `l.Detail.Observe(release)`。`Observe` 无 error 返回。
+- `internal/control/run.go`：`GATEWAY_DETAIL_CLICKHOUSE_URL` 非空时建 writer + sink，启动时
+  `EnsureSchema`，失败只 log 并降级为无明细。
+- `pkg/contracts`：`Release` 新增可选 `InboundProtocol`（未进 `Validate()`）。
+- `internal/gateway/server.go`：把 `inboundProtocol` 透传进两条 release 构造路径（8 处调用点）。
+- `configs/test-infra/docker-compose.yml` / `test.env`：新增 `gateway-test-clickhouse`
+  （`clickhouse/clickhouse-server:24.8-alpine`，127.0.0.1:18123）与 `GATEWAY_TEST_CLICKHOUSE_URL`。
+- **无新增 PG migration**。
+
+### 本轮执行（命令与结果）
+- `gofmt -l .` → 仅 `internal/control/health.go`、`cmd/new-api-migrate/main_test.go` 命中，
+  两者均为**既有**问题，本轮未改动这两个文件，按 Change Boundary 不动。本轮新增/修改文件全部干净。
+- `go build ./...`、`go vet ./...` → 通过。
+- `go test -count=1 -race ./internal/detail/` → `ok 1.032s`。
+- 无凭据基线：`env -u GATEWAY_TEST_DATABASE_URL -u GATEWAY_TEST_REDIS_ADDR -u GATEWAY_TEST_CLICKHOUSE_URL go test -count=1 ./...`
+  → 全绿（明细套件按设计 skip）。
+- 真实 ClickHouse（容器 `24.8.14.39`，healthy）下的门控套件全部 PASS：
+  `TestClickHouseWriterRoundTripsARecord`（17 列 TSV 逐字段回读比对 + DDL 幂等）、
+  `TestRedeliveredReleaseDoesNotDuplicate`（`FINAL` 下 count=1、`max(ingested_at)` 取后写）、
+  `TestSinkDeliversToClickHouse`（10 条经异步 sink 落库）、
+  `TestRealClickHouseErrorsStayInsideTheSink`（真实 HTTP 错误只记 `detail_flush_failures_total`）。
+- 真实 PG 下 `TestDetailFailureDoesNotAffectMeteringOrAck` PASS：明细存储完全不可用时，
+  `HandleRelease` 仍返回 nil（消费者照常 ACK）、`usage_ledger` 行照常写入（tokens 7/9），
+  并断言 sink 确实发起过写入（否则该测试"接了个空"也能过）。
+- 门控全量 `go test -count=1 -p 1 ./...`：除**既有**的
+  `TestBillingJobSettlesLedgerRowsAndWalletInOneTransaction` 失败外全绿。该失败在本轮改动前
+  已于干净 HEAD 上复现（`cmd/gwd` 集成测试在共享库里留下 `usage_ledger` 行，而 B4.2 断言的是
+  全局 run 计数），与 A12 无关，本轮不修。`internal/gateway` 套件通过——这一条尤其重要，
+  因为本轮改了 8 处 release 构造调用点的签名。
+
+### 明确未由本轮证实
+- 前一轮我在选型问答里写过"ClickHouse 本地无实例、无法在本轮做真实验证，只能交付未经运行验证的骨架"
+  ——**这句话是错的**，已由上面的真实容器验证推翻，此处更正。
+- `BatchSize=500` / `FlushInterval=2s` / `BufferSize=10000` / `TTL=30d` **未经真实流量校准**，
+  是可运行默认值而非容量规划结论。丢弃率在真实 RPM 下是多少，本轮没有数据。
+- 未验证 ClickHouse 的集群/副本/备份/保留策略；未做压测；未验证生产接线在真实 ClickHouse 上启动。
+- 明细与 `usage_ledger` 的交叉核对未做。
+
+### 最高剩余风险
+明细管道**天然 at-least-once**（写在事务提交之后，消费者在提交与 flush 之间重启会重放），
+`ReplacingMergeTree` 只做**最终**收敛——后台 merge 之前，不带 `FINAL` 的 `count()` 会偏高。
+**明细永远不能当账加总**，账的权威只有 `usage_ledger`。B5 控制台若直接对明细做求和展示，
+就会在 merge 之前给出偏高的数字。
+
+---
+
 ## B4.5 对账（2026-09-11）
 
 本轮只做一件事：给 B4 加一个**只读的三方对账**，把"账本怎么算"、"钱包被扣了多少"、

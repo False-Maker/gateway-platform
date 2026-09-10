@@ -355,7 +355,7 @@ func (s *Server) handleProtocolStreaming(ctx context.Context, tenantID, group st
 	endpoint := strings.TrimRight(lease.Profile.BaseURL, "/") + resolveInferencePath(path, model)
 	upstreamRequest, err := http.NewRequestWithContext(upstreamCtx, http.MethodPost, endpoint, bytes.NewReader(payload))
 	if err != nil {
-		return s.finishStreamingRelease(requestCtx, tenantID, requestID, attemptID, startedAt, lease, ChatCompletionRequest{Model: model}, 0, nil, false, true, err)
+		return s.finishStreamingRelease(requestCtx, tenantID, requestID, attemptID, startedAt, lease, inboundProtocol, ChatCompletionRequest{Model: model}, 0, nil, false, true, err)
 	}
 	upstreamRequest.Header.Set("Content-Type", "application/json")
 	if lease.Credential.AccessToken != "" {
@@ -383,25 +383,25 @@ func (s *Server) handleProtocolStreaming(ctx context.Context, tenantID, group st
 	}
 	client, err = clientForProxy(client, lease.Profile.Proxy)
 	if err != nil {
-		return s.finishStreamingRelease(requestCtx, tenantID, requestID, attemptID, startedAt, lease, ChatCompletionRequest{Model: model}, 0, nil, false, true, err)
+		return s.finishStreamingRelease(requestCtx, tenantID, requestID, attemptID, startedAt, lease, inboundProtocol, ChatCompletionRequest{Model: model}, 0, nil, false, true, err)
 	}
 	client, err = clientForTLSProfile(client, lease.Profile.TLSFingerprint)
 	if err != nil {
-		return s.finishStreamingRelease(requestCtx, tenantID, requestID, attemptID, startedAt, lease, ChatCompletionRequest{Model: model}, 0, nil, false, true, err)
+		return s.finishStreamingRelease(requestCtx, tenantID, requestID, attemptID, startedAt, lease, inboundProtocol, ChatCompletionRequest{Model: model}, 0, nil, false, true, err)
 	}
 	response, err := client.Do(upstreamRequest)
 	if err != nil {
-		return s.finishStreamingRelease(requestCtx, tenantID, requestID, attemptID, startedAt, lease, ChatCompletionRequest{Model: model}, 0, nil, false, true, err)
+		return s.finishStreamingRelease(requestCtx, tenantID, requestID, attemptID, startedAt, lease, inboundProtocol, ChatCompletionRequest{Model: model}, 0, nil, false, true, err)
 	}
 	defer response.Body.Close()
 
 	if response.StatusCode >= 400 {
 		body, readErr := io.ReadAll(io.LimitReader(response.Body, 16<<20))
 		if readErr != nil {
-			return s.finishStreamingRelease(requestCtx, tenantID, requestID, attemptID, startedAt, lease, ChatCompletionRequest{Model: model}, response.StatusCode, nil, false, true, readErr)
+			return s.finishStreamingRelease(requestCtx, tenantID, requestID, attemptID, startedAt, lease, inboundProtocol, ChatCompletionRequest{Model: model}, response.StatusCode, nil, false, true, readErr)
 		}
 		callErr := fmt.Errorf("upstream returned HTTP %d", response.StatusCode)
-		releaseErr := s.writeStreamingRelease(requestCtx, tenantID, requestID, attemptID, startedAt, lease, ChatCompletionRequest{Model: model}, response.StatusCode, nil, false, classifyHTTPWithReset(response.StatusCode, body, retryAfter(response.Header, time.Now())), callErr)
+		releaseErr := s.writeStreamingRelease(requestCtx, tenantID, requestID, attemptID, startedAt, lease, inboundProtocol, ChatCompletionRequest{Model: model}, response.StatusCode, nil, false, classifyHTTPWithReset(response.StatusCode, body, retryAfter(response.Header, time.Now())), callErr)
 		if releaseErr != nil {
 			return http.StatusServiceUnavailable, releaseErr
 		}
@@ -432,13 +432,13 @@ func (s *Server) handleProtocolStreaming(ctx context.Context, tenantID, group st
 			class = contracts.ErrorForbiddenCapability
 			resultErr = readErr
 		}
-		releaseErr := s.writeStreamingRelease(requestCtx, tenantID, requestID, attemptID, startedAt, lease, ChatCompletionRequest{Model: model}, http.StatusOK, parsedUsage, partial, class, readErr)
+		releaseErr := s.writeStreamingRelease(requestCtx, tenantID, requestID, attemptID, startedAt, lease, inboundProtocol, ChatCompletionRequest{Model: model}, http.StatusOK, parsedUsage, partial, class, readErr)
 		if releaseErr != nil {
 			return http.StatusServiceUnavailable, releaseErr
 		}
 		return http.StatusOK, resultErr
 	}
-	releaseErr := s.writeStreamingRelease(requestCtx, tenantID, requestID, attemptID, startedAt, lease, ChatCompletionRequest{Model: model}, http.StatusOK, parsedUsage, partial, contracts.ErrorOK, nil)
+	releaseErr := s.writeStreamingRelease(requestCtx, tenantID, requestID, attemptID, startedAt, lease, inboundProtocol, ChatCompletionRequest{Model: model}, http.StatusOK, parsedUsage, partial, contracts.ErrorOK, nil)
 	if releaseErr != nil {
 		return http.StatusServiceUnavailable, releaseErr
 	}
@@ -1197,12 +1197,12 @@ func streamEventDone(protocol protokit.Protocol, eventType, data string) bool {
 	}
 }
 
-func (s *Server) finishStreamingRelease(ctx context.Context, tenantID, requestID, attemptID string, startedAt time.Time, lease contracts.Lease, request ChatCompletionRequest, status int, parsedUsage *usage, partial, networkErr bool, callErr error) (int, error) {
+func (s *Server) finishStreamingRelease(ctx context.Context, tenantID, requestID, attemptID string, startedAt time.Time, lease contracts.Lease, inboundProtocol protokit.Protocol, request ChatCompletionRequest, status int, parsedUsage *usage, partial, networkErr bool, callErr error) (int, error) {
 	class := contracts.ErrorOK
 	if networkErr {
 		class = contracts.ErrorNetwork
 	}
-	if err := s.writeStreamingRelease(ctx, tenantID, requestID, attemptID, startedAt, lease, request, status, parsedUsage, partial, class, callErr); err != nil {
+	if err := s.writeStreamingRelease(ctx, tenantID, requestID, attemptID, startedAt, lease, inboundProtocol, request, status, parsedUsage, partial, class, callErr); err != nil {
 		return http.StatusServiceUnavailable, err
 	}
 	if networkErr {
@@ -1211,8 +1211,8 @@ func (s *Server) finishStreamingRelease(ctx context.Context, tenantID, requestID
 	return status, callErr
 }
 
-func (s *Server) writeStreamingRelease(ctx context.Context, tenantID, requestID, attemptID string, startedAt time.Time, lease contracts.Lease, request ChatCompletionRequest, status int, parsedUsage *usage, partial bool, class contracts.ErrorClass, callErr error) error {
-	release := contracts.Release{SchemaVersion: contracts.SchemaVersion, EventID: contracts.TerminalEventID(attemptID), RequestID: requestID, AttemptID: attemptID, AttemptNo: 1, ProducerID: s.Producer.ProducerID, OccurredAt: time.Now().UTC(), AccountID: lease.AccountID, Provider: leaseProvider(s, lease), StatusCode: status, LatencyMS: int(time.Since(startedAt).Milliseconds()), Model: request.Model, TenantID: tenantID, ErrorClass: class, UsageSource: contracts.UsageSourceMissing, Partial: partial}
+func (s *Server) writeStreamingRelease(ctx context.Context, tenantID, requestID, attemptID string, startedAt time.Time, lease contracts.Lease, inboundProtocol protokit.Protocol, request ChatCompletionRequest, status int, parsedUsage *usage, partial bool, class contracts.ErrorClass, callErr error) error {
+	release := contracts.Release{SchemaVersion: contracts.SchemaVersion, EventID: contracts.TerminalEventID(attemptID), RequestID: requestID, AttemptID: attemptID, AttemptNo: 1, ProducerID: s.Producer.ProducerID, OccurredAt: time.Now().UTC(), AccountID: lease.AccountID, Provider: leaseProvider(s, lease), StatusCode: status, LatencyMS: int(time.Since(startedAt).Milliseconds()), Model: request.Model, TenantID: tenantID, ErrorClass: class, UsageSource: contracts.UsageSourceMissing, Partial: partial, InboundProtocol: string(inboundProtocol)}
 	if parsedUsage != nil {
 		release.TokensIn, release.TokensOut, release.CacheReadTokens, release.CacheWriteTokens = parsedUsage.Input, parsedUsage.Output, parsedUsage.CacheRead, parsedUsage.CacheWrite
 		release.UsageSource = contracts.UsageSourceUpstream
@@ -1292,7 +1292,7 @@ func (s *Server) handleNonStreaming(ctx context.Context, tenantID, group string,
 			return nil, http.StatusServiceUnavailable, ErrAttemptFailed
 		}
 		body, status, usage, networkErr, reset, callErr := s.callUpstream(ctx, lease, request, inboundProtocol)
-		release := contracts.Release{SchemaVersion: contracts.SchemaVersion, EventID: contracts.TerminalEventID(attemptID), RequestID: requestID, AttemptID: attemptID, AttemptNo: attemptNo, ProducerID: s.Producer.ProducerID, OccurredAt: time.Now().UTC(), AccountID: lease.AccountID, Provider: leaseProvider(s, lease), StatusCode: status, LatencyMS: int(time.Since(startedAt).Milliseconds()), Model: request.Model, TenantID: tenantID, ErrorClass: contracts.ErrorOK, UsageSource: contracts.UsageSourceMissing, Partial: false}
+		release := contracts.Release{SchemaVersion: contracts.SchemaVersion, EventID: contracts.TerminalEventID(attemptID), RequestID: requestID, AttemptID: attemptID, AttemptNo: attemptNo, ProducerID: s.Producer.ProducerID, OccurredAt: time.Now().UTC(), AccountID: lease.AccountID, Provider: leaseProvider(s, lease), StatusCode: status, LatencyMS: int(time.Since(startedAt).Milliseconds()), Model: request.Model, TenantID: tenantID, ErrorClass: contracts.ErrorOK, UsageSource: contracts.UsageSourceMissing, Partial: false, InboundProtocol: string(inboundProtocol)}
 		if usage != nil {
 			release.TokensIn, release.TokensOut, release.CacheReadTokens, release.CacheWriteTokens = usage.Input, usage.Output, usage.CacheRead, usage.CacheWrite
 			release.UsageSource = contracts.UsageSourceUpstream

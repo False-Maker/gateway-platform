@@ -294,6 +294,11 @@ type Release struct {
 	ErrorClass       ErrorClass `json:"error_class"`
 	UsageSource      string     `json:"usage_source"`
 	Partial          bool       `json:"partial"`
+	// InboundProtocol is the protocol the client spoke (pkg/protokit's Protocol
+	// in string form -- held as a string so contracts stays dependency-free).
+	// Optional: it is routing context for A12's request detail, not metering
+	// input, and an empty value must never make a release unbillable.
+	InboundProtocol string `json:"inbound_protocol,omitempty"`
 }
 
 type AttemptStarted struct {

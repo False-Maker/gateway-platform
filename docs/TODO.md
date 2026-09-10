@@ -23,7 +23,9 @@
 > → ~~`A11 迁移 tenant 转正`~~（2026-09-11 完成）→ ~~`B4.1 计价表与钱包 schema`~~（2026-09-11 完成）
 > → ~~`B4.2 扣费作业`~~（2026-09-11 完成）→ ~~`B4.3 UsageSource 可信度口径`~~（2026-09-11 完成）
 > → ~~`B4.4 余额不足的执行点`~~（2026-09-11 完成）→ ~~`B4.5 对账`~~（2026-09-11 完成）。
-> **§B4 到此闭合。**下一步在 `B5 控制台` 与并行项 A12 / E1 / E2 / C6(no-cred 部分) 之间取。
+> **§B4 到此闭合。**~~下一步在 `B5 控制台` 与并行项 A12 / E1 / E2 / C6(no-cred 部分) 之间取。~~
+> `A12 请求明细存储` 2026-09-11 完成（见 `docs/A12-REQUEST-DETAIL.md`），**§A 到此闭合**。
+> 下一步在 `B5 控制台` 与并行项 E1 / E2 / C6(no-cred 部分) 之间取。
 > A12/E1/E2 不阻塞 B4，可并行取。P4（B4）在 A11 之前不进入编码——迁移来的用户还停在 staging，没有可扣费主体。
 
 ---
@@ -273,7 +275,7 @@ tenants / principals / tenant_tokens；摘要新增 `tenant_count` / `principal_
 
 ### A12 `[no-cred]` 请求明细存储缺失（总览 §6.4 的 P0 级共享决策）
 
-**状态：未开始。不阻塞 B4，可并行。**
+**状态：已完成（2026-09-11）。** 形态决策与取舍见 `docs/A12-REQUEST-DETAIL.md`。
 
 **基线**
 - 总览 §6.4 把"计量流水"与"高频请求明细日志"的**物理分离**定为 P0 级共享决策，理由是 control 的
@@ -290,6 +292,28 @@ tenants / principals / tenant_tokens；摘要新增 `tenant_count` / `principal_
 - 决策为"引入存储"时：写入路径与 `usage_ledger` 事务解耦，明细写失败不得影响计量与 ACK。
 - 决策为"暂不引入"时：显式在文档中记为已评估的取舍，并保留采样指标，**不留空白**。
 - 凭据、token 明文、refresh token 不得进入明细。
+
+**实现摘要**
+- 形态：**引入 ClickHouse**（用户拍板，覆盖"不默认引入新中间件"这条默认；决策记录已按 DoD 先写）。
+  走 HTTP 接口 + `JSONEachRow`，**不引入 ClickHouse Go 驱动依赖**。
+- `internal/detail`：`Record`（Release 全字段 + 路由信息）、`FromRelease` 投影、`DDL`
+  （`ReplacingMergeTree(ingested_at)` / `PARTITION BY toYYYYMMDD(occurred_at)` /
+  `ORDER BY (tenant_id, occurred_at, event_id)` / TTL 30 天）、`Sink`（有界、异步、可丢）、
+  `ClickHouseWriter`。
+- 解耦靠形状而非自觉：`Sink.Observe` **无 error 返回**、非阻塞，只在 `Ledger.HandleRelease` 的
+  `tx.Commit()` **之后**被调用；`*Sink` 为 nil 即"明细关闭"。
+- 凭据不入明细靠结构：`Record` 无 map / 无 interface / 无 header 袋子 / 无 body 字段，
+  `TestRecordCarriesNoFreeFormFields` 反射守门。ClickHouse 口令从 URL 移到 Basic-Auth header。
+- 新增可选 `contracts.Release.InboundProtocol`（不进 `Validate()`，缺失不得使 release 不可计费）。
+- 生产接线：`GATEWAY_DETAIL_CLICKHOUSE_URL` 为空即关闭；schema 不可用只 log 并降级为无明细，
+  绝不因明细故障拒绝启动。
+- **无新增 PG migration**——明细刻意不进控制状态库。
+
+**本轮未做**
+- `BatchSize` / `FlushInterval` / `BufferSize` / TTL 未经真实流量校准。
+- 无 ClickHouse 集群、副本、备份与保留策略；测试与本地只有单实例。
+- 控制台查询界面属于 B5。
+- 明细与 `usage_ledger` 的交叉核对未做（B4.5 对账只覆盖账侧三方）。
 
 ---
 

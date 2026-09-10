@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/elucid/gateway-platform/internal/control/provider/builtin"
+	"github.com/elucid/gateway-platform/internal/detail"
 	"github.com/elucid/gateway-platform/internal/observability"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
@@ -26,6 +27,14 @@ type Config struct {
 	CredentialKey           string
 	WrapperEnvelopeKey      string
 	WrapperAuthorizeTimeout time.Duration
+
+	// DetailClickHouseURL enables A12's request-detail store. Empty means
+	// detail is off, which is a supported deployment: detail is droppable by
+	// design, so a platform without ClickHouse loses observability, not
+	// metering.
+	DetailClickHouseURL string
+	DetailDatabase      string
+	DetailTable         string
 }
 
 func ConfigFromEnv() Config {
@@ -39,6 +48,9 @@ func ConfigFromEnv() Config {
 		CredentialKey:           os.Getenv("GATEWAY_CREDENTIAL_KEY"),
 		WrapperEnvelopeKey:      os.Getenv("GATEWAY_WRAPPER_ENVELOPE_KEY"),
 		WrapperAuthorizeTimeout: getenvSeconds("GATEWAY_WRAPPER_AUTHORIZE_TIMEOUT_SECONDS", 6*time.Minute),
+		DetailClickHouseURL:     os.Getenv("GATEWAY_DETAIL_CLICKHOUSE_URL"),
+		DetailDatabase:          getenv("GATEWAY_DETAIL_DATABASE", detail.DefaultDatabase),
+		DetailTable:             getenv("GATEWAY_DETAIL_TABLE", detail.DefaultTable),
 	}
 }
 
@@ -77,6 +89,28 @@ func Run(cfg Config) error {
 	rdb := redis.NewClient(&redis.Options{Addr: cfg.RedisAddr, Username: cfg.RedisUsername, Password: cfg.RedisPassword})
 	defer rdb.Close()
 	ledger := Ledger{DB: db, Signals: NewPlatformSignals(observability.Default)}
+	// A12: request detail. Wiring failures here are logged and then ignored on
+	// purpose -- a control plane that refuses to boot because the detail store
+	// is down would have made metering depend on detail, which is precisely
+	// what this package is built to prevent.
+	if cfg.DetailClickHouseURL != "" {
+		writer := detail.ClickHouseWriter{
+			URL:      cfg.DetailClickHouseURL,
+			Database: cfg.DetailDatabase,
+			Table:    cfg.DetailTable,
+		}
+		schemaCtx, cancelSchema := context.WithTimeout(ctx, 30*time.Second)
+		err := writer.EnsureSchema(schemaCtx)
+		cancelSchema()
+		if err != nil {
+			log.Printf("control detail schema unavailable, running without request detail: %v", err)
+		} else {
+			sink := &detail.Sink{Writer: writer, Metrics: observability.Default}
+			sink.Start()
+			defer sink.Stop()
+			ledger.Detail = sink
+		}
+	}
 	consumer := eventsConsumer(rdb, cfg.ConsumerID, ledger)
 	refreshLoop, err := NewRefreshLoop(db, cfg.CredentialKey)
 	if err != nil {

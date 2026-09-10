@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/elucid/gateway-platform/internal/detail"
 	"github.com/elucid/gateway-platform/internal/observability"
 	"github.com/elucid/gateway-platform/pkg/contracts"
 	"github.com/jackc/pgx/v5"
@@ -17,6 +18,10 @@ type Ledger struct {
 	Metrics *observability.Registry
 	// Signals aggregates platform-level transport rejections. Optional.
 	Signals *PlatformSignals
+	// Detail is A12's request-detail sink. Optional, and deliberately typed as
+	// something that cannot fail: it is fed after the metering transaction has
+	// committed, and a nil sink is a valid "detail disabled" deployment.
+	Detail *detail.Sink
 }
 
 func (l Ledger) HandleAttemptStarted(ctx context.Context, event contracts.AttemptStarted) error {
@@ -65,6 +70,11 @@ func (l Ledger) HandleRelease(ctx context.Context, release contracts.Release) er
 		l.metrics().AddCounter("request_attempt_recovered_total", 1, "source", "gateway")
 		l.Signals.Observe(release)
 	}
+	// A12: request detail is fed here and nowhere else -- after the metering
+	// transaction has committed, outside it, and through a call that returns
+	// nothing. There is no path by which a detail failure can roll back the
+	// ledger or stop the stream ACK below the caller.
+	l.Detail.Observe(release)
 	return nil
 }
 
