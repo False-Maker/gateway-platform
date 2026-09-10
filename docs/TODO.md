@@ -22,7 +22,8 @@
 > **下一步顺序（已定）**：~~`B4.0 定计费模型（不写代码）`~~（2026-09-10 完成，见 `docs/B4-BILLING-MODEL.md`）
 > → ~~`A11 迁移 tenant 转正`~~（2026-09-11 完成）→ ~~`B4.1 计价表与钱包 schema`~~（2026-09-11 完成）
 > → ~~`B4.2 扣费作业`~~（2026-09-11 完成）→ ~~`B4.3 UsageSource 可信度口径`~~（2026-09-11 完成）
-> → ~~`B4.4 余额不足的执行点`~~（2026-09-11 完成）→ `B4.5 对账`。
+> → ~~`B4.4 余额不足的执行点`~~（2026-09-11 完成）→ ~~`B4.5 对账`~~（2026-09-11 完成）。
+> **§B4 到此闭合。**下一步在 `B5 控制台` 与并行项 A12 / E1 / E2 / C6(no-cred 部分) 之间取。
 > A12/E1/E2 不阻塞 B4，可并行取。P4（B4）在 A11 之前不进入编码——迁移来的用户还停在 staging，没有可扣费主体。
 
 ---
@@ -314,7 +315,7 @@ tenants / principals / tenant_tokens；摘要新增 `tenant_count` / `principal_
   `getUsageLimits` 仅映射已核实字段，未知 envelope/缺失字段保持 missing。快照 JSON、PG quota/outbox
   与 gateway 选号保留精度；选号只在明确余量为零或负数时排除账号。真实 provider schema 对账仍属 C2。
 - **B4** P4 范围：真实用量扣减、调度深化、多租户计费。依赖 §A 打通后才有意义。
-  **状态：进行中。**B4.0–B4.4 已完成；下列子项按序取，下一项是 B4.5。
+  **状态：B4.0–B4.5 全部完成（2026-09-11）。**§B4 到此闭合；`§B` 剩下的是 B5（P6 控制台）。
 
   - **B4.0** `[no-cred]` **定计费模型（只出文档，不写代码）**。
     **状态：已完成（2026-09-10）。决策记录见 `docs/B4-BILLING-MODEL.md`。**
@@ -395,8 +396,25 @@ tenants / principals / tenant_tokens；摘要新增 `tenant_count` / `principal_
     因此"余额 ≤ 0"的绝对刻度仍未验证。
 
   - **B4.5** `[no-cred]` 对账。
+    **状态：已完成（2026-09-11）。** 证据见 `docs/EVIDENCE.md` 同名小节。
+    `internal/control/billing_reconcile.go` 的 `Reconciliation.Run(start, end)` 在**一个
+    `pgx.ReadOnly` + `RepeatableRead` 事务**里读三方：窗口内 `usage_ledger` 按 `billing_state`
+    的行数与 `billed_amount` 求和、这些行所属 `billing_run_id` 的 `wallet_transactions` 扣款、
+    `tenant_wallets.balance` 与该租户**全量**流水求和。
+    窗口取 `occurred_at`（用量发生时刻），**不**取扣费时刻——两者是不同的钟，按扣费时刻切窗
+    会在每个边界上造出并不存在的差额；窗口行改为顺着 `billing_run_id` 与该次运行的扣款比。
+    `unpriced` / `held` / `pending` / `not_billable` 单独列进 `UnsettledRows` 并带 `event_id`，
+    不计入收入也不被抹平。差额分六类（`run_debit_mismatch` / `wallet_balance_drift` /
+    `billed_row_without_amount` / `billed_row_without_run` / `amount_on_unsettled_row` /
+    `missing_wallet`），能归因到请求的都带 `EventIDs`。
     **DoD**：给定一段时间窗，能对齐 ledger 行数、扣费总额、钱包变动三者；差额可解释到具体
     `event_id`；对账本身只读，不修数据。
+    **本轮未做**：只提供库内 API，没有 CLI/HTTP 入口，也没有定时运行与指标（告警仍属 E1）；
+    只比较金额，不重算单价（不做"应收 vs 实收"的重新定价核对）；
+    不校验 `wallet_transactions.balance_after` 的逐行链条（同 `created_at` 的顺序不唯一，
+    会造假阳性），只用与顺序无关的"余额 == 流水求和"这一恒等式；
+    `held` 的人工处理入口仍未做（B4.3 遗留）；`estimated` 仍无生产者；
+    new-api quota 整数单位 ↔ 货币金额的换算比例**仍未核对**（B4-BILLING-MODEL D4 的遗留项）。
 
 - **B5** P6 范围：控制台。
 

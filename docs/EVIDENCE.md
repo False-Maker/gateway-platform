@@ -7,7 +7,90 @@
 > 阅读规则：本文的每一条都是**对已发生事实的描述**。不要从本文推断"项目是否可以继续开发"——
 > 那个问题由 `docs/TODO.md` 和 `AGENTS.md` §0 回答。
 
-## B4.4 余额不足的执行点（2026-09-11）
+## B4.5 对账（2026-09-11）
+
+本轮只做一件事：给 B4 加一个**只读的三方对账**，把"账本怎么算"、"钱包被扣了多少"、
+"余额还剩多少"这三份各自独立写出来的记录，在一段时间窗上对齐。不修任何数据。
+
+### 改动
+
+- 新增 `internal/control/billing_reconcile.go`：`Reconciliation.Run(ctx, start, end)`。
+  三方是 `usage_ledger`（窗口内按 `billing_state` 的行数、`billed_amount` 求和）、
+  `wallet_transactions`（窗口行所属 `billing_run_id` 的 `debit` 求和）、
+  `tenant_wallets.balance`（与该租户全量流水求和比）。
+- 窗口取 `usage_ledger.occurred_at`，不取扣费时刻。理由写在代码注释里：扣费作业在用量发生
+  之后若干分钟才跑，按扣费时刻切窗会在每个边界上报出并不存在的差额。窗口内的行改为顺着
+  `billing_run_id` 找到那次运行，再拿**该次运行的完整足迹**（不裁剪到窗口）与它写的那一笔
+  扣款比——两侧同口径，边界不再造差。
+- `unpriced` / `held` / `pending` / `not_billable` 进 `UnsettledRows`，每行带 `event_id`。
+  这是 `docs/B4-BILLING-MODEL.md` §2 对 B4.5 的增补要求：不计入收入，但必须单独列出，
+  否则"全窗口都被 hold"会看起来完美平账而实际一分未收。
+- 差额分六类，能归因到请求的都带 `EventIDs`：`run_debit_mismatch`、`wallet_balance_drift`、
+  `billed_row_without_amount`、`billed_row_without_run`、`amount_on_unsettled_row`、
+  `missing_wallet`。
+- 只读由**数据库**承载而不是靠约定：整份报告跑在一个
+  `pgx.TxOptions{AccessMode: pgx.ReadOnly, IsoLevel: pgx.RepeatableRead}` 事务里。
+  只读之外还要求同一快照——否则一次在报告中途提交的扣费作业会被读成差额。
+- 金额比较用 `big.Rat` 比值（`sameMoney`），不比字符串：`"1.5"` 与 `"1.500000000000"`
+  是同一笔钱，比字符串会在 PG 和 Go 拼写不同的每个数上误报。
+
+### 本轮执行（命令与结果）
+
+```
+gofmt -l internal/control/billing_reconcile.go        # 无输出
+go build ./... && go vet ./internal/control/          # 通过
+go test -count=1 -p 1 -run TestReconciliation -v ./internal/control/
+  → 3 PASS（均真实执行，非 skip）
+env -u GATEWAY_TEST_DATABASE_URL -u GATEWAY_TEST_REDIS_ADDR go test -count=1 ./...
+  → 全绿
+set -a; source configs/test-infra/test.env; set +a; go test -count=1 -p 1 ./internal/control/
+  → 全绿
+set -a; source configs/test-infra/test.env; set +a; go test -count=1 -p 1 ./...
+  → 仅 TestBillingJobSettlesLedgerRowsAndWalletInOneTransaction 失败，见下
+```
+
+新增测试（`internal/control/billing_reconcile_integration_test.go`，前两个 PG-gated）：
+
+- `TestReconciliationAlignsLedgerDebitsAndWalletOverAWindow`：播一个租户、四行用量
+  （2 计费 / 1 unpriced / 1 held），跑扣费作业，再对账。断言三方全对齐
+  （`billed=0.0165` == 扣款 == 余额变动）、`Balanced()` 为真、两行未结算按 `event_id` 列出、
+  重跑一次结论不变。fixture 的 `occurred_at` 固定在 **2021-05-04**：gated 套件共用一个 PG，
+  别的计费测试都在 `now` 附近播数据，用一个远古窗口才能让"对整个窗口的断言"仍然是
+  "对本测试的断言"。
+- `TestReconciliationAttributesDifferencesToEventIDs`：扣费后人为制造两处不一致——
+  改大某一行的 `billed_amount`、以及绕过流水直接改余额。断言两类差额都被报出，
+  且金额差额**点名到那个 `event_id`**（DoD 的实质要求）。
+- `TestReconciliationSourceContainsNoWrites`（非 gated）：对源码断言
+  `billing_reconcile.go` 不含 `INSERT/UPDATE/DELETE/ALTER/TRUNCATE/.Exec(`，
+  且仍持有 `pgx.ReadOnly`。这是为了覆盖**没有测试走到的代码路径**：只读事务是执行者，
+  这条是在生产上撞见 PG 拒写之前先响的绊线。
+
+### 明确未由本轮证实
+
+- **`./...` 的这一处失败不是本轮引入的。** 在 `git stash -u` 后的干净 HEAD 上执行
+  `go test -count=1 -p 1 ./cmd/gwd/ ./internal/control/` 同样复现
+  （`B4.3 buckets = held 2, not billable 2`）。成因是 `cmd/gwd` 的集成测试在共用的
+  gateway_test 库里留下了 ledger 行，而 B4.2 那个测试断言的是扣费作业的**全局**计数器。
+  按 CLAUDE.md 的改动边界，本轮只陈述、不修。单独跑 `./internal/control/` 全绿。
+- 只提供库内 API：没有 CLI/HTTP 入口，没有定时运行，没有指标；告警规则仍属 E1。
+- 只比金额，不重算单价。本轮不做"拿原始 token 数重新定价、与 `billed_amount` 比"的核对，
+  因此"扣费算错了但账本和钱包一致"这一类错误对账查不出来。
+- 不校验 `wallet_transactions.balance_after` 的逐行链条。同一 `created_at` 的行顺序不唯一，
+  链式校验会产生假阳性；本轮只用与顺序无关的"余额 == 全量流水求和"这一恒等式，
+  它能抓住"余额被绕过流水改动"，抓不住"中间某行的 `balance_after` 被单独改写"。
+- 未在大窗口/大数据量上跑过：`Run` 会把窗口内每一行读进内存，窗口大小的上界没有压测过。
+- new-api quota 整数单位 ↔ 货币金额的换算比例**仍未核对**（B4-BILLING-MODEL D4）。
+
+### 最高剩余风险
+
+对账证明的是"三份记录互相一致"，不是"金额本身正确"。单价配错、`unit_scale` 配错、
+或 D4 那个未核实的换算比例错了，三方会**一致地错**，而本轮的报告一律显示 `Balanced()`。
+要把这一层补上，需要的是重新定价核对（拿 ledger 的原始 token 数按当时价重算并与
+`billed_amount` 比），本轮没做。
+
+---
+
+
 
 本轮只做一件事：把"钱包见底"这个状态经**已有的** `snap:auth:tokens:v1` 通道下发到 gateway，
 由 gateway 在鉴权中间件里返回 402。热路径不新增任何依赖。
