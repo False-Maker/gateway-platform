@@ -7,6 +7,29 @@
 > 阅读规则：本文的每一条都是**对已发生事实的描述**。不要从本文推断"项目是否可以继续开发"——
 > 那个问题由 `docs/TODO.md` 和 `AGENTS.md` §0 回答。
 
+## B4.0 计费模型决策记录（2026-09-10，仅文档）
+
+本轮只做一件事：产出 `docs/B4-BILLING-MODEL.md`。**非目标**：不写计费代码、不建表、不动 A11。
+
+**本轮实际执行**
+- 为写准文中引用的现有口径，读取并核对了：`migrations/001_initial.sql:81-100`（`usage_ledger` 已有
+  `tokens_in` / `tokens_out` / `cache_read_tokens` / `cache_write_tokens` / `usage_source` / `partial`
+  与 `event_id UNIQUE`）、`internal/snapshot/auth.go:21,24`（`snap:auth:tokens:v1` 与 `TokenRecord`）、
+  `internal/control/tenants.go:135` 与 `internal/control/run.go:105`（token 快照 tick 为 15s）、
+  `internal/gateway/auth.go:19-34`（`AuthContext` / `TenantLimits`）、
+  `migrations/002_tenants.sql`、`migrations/004_tenant_limits.sql`（`max_concurrency` / `rpm`，0 = 不限）、
+  `pkg/contracts/contracts.go:139`（`Decimal`）。文中所有代码位置引用均出自本轮实读，非记忆。
+- 三项业务决策由项目所有者本轮拍板：token 计价四类分别单价、预付余额、余额不足拒绝新请求走快照下发。
+  其余（单价存放位置、改价生效语义、缺价行为）由本文给出工程结论并附被否决选项。
+- `docs/TODO.md` 的 B4.0 条目标记完成并挂上记录链接，头部"下一步顺序"同步划掉 B4.0。
+
+**未由本轮证实**
+- 本轮**未写任何代码、未建任何表、未跑任何测试**；`go build` / `go test` 未执行，因为无代码变更。
+  文中的 schema 片段是待实现形状，不对应仓库中任何已存在的表。
+- **new-api 的 quota 整数单位与货币金额换算比例未核对**（未读真实 new-api 部署配置）。这是 B4.1 的硬输入，
+  届时必须实读确认，不得按上游默认值假定。
+- 文中的透支上界公式是结构性推导，未经真实流量校准；四类 token 的具体单价数值不在本文范围内。
+
 ## 计划补全 + `internal/migration/newapi` 测试补全（2026-09-10）
 
 本轮只做两件事：把第二次结构复盘的结论补进 `docs/TODO.md`（新增 A11、A12、C6、E1、E2，B4 拆为
