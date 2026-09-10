@@ -76,6 +76,7 @@ type UpstreamProfile struct {
     ExtraHeaders   map[string]string // anthropic-beta 等
     WS             bool
     // 见附录未决问题:若某渠道需每请求现场生成 challenge，此静态 Profile 不足以覆盖
+    // （2026-09-11：codex 已核实不需要；该风险目前只对未接入的 ChatGPT web 渠道成立）
 }
 
 // Release:一次上游尝试的终态事件,gateway 写入 Redis Stream 后由 control 消费
@@ -372,7 +373,7 @@ gateway-platform/            # 单 repo,单 module
 | 模块分层风格 | control | elucid-gateway | `elucid-gateway/internal/modules/*` |
 | `.sql` 独立迁移文件风格 | control | elucid-relay | `elucid-relay/internal/migrations/sql/`(27 个 .sql) |
 | utls JA3 指纹反代(codex_rustls 搬入蓝本) | gateway | elucid-relay | `elucid-relay/services/gateway-api/internal/httpserver/codex_tls.go` |
-| codex 反代/代理链 + 反自动化 另一份参考 | gateway | chatgpt2api | `chatgpt2api/services/proxy_service.py`(**核实是否每请求 PoW,见附录未决问题**)、`chatgpt2api/utils/pow.py` / `turnstile.py` / `sentinel.py` |
+| codex 反代/代理链 + 反自动化 另一份参考 | gateway | chatgpt2api | `chatgpt2api/services/proxy_service.py`(代理链/Cloudflare clearance,**不含** PoW)、`chatgpt2api/services/openai_backend_api.py`(PoW/turnstile 真实调用点;codex 端点已核实**不需要**,见附录)、`chatgpt2api/utils/pow.py` / `turnstile.py` / `sentinel.py` |
 | 协议互转独立 module 参考 | gateway | new-api | `new-api/relay/`(relaykit 独立 go module + channel 适配器) |
 | 入站客户端协议标记(http/ws) | gateway | sub2api | `sub2api/backend/internal/service/openai_client_transport.go` |
 
@@ -380,4 +381,12 @@ gateway-platform/            # 单 repo,单 module
 
 ## 附:未决架构问题(P2 前必须核实,评审 F8)
 
-`UpstreamProfile` 是**静态**配方。chatgpt2api 的 PoW/Turnstile 调用点在 **`chat-requirements`(每条消息)**,不只是登录。若 **codex provider 走的是这种 web-backend 路径**,则"每请求现场生成 challenge token"属于 provider(control 慢路径)却必须在**热路径每请求执行**,干净的热/慢拆分会破。**P2 打通 codex 前必须先确认**:codex CLI 的 API 端点是否需要每请求 PoW/turnstile。若需要,要么把该 provider 的 per-request minter 作为 gateway 可调用的旁路,要么承认该渠道不适用无状态热路径模型。
+> **2026-09-11 更新:no-cred 层面已核实,结论"不需要"。** 见 `docs/C6-CODEX-PER-REQUEST-CHALLENGE.md`。
+> 下段的条件句"**若 codex provider 走的是这种 web-backend 路径**"不成立:codex 与 web 通道**同主机不同 path**。
+> 蓝本里 `/backend-api/codex/responses` 是**纯 Bearer** 调用(`openai_backend_api.py:596`/`:785`),
+> 不带 sentinel 头、不调 `chat-requirements`;而本平台正是这个端点(`internal/control/provider/profile.go:57-58`)。
+> 故 `UpstreamProfile` 静态配方够用,**不开** per-request minter 旁路,§5 热/慢拆分**不破**。
+> 剩余部分:拿真实 codex 账号对该端点发一次只带 Bearer 的**通用文本推理**请求确认(live-gate,TODO §C6)。
+> 另注:**需要每请求 PoW/turnstile 的是 ChatGPT web 渠道**,本平台当前未把它建模为 provider;若将来接入,本问题原样回来。
+
+`UpstreamProfile` 是**静态**配方。chatgpt2api 的 PoW/Turnstile 调用点在 **`chat-requirements`(每条消息)**,不只是登录。若 **codex provider 走的是这种 web-backend 路径**,则"每请求现场生成 challenge token"属于 provider(control 慢路径)却必须在**热路径每请求执行**,干净的热/慢拆分会破。**P2 打通 codex 前必须先确认**:codex CLI 的 API 端点是否需要每请求 PoW/turnstile。若需要,要么把该 provider 的 per-request minter 作为 gateway 可调用的旁路,要么承认该渠道不适用无状态热路径模型。chatgpt2api 的 PoW/Turnstile 调用点在 **`chat-requirements`(每条消息)**,不只是登录。若 **codex provider 走的是这种 web-backend 路径**,则"每请求现场生成 challenge token"属于 provider(control 慢路径)却必须在**热路径每请求执行**,干净的热/慢拆分会破。**P2 打通 codex 前必须先确认**:codex CLI 的 API 端点是否需要每请求 PoW/turnstile。若需要,要么把该 provider 的 per-request minter 作为 gateway 可调用的旁路,要么承认该渠道不适用无状态热路径模型。

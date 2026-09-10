@@ -28,7 +28,9 @@
 > 下一步在 `B5 控制台` 与并行项 E1 / E2 / C6(no-cred 部分) 之间取。
 > `E1 告警规则落点` 2026-09-11 完成。
 > `E2 wrapper 其余 executor（no-cred 部分）` 2026-09-11 完成。
-> 下一步在 `B5 控制台` 与 `C6(no-cred 部分)` 之间取。
+> ~~下一步在 `B5 控制台` 与 `C6(no-cred 部分)` 之间取。~~
+>
+> 下一步：`B5 控制台`（并行项已清空；C6 只剩 live-gate）。
 > A12/E1/E2 不阻塞 B4，可并行取。P4（B4）在 A11 之前不进入编码——迁移来的用户还停在 staging，没有可扣费主体。
 
 ---
@@ -458,15 +460,21 @@ tenants / principals / tenant_tokens；摘要新增 `tenant_count` / `principal_
 - **C4** Copilot device authorization 端到端流程。
 - **C5** Antigravity / Kiro / Windsurf 的真实协议 harness。
 - **C6** **codex CLI 的 API 端点是否需要每请求 PoW / turnstile**。
-  **爆炸半径是契约级的，不是一个渠道的适配问题** —— 这是它区别于 C1–C5 的地方，取任务时优先核实。
+  **no-cred 部分 2026-09-11 完成，结论：不需要。**详见 `docs/C6-CODEX-PER-REQUEST-CHALLENGE.md`。
+  ~~**爆炸半径是契约级的，不是一个渠道的适配问题**~~ —— **本轮据此降级**：
+  蓝本证据显示本平台所用端点 `https://chatgpt.com/backend-api/codex/responses`
+  是**纯 Bearer** 调用、不带 sentinel 头、不调 `chat-requirements`
+  （`chatgpt2api/services/openai_backend_api.py:596` / `:785`，与 `profile.go:57-58` 同一路径）。
+  故 `UpstreamProfile` 静态配方够用，**不需要** per-request minter 旁路，总览 §5 热/慢拆分不破。
+  **本轮未写任何实现、未改任何契约**——核实结果就是"不需要改"。
   出处：总览"附：未决架构问题"与 `fluxgate/docs/architecture.md` §7。原文标注"P2 打通 codex 前必须核实"，
   但 P2、P3 都已过去，这条既未核实也未关闭，一直以附录脚注形式存在——2026-09-10 复盘将其提升为编号任务。
-  **若结论为"需要每请求 challenge"**：`UpstreamProfile` 这个**静态**配方就覆盖不了，
-  受影响的是两角色唯一深耦合点（总览 §5），要么给该 provider 开一条 gateway 可调用的 per-request minter 旁路，
-  要么承认该渠道不适用无状态热路径模型。两条路都会改契约，**不要在核实前先写实现**。
-  **可先做的 no-cred 部分**：读 `chatgpt2api/services/proxy_service.py` 与 `utils/pow.py`
-  确认其 PoW 调用点究竟在 `chat-requirements` 还是仅在登录，把结论写进文档；
-  真正的端到端确认需要真实 codex 账号，属 live-gate。
+  **顺带更正**：TODO 原指路"读 `chatgpt2api/services/proxy_service.py`"有误——
+  该文件**没有任何** PoW/turnstile/sentinel 引用（它管代理链与 Cloudflare clearance），
+  调用点全在 `services/openai_backend_api.py`。
+  **剩余 live-gate 部分**：拿真实 codex 账号对该端点发一次只带 Bearer 的**通用文本推理**请求，
+  确认不被要求 sentinel。（蓝本对该端点的唯一调用是**图像生成**，通用推理路径属推断而非证据。）
+  若被拒，需回到附录的两条路，**并重新评估上面"无需改动"的结论**。
 
 harness 契约（变量、约束）见 `docs/EVIDENCE.md` 中"项目结束真实 provider 验收"一节。
 harness 默认严格 skipped，只接受已审计官方 base URL，不接受 fixture 或 loopback。

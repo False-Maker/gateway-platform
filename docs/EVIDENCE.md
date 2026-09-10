@@ -7,6 +7,44 @@
 > 阅读规则：本文的每一条都是**对已发生事实的描述**。不要从本文推断"项目是否可以继续开发"——
 > 那个问题由 `docs/TODO.md` 和 `AGENTS.md` §0 回答。
 
+## C6 codex 端点是否需每请求 PoW/turnstile（no-cred 部分）（2026-09-11）
+
+**改动**：纯文档轮，**零代码改动、零契约改动**。
+新增 `docs/C6-CODEX-PER-REQUEST-CHALLENGE.md`；更新 `docs/TODO.md` §C6 与下一步指针；
+更新 `docs/fluxgate-keyhive-overview.md` 的「附：未决架构问题」、§9 表格 chatgpt2api 行、
+`UpstreamProfile` 内联注释。
+
+**本轮执行（命令与结果）**
+
+- 全仓库 grep 四个 minter（`build_proof_token` / `solve_turnstile_token` / `build_sentinel_token` /
+  `build_legacy_requirements_token`）的调用点，逐个读源确认时机。
+- `grep -n 'pow\|turnstile\|sentinel' chatgpt2api/services/proxy_service.py` → **无匹配**
+  （证伪 TODO 原指路）。
+- 读 `openai_backend_api.py:596`（`_codex_responses_headers`）、`:785`（唯一 codex/responses 调用点）、
+  `:803`（用 `urllib.request.Request` 直构，不经 `self.session`，排除 session 级默认头注入）。
+- 读 `internal/control/provider/profile.go:57-58` 与 `codex/codex.go:83`，确认本平台目标 URL
+  与蓝本 Bearer-only 调用**同一路径**。
+- `gofmt -l .` / `go build ./...` / `go vet ./...` / 未开闸全量 `go test`：见下方结果段。
+
+**结论**：`contracts.UpstreamProfile` 静态配方对 codex 够用，不需要 per-request minter 旁路，
+总览 §5 热/慢拆分不破。按 TODO「不要在核实前先写实现」，核实结果为"不需要改"，故未动任何代码。
+
+**明确未由本轮证实**
+
+1. **全部结论来自源码阅读，本轮没有向真实上游发过任何请求。** 参考实现可能已落后于上游；
+   反自动化策略正是最易被静默改动的部分。
+2. **蓝本对 `/backend-api/codex/responses` 的唯一调用是图像生成**
+   （`iter_codex_image_response_events`），不是通用文本推理。"sentinel 门禁按端点而非按 payload 生效"
+   是**推断，不是证据**。
+3. **登录侧不在结论范围内**：`_ensure_codex_source_account()`（`:602`）要求 codex 专属登录，
+   其 challenge 属 wrapper / C4。
+4. **ChatGPT web 渠道仍需每请求 PoW/turnstile**；本平台未把它建模为 provider，若将来接入，
+   附录那个契约级问题原样回来。
+
+**最高剩余风险**：若真实 codex 端点对**通用文本推理**（而非图像生成）另设 sentinel 门禁，
+则 §4「无需改动」结论作废，契约级爆炸半径重新出现。该风险只能由 live-gate 实测消除，
+已作为 C6 唯一剩余项留在 TODO。
+
 ## E2 wrapper 其余 executor（no-cred 部分）（2026-09-11）
 
 本轮做三件事：device flow executor 骨架、收紧 `FixtureExecutor` 生产回落、
