@@ -7,6 +7,47 @@
 > 阅读规则：本文的每一条都是**对已发生事实的描述**。不要从本文推断"项目是否可以继续开发"——
 > 那个问题由 `docs/TODO.md` 和 `AGENTS.md` §0 回答。
 
+## B4.1 计价表与钱包 schema（2026-09-11）
+
+本轮只做 schema 与仓储，不做扣费。
+
+**改动**
+
+- `migrations/005_billing.sql`：`model_prices` / `tenant_wallets` / `wallet_transactions`。
+  所有金额列为 `NUMERIC(38,12)`；`model_prices` 上加了 `BEFORE UPDATE OR DELETE` trigger，
+  任何改写历史价的尝试直接 `RAISE EXCEPTION`。文件与其余 migration 一样可重复应用
+  （`CREATE TABLE IF NOT EXISTS` + `CREATE OR REPLACE FUNCTION` + `DROP TRIGGER IF EXISTS`）。
+- `internal/control/billing.go`：`PGBillingRepository`。
+  `InsertModelPrice` 在应用层拒绝 `effective_from <= now`（`ErrPriceNotEffectiveInFuture`）、
+  拒绝超过 12 位小数（否则 PG 会静默四舍五入）、拒绝负单价；
+  `PriceAt` 按传入时刻取价（B4.2 将传 ledger 行的 `occurred_at`），无价时返回 `found=false` 而不是 0；
+  `ApplyMovement` 在一个事务里 `SELECT ... FOR UPDATE` → 更新余额 → 写流水，
+  `balance_after` 由 PG 从库内 numeric 算出，不由调用方传入；
+  `Balance` 对"无钱包"和"余额为 0"返回不同结果。仓储**没有**改价、删价、或单独改余额的方法。
+
+**本轮执行**
+
+- `go build ./cmd/gwd`、`go vet ./...`、`go test -count=1 ./...`（ungated）通过。
+- 带库回归：`set -a; source configs/test-infra/test.env; set +a; go test -count=1 -p 1 ./...` 全绿。
+  其中 `TestModelPricesOnlyGoForwardAndAreImmutable`、`TestWalletBalanceAndJournalMoveInOneTransaction`
+  在真实 PostgreSQL 上实跑（非 skip），已核实：
+  - 回溯价与"恰好等于 now"的价被拒；重复 `(provider, model, effective_from)` 被拒；
+  - 直接 `UPDATE` / `DELETE` 单价行被数据库拒绝，行数不变；
+  - 连续 100 次 `-0.01` 扣减后余额精确为 `9.050000000000`（float64 在此必然漂移）；
+  - 流水求和 == `tenant_wallets.balance`，最后一条 `balance_after` == 当前余额；
+  - 被守卫拒绝的流水（负充值 / 未知 kind / 重复 id）既不改余额也不留流水行；
+  - 删除 tenant 级联清掉钱包与流水；`migrations.Apply` 连续跑两次无错。
+
+**未由本轮证实**
+
+- **未写入任何真实单价**，也未在任何环境建过真实钱包余额。表是空的。
+- **new-api 的 `QuotaPerUnit`（quota 整数单位 ↔ 货币金额）本轮仍未核对**，
+  这是 B4-BILLING-MODEL D4 明确标注的硬输入；A11 迁移过来的 quota 仍停留在 source unit，
+  本轮没有做任何换算，也没有据此给任何租户建钱包。
+- `wallet_transactions` 目前只靠"仓储不提供改写入口"保证不可变，**没有**像 `model_prices`
+  那样加数据库 trigger。
+- 并发正确性只由 `FOR UPDATE` 结构保证，**未做并发压测**。
+
 ## A11 迁移 tenant 转正（2026-09-11）
 
 本轮只做一件事：让 `internal/migration/newapi` 把 new-api 的 users / tokens 转正为目标库的

@@ -20,7 +20,7 @@
 > 同时把原来只有一行字的 B4 拆成 **B4.0–B4.5**，每项带 DoD。
 >
 > **下一步顺序（已定）**：~~`B4.0 定计费模型（不写代码）`~~（2026-09-10 完成，见 `docs/B4-BILLING-MODEL.md`）
-> → ~~`A11 迁移 tenant 转正`~~（2026-09-11 完成）→ `B4.1+ 计费编码`。
+> → ~~`A11 迁移 tenant 转正`~~（2026-09-11 完成）→ ~~`B4.1 计价表与钱包 schema`~~（2026-09-11 完成）→ `B4.2 扣费作业`。
 > A12/E1/E2 不阻塞 B4，可并行取。P4（B4）在 A11 之前不进入编码——迁移来的用户还停在 staging，没有可扣费主体。
 
 ---
@@ -330,9 +330,18 @@ tenants / principals / tenant_tokens；摘要新增 `tenant_count` / `principal_
     **DoD**：决策记录进 `docs/`，含被否决的选项与否决理由；B4.1–B4.5 的 DoD 据此细化。
 
   - **B4.1** `[no-cred]` 计价表与钱包 schema。
+    **状态：已完成（2026-09-11）。** `migrations/005_billing.sql`（`model_prices` / `tenant_wallets` /
+    `wallet_transactions`）+ `internal/control/billing.go`（`PGBillingRepository`）。
+    单价不可变由**数据库 trigger** 承载，不只靠应用层——手工 psql 也改不动历史价；
+    仓储不提供任何改价/删价入口，改价只能是一条 `effective_from` 更晚的新行。
+    金额全程 `contracts.Decimal` ↔ `NUMERIC(38,12)`（SQL 里 `$n::numeric` / `col::text`），
+    余额加减交给 PG 的 numeric 运算，Go 侧不做浮点算术。
     **DoD**：新增 migration（单价表 + 钱包/账单表），单价带生效时间且历史单价不可变；
     钱包余额为精确十进制，**不经 `float64`**（沿用 B3 已建立的 `contracts.Decimal` 口径）；
     重复应用 migration 幂等。
+    **本轮未做**：未写入任何真实单价数值（业务定价，非工程决策）；
+    new-api quota 整数单位 ↔ 货币金额的换算比例**仍未核对**（B4-BILLING-MODEL D4 的遗留项），
+    充值入口留在 B5。
 
   - **B4.2** `[no-cred]` 从 `usage_ledger` 到扣费的慢路径作业。
     **DoD**：control 慢路径按 tenant 聚合未计费的 ledger 行 → 乘单价 → 扣钱包，**热路径零参与**；
