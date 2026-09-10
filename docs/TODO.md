@@ -22,7 +22,7 @@
 > **下一步顺序（已定）**：~~`B4.0 定计费模型（不写代码）`~~（2026-09-10 完成，见 `docs/B4-BILLING-MODEL.md`）
 > → ~~`A11 迁移 tenant 转正`~~（2026-09-11 完成）→ ~~`B4.1 计价表与钱包 schema`~~（2026-09-11 完成）
 > → ~~`B4.2 扣费作业`~~（2026-09-11 完成）→ ~~`B4.3 UsageSource 可信度口径`~~（2026-09-11 完成）
-> → `B4.4 余额不足的执行点`。
+> → ~~`B4.4 余额不足的执行点`~~（2026-09-11 完成）→ `B4.5 对账`。
 > A12/E1/E2 不阻塞 B4，可并行取。P4（B4）在 A11 之前不进入编码——迁移来的用户还停在 staging，没有可扣费主体。
 
 ---
@@ -314,7 +314,7 @@ tenants / principals / tenant_tokens；摘要新增 `tenant_count` / `principal_
   `getUsageLimits` 仅映射已核实字段，未知 envelope/缺失字段保持 missing。快照 JSON、PG quota/outbox
   与 gateway 选号保留精度；选号只在明确余量为零或负数时排除账号。真实 provider schema 对账仍属 C2。
 - **B4** P4 范围：真实用量扣减、调度深化、多租户计费。依赖 §A 打通后才有意义。
-  **状态：进行中。**B4.0–B4.3 已完成；下列子项按序取，下一项是 B4.4。
+  **状态：进行中。**B4.0–B4.4 已完成；下列子项按序取，下一项是 B4.5。
 
   - **B4.0** `[no-cred]` **定计费模型（只出文档，不写代码）**。
     **状态：已完成（2026-09-10）。决策记录见 `docs/B4-BILLING-MODEL.md`。**
@@ -378,9 +378,21 @@ tenants / principals / tenant_tokens；摘要新增 `tenant_count` / `principal_
     new-api quota 整数单位 ↔ 货币金额的换算比例**仍未核对**（B4-BILLING-MODEL D4 的遗留项）。
 
   - **B4.4** `[no-cred]` 余额不足的执行点。
+    **状态：已完成（2026-09-11）。** 证据见 `docs/EVIDENCE.md` 同名小节。
     **DoD**：按 B4.0 的结论实现。若结论是"拒绝新请求"，则必须走**已有的 tenant 快照下发通道**
     （A6 的 `snap:auth:tokens:v1` 已经在下发 tenant 限额，余额状态同理），
     **不允许 gateway 在热路径同步查 PG 或调用 control**。
+    结论摘要：`snapshot.TokenRecord` 增加 `BillingBlocked`，control 在 15s publish tick 上
+    用 `LEFT JOIN tenant_wallets` 算出 `balance <= 0`（**无钱包行的租户永不被拦**）；
+    gateway 在鉴权中间件里返回 **402**，文案带 tenant，计 `gateway_billing_rejected_total{tenant}`，
+    因为拦在 handler 之前，所以结构性地**不打上游、不产生 Release 事件、不写 `usage_ledger`**。
+    "未查 PG / 未调 control"由 import 闭包断言证明（覆盖所有代码路径，不止被测到的那些）。
+    在途请求不杀；敞口上界 ≈ `峰值花费速率 × (快照周期 + 扣费周期 + 在途时长)`。
+    **本轮未做**：`rpm = 0` 的预付租户敞口无上界，只上报
+    `control_billing_uncapped_wallet_tenants` gauge + log 点名，**不自动处置**，
+    告警规则本身留给 E1；三方对账未做（B4.5）；
+    new-api quota 整数单位 ↔ 货币金额的换算比例**仍未核对**（B4-BILLING-MODEL D4），
+    因此"余额 ≤ 0"的绝对刻度仍未验证。
 
   - **B4.5** `[no-cred]` 对账。
     **DoD**：给定一段时间窗，能对齐 ledger 行数、扣费总额、钱包变动三者；差额可解释到具体

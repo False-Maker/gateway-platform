@@ -14,6 +14,11 @@ import (
 
 var ErrUnauthorized = errors.New("tenant authentication required")
 
+// ErrBillingBlocked is returned as HTTP 402 to a tenant whose prepaid wallet
+// control last published as exhausted. It is deliberately distinct from
+// ErrUnauthorized: the credential is valid, the money is not there.
+var ErrBillingBlocked = errors.New("tenant balance exhausted")
+
 // AuthContext is the gateway-internal identity derived from a verified tenant
 // token. Request bodies cannot override any of these fields.
 type AuthContext struct {
@@ -22,6 +27,11 @@ type AuthContext struct {
 	TokenID     string
 	Group       string
 	Limits      TenantLimits
+	// BillingBlocked mirrors the control-published snapshot field: the tenant's
+	// wallet was at or below zero the last time control looked. The gateway
+	// carries the flag rather than a balance, because a balance would tempt the
+	// hot path into arithmetic it has no authority to do (B4.0 D5).
+	BillingBlocked bool
 	// SessionKey is the client's opaque conversation handle (X-Session-Key).
 	// It is only meaningful inside this tenant; the router fills it per request.
 	SessionKey string
@@ -114,7 +124,8 @@ func (a *Authenticator) Authenticate(raw string) (AuthContext, error) {
 	if group == "" {
 		group = "default"
 	}
-	return AuthContext{TenantID: record.TenantID, PrincipalID: record.PrincipalID, TokenID: record.TokenID, Group: group, Limits: TenantLimits{MaxConcurrency: record.MaxConcurrency, RPM: record.RPM}}, nil
+	return AuthContext{TenantID: record.TenantID, PrincipalID: record.PrincipalID, TokenID: record.TokenID, Group: group,
+		Limits: TenantLimits{MaxConcurrency: record.MaxConcurrency, RPM: record.RPM}, BillingBlocked: record.BillingBlocked}, nil
 }
 
 // AuthenticateRequest extracts the bearer token from the Authorization header

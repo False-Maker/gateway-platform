@@ -31,6 +31,15 @@ type TokenRecord struct {
 	// Tenant-wide ceilings; 0 = unlimited.
 	MaxConcurrency int `json:"max_concurrency,omitempty"`
 	RPM            int `json:"rpm,omitempty"`
+	// BillingBlocked is true when control last saw this tenant's wallet at or
+	// below zero. Gateway refuses new requests for the tenant without reading
+	// any balance itself -- that is the whole point of shipping it here rather
+	// than having the hot path ask control or PostgreSQL (B4.0 D5).
+	//
+	// Every token of the same tenant carries the same value: control is the
+	// single writer and computes it once per publish, so two tokens cannot
+	// disagree.
+	BillingBlocked bool `json:"billing_blocked,omitempty"`
 }
 
 func (r TokenRecord) Validate() error {

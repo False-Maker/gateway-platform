@@ -7,6 +7,89 @@
 > 阅读规则：本文的每一条都是**对已发生事实的描述**。不要从本文推断"项目是否可以继续开发"——
 > 那个问题由 `docs/TODO.md` 和 `AGENTS.md` §0 回答。
 
+## B4.4 余额不足的执行点（2026-09-11）
+
+本轮只做一件事：把"钱包见底"这个状态经**已有的** `snap:auth:tokens:v1` 通道下发到 gateway，
+由 gateway 在鉴权中间件里返回 402。热路径不新增任何依赖。
+
+**改动**
+
+- `internal/snapshot/auth.go`：`TokenRecord` 增加 `BillingBlocked bool`。下发的是**结论不是余额**——
+  给出余额就等于邀请热路径自己做它没有权威做的算术。同一 tenant 的所有 token 取值必然一致：
+  control 是唯一写入方，每个 publish 周期只算一次。
+- `internal/control/tenants.go`：`ListActiveTokens` 的 SQL 加 `LEFT JOIN tenant_wallets`，
+  判据是 `w.tenant_id IS NOT NULL AND w.balance <= 0`。**没有钱包行的 tenant 永不被拦**——
+  "没有钱包"不等于"没有钱"，否则会一次性打掉所有非预付计费方式的租户。
+  边界取 `<= 0`（含零）：余额恰为 0 的租户已经没有可花的钱了。
+  这次读库发生在 15s 的 publish tick 上，离请求路径十万八千里。
+- `internal/gateway/auth.go` / `run.go`：`AuthContext` 增加 `BillingBlocked`，
+  `NewRouter` 的鉴权中间件在 `AuthenticateRequest` 成功之后、其余一切之前返回
+  **402 Payment Required**，错误文案带 tenant，并计 `gateway_billing_rejected_total{tenant}`。
+  放在中间件里是结构性保证，不是约定：被拦的请求根本到不了 handler，
+  因此**不打上游、不产生 Release 事件、不写 `usage_ledger`**。
+  402 与 401 严格分开：凭据是好的，钱不在。
+- 溢出敞口信号：`TokenLoop` 增加可选 `Metrics`，每个 publish 周期发
+  `control_billing_blocked_tenants`（按 **tenant** 去重，不是按 token）和
+  `control_billing_uncapped_wallet_tenants` 两个 gauge，后者由
+  `PGTenantRepository.UncappedWalletTenants` 支撑（`rpm = 0` 且有钱包的 active 租户），
+  并同时打一条 log 点名这些租户。
+
+**为什么接受"会欠一点"**
+
+B4.0 D5 定的敞口上界约为
+`峰值花费速率 × (快照周期 + 扣费周期 + 在途请求时长)`。
+第一项唯一的封顶来自 A10 的 per-tenant `rpm`；**`rpm = 0` 的预付租户敞口无上界**，
+这是本设计唯一一处会"坏得难看"而不是"坏得优雅"的地方。本轮选择**报出来而不是偷偷改**：
+在这里硬塞一个限流值等于 control 自己发明一个没人拍板过的数字。这条是 E1 告警的落点，
+本轮不写告警规则本身。
+
+在途请求也不杀：拦截点在"新请求"上，已经打到上游的请求继续跑完，
+否则会同时产生一笔已花的上游成本和一个没有 usage 的截断响应。
+
+**本轮执行（命令与结果）**
+
+- `gofmt -l .`、`go build ./...`、`go vet ./...`：通过（`gofmt` 的两处报告见下方免责）。
+- 无凭据全量回归（清空 `GATEWAY_TEST_*` 环境变量）：`go test -count=1 ./...` 全绿。
+- PG 门禁全量回归：`set -a; source configs/test-infra/test.env; set +a; go test -count=1 -p 1 ./...`
+  连续执行 **2 次**全绿。
+- 新增测试，`-v` 确认真实执行而非 skip：
+  - `internal/gateway/billing_block_test.go`
+    `TestRouterRefusesBillingBlockedTenantsWithoutTouchingUpstream`：`BillingBlocked` 的 token 得 402、
+    文案含 tenant、**httptest 上游调用数为 0**、**Redis release 流中一条事件都没有**；
+    未知 token 仍是 401（不塌缩成 402）；同一 router 上健康租户仍得 200 且上游恰好被调用 1 次。
+  - 同文件 `TestGatewayDoesNotDependOnPostgresOrControl`：从
+    `internal/gateway` 出发递归解析**非测试**源文件的 import（`go/parser`，`ImportsOnly`），
+    断言整个可达闭包里没有 `jackc/pgx`、没有 `database/sql`、没有 `internal/control`。
+    这是 DoD 里"gateway 全程未查 PG / 未调 control"的诚实证明方式：它覆盖所有代码路径，
+    包括没有测试跑过的那些；将来谁往 gateway 里加一行 PG 查询，即使永不被调用也会在这里挂。
+    另有"必须走到 snapshot/events/contracts"的自检，防止 walk 空转而假绿。
+  - `internal/control/billing_block_integration_test.go`
+    `TestWalletExhaustionReachesTheTokenSnapshotWithinOneTick`（PG 门禁）：
+    充值 1.5 → publish → 未拦；扣到**恰好 0** → **只跑一次** `RunOnce` → 快照里已 `BillingBlocked=true`，
+    对应 DoD 的"余额转负后，最多一个快照周期内 gateway 开始拒绝"；再充值 → 下一 tick 解除。
+    同一断言里验证隔壁**没有钱包**的租户全程不被拦。
+  - 同文件 `TestUncappedWalletTenantsNamesPrepaidTenantsWithNoRateLimit`（PG 门禁）：
+    `rpm=0` 且有钱包 → 上报；`rpm=60` → 不报；无钱包 → 不报。
+  - gauge 断言写成**相对基线的增减**而不是绝对值：这两个 gauge 统计的是整库租户，
+    共享测试库里别的 fixture 会移动绝对数。第一次全量门禁跑就是被这一点打挂的，已修正。
+
+**明确未由本轮证实**
+
+- 真实计费准确性：全部数字来自本地 fixture 与本地 PG，不构成任何真实 provider 或生产计费结论。
+- new-api `QuotaPerUnit`（quota 整数单位 ↔ 货币金额）**仍未核对**（B4-BILLING-MODEL D4），
+  因此"余额 ≤ 0"这个判据的**绝对刻度**仍未验证——本轮只证明了机制，没证明标尺。
+- 敞口上界公式本身未做压测标定：没有实测过"峰值花费速率"，公式是设计约束不是测量结果。
+- 未验证在真实并发下 15s 快照周期对具体某租户的实际欠款金额。
+- `gofmt -l .` 报告 `cmd/new-api-migrate/main_test.go` 与 `internal/control/health.go` 未格式化。
+  两者都在本轮改动范围之外，按 CLAUDE.md 的 Change Boundary 只陈述、不顺手改。
+
+**最高剩余风险**
+
+`rpm = 0` 的预付租户敞口无上界。本轮把它变成了一个可观测、会点名的信号
+（`control_billing_uncapped_wallet_tenants` + log），但**没有任何自动处置**：
+真出现一个高速烧钱且不限流的预付租户，系统只会一边记账一边看着它欠下去，直到有人看告警。
+告警规则落点是 E1。
+
 ## B4.3 `UsageSource` 可信度口径（2026-09-11）
 
 本轮只把"什么样的用量算不算钱"写成一张穷举表，接管 B4.2 里一律留 `pending` 的行。热路径不动。

@@ -100,6 +100,18 @@ func NewRouter(server *Server, auth *Authenticator) *gin.Engine {
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": ErrUnauthorized.Error()})
 			return
 		}
+		// B4.4: refuse before any upstream work happens. Because this sits in
+		// the auth middleware, a blocked tenant never reaches a handler, so no
+		// upstream call is made, no Release event is produced and no
+		// usage_ledger row is written. The decision is read off the snapshot
+		// the authenticator already had in memory -- no PostgreSQL, no control.
+		if authCtx.BillingBlocked {
+			observability.Default.AddCounter("gateway_billing_rejected_total", 1, "tenant", authCtx.TenantID)
+			c.AbortWithStatusJSON(http.StatusPaymentRequired, gin.H{
+				"error": ErrBillingBlocked.Error(), "tenant": authCtx.TenantID,
+			})
+			return
+		}
 		sessionKey, err := normalizeSessionKey(c.GetHeader(SessionKeyHeader))
 		if err != nil {
 			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": err.Error()})

@@ -101,7 +101,7 @@ func Run(cfg Config) error {
 	if err := snapshotLoop.RunOnce(ctx); err != nil {
 		log.Printf("control initial snapshot publish failed: %v", err)
 	}
-	tokenLoop := TokenLoop{Repository: PGTenantRepository{DB: db}, Redis: rdb}
+	tokenLoop := TokenLoop{Repository: PGTenantRepository{DB: db}, Redis: rdb, Metrics: observability.Default}
 	tokenTicker := time.NewTicker(tokenRefreshInterval)
 	defer tokenTicker.Stop()
 	if err := tokenLoop.RunOnce(ctx); err != nil {

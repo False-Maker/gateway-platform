@@ -6,9 +6,11 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log"
 	"strings"
 	"time"
 
+	"github.com/elucid/gateway-platform/internal/observability"
 	"github.com/elucid/gateway-platform/internal/snapshot"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
@@ -26,11 +28,16 @@ func (r PGTenantRepository) ListActiveTokens(ctx context.Context, now time.Time)
 	if r.DB == nil {
 		return nil, errors.New("tenant database pool is nil")
 	}
+	// B4.4: the wallet is read here, on the 15s publish tick, and nowhere near
+	// a request. A tenant with no wallet row is not a prepaid tenant and is
+	// never blocked -- absence of a wallet must not read as "no money".
 	rows, err := r.DB.Query(ctx, `
-		SELECT k.id, k.tenant_id, k.principal_id, k."group", k.token_hash, k.expires_at, t.max_concurrency, t.rpm
+		SELECT k.id, k.tenant_id, k.principal_id, k."group", k.token_hash, k.expires_at, t.max_concurrency, t.rpm,
+		       (w.tenant_id IS NOT NULL AND w.balance <= 0) AS billing_blocked
 		FROM tenant_tokens k
 		JOIN tenants t ON t.id = k.tenant_id
 		JOIN principals p ON p.id = k.principal_id
+		LEFT JOIN tenant_wallets w ON w.tenant_id = k.tenant_id
 		WHERE k.status = 'active' AND k.revoked_at IS NULL
 		  AND t.status = 'active' AND p.status = 'active'
 		  AND (k.expires_at IS NULL OR k.expires_at > $1)`, now)
@@ -43,7 +50,8 @@ func (r PGTenantRepository) ListActiveTokens(ctx context.Context, now time.Time)
 		var record snapshot.TokenRecord
 		var hash string
 		var expiresAt *time.Time
-		if err := rows.Scan(&record.TokenID, &record.TenantID, &record.PrincipalID, &record.Group, &hash, &expiresAt, &record.MaxConcurrency, &record.RPM); err != nil {
+		if err := rows.Scan(&record.TokenID, &record.TenantID, &record.PrincipalID, &record.Group, &hash, &expiresAt,
+			&record.MaxConcurrency, &record.RPM, &record.BillingBlocked); err != nil {
 			return nil, err
 		}
 		if expiresAt != nil {
@@ -140,6 +148,52 @@ type TokenLoop struct {
 	Repository TenantRepository
 	Redis      redis.UniversalClient
 	Now        func() time.Time
+	// Metrics carries the B4.4 overdraft-exposure signals. Optional: a nil
+	// registry drops the signals, it does not stop the publish.
+	Metrics *observability.Registry
+}
+
+// uncappedWalletReporter is implemented by repositories that can also name the
+// prepaid tenants whose spend rate has no ceiling. It is a separate optional
+// interface so the existing TenantRepository fakes keep compiling; a repository
+// that does not implement it simply publishes no exposure signal.
+type uncappedWalletReporter interface {
+	UncappedWalletTenants(context.Context) ([]string, error)
+}
+
+// UncappedWalletTenants lists prepaid tenants with rpm = 0 (unlimited).
+//
+// B4.0 D5 bounds the overdraft this design accepts at roughly
+//
+//	peak spend rate x (snapshot period + billing period + in-flight duration)
+//
+// and the only thing capping the first factor is A10's per-tenant rpm. A
+// prepaid tenant with rpm = 0 therefore has an *unbounded* overdraft, which is
+// the one way this design fails badly rather than gracefully. It is reported,
+// not silently corrected: forcing a limit here would be control inventing a
+// number nobody chose.
+func (r PGTenantRepository) UncappedWalletTenants(ctx context.Context) ([]string, error) {
+	if r.DB == nil {
+		return nil, errors.New("tenant database pool is nil")
+	}
+	rows, err := r.DB.Query(ctx, `
+		SELECT t.id FROM tenants t
+		JOIN tenant_wallets w ON w.tenant_id = t.id
+		WHERE t.status = 'active' AND t.rpm = 0
+		ORDER BY t.id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var tenants []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		tenants = append(tenants, id)
+	}
+	return tenants, rows.Err()
 }
 
 func (l TokenLoop) RunOnce(ctx context.Context) error {
@@ -160,7 +214,39 @@ func (l TokenLoop) RunOnce(ctx context.Context) error {
 	if err := snapshot.PublishTokens(ctx, l.Redis, records); err != nil {
 		return fmt.Errorf("publish tokens: %w", err)
 	}
+	l.publishExposure(ctx, records)
 	return nil
 }
 
+// publishExposure reports how many tenants are currently refused, and how many
+// prepaid tenants can overdraw without bound. Both are gauges rather than
+// counters: what matters is the standing state, not how often it was recomputed.
+func (l TokenLoop) publishExposure(ctx context.Context, records map[string]snapshot.TokenRecord) {
+	if l.Metrics == nil {
+		return
+	}
+	blocked := map[string]struct{}{}
+	for _, record := range records {
+		if record.BillingBlocked {
+			blocked[record.TenantID] = struct{}{}
+		}
+	}
+	// Tenants, not tokens: one tenant with six tokens is one blocked tenant.
+	l.Metrics.SetGauge("control_billing_blocked_tenants", float64(len(blocked)))
+	reporter, ok := l.Repository.(uncappedWalletReporter)
+	if !ok {
+		return
+	}
+	uncapped, err := reporter.UncappedWalletTenants(ctx)
+	if err != nil {
+		log.Printf("control uncapped wallet tenant check failed: %v", err)
+		return
+	}
+	l.Metrics.SetGauge("control_billing_uncapped_wallet_tenants", float64(len(uncapped)))
+	if len(uncapped) > 0 {
+		log.Printf("control: %d prepaid tenants have rpm=0, so their overdraft is unbounded: %v", len(uncapped), uncapped)
+	}
+}
+
 var _ TenantRepository = PGTenantRepository{}
+var _ uncappedWalletReporter = PGTenantRepository{}
