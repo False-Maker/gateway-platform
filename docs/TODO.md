@@ -26,6 +26,7 @@
 > **§B4 到此闭合。**~~下一步在 `B5 控制台` 与并行项 A12 / E1 / E2 / C6(no-cred 部分) 之间取。~~
 > `A12 请求明细存储` 2026-09-11 完成（见 `docs/A12-REQUEST-DETAIL.md`），**§A 到此闭合**。
 > 下一步在 `B5 控制台` 与并行项 E1 / E2 / C6(no-cred 部分) 之间取。
+> `E1 告警规则落点` 2026-09-11 完成。下一步在 `B5 控制台` 与 `E2` / `C6(no-cred 部分)` 之间取。
 > A12/E1/E2 不阻塞 B4，可并行取。P4（B4）在 A11 之前不进入编码——迁移来的用户还停在 staging，没有可扣费主体。
 
 ---
@@ -491,7 +492,8 @@ harness 默认严格 skipped，只接受已审计官方 base URL，不接受 fix
 ## §E 可观测性与运维闭环（2026-09-10 复盘新增）
 
 - **E1** `[no-cred]` **告警规则没有落点：指标埋了但没有消费方**。
-  **状态：未开始。不阻塞 B4，可并行。**
+  **状态：已完成（2026-09-11）。** 规则见 `configs/alerts/gateway-platform.rules.yml`，
+  验证命令见 `configs/alerts/README.md`。
   **基线**：A9 产出了 `control_platform_alert{provider,reason}`、`control_platform_error_total{provider,class}`、
   `control_platform_transport_rejections_accounts`、`control_platform_starvation_release_total`；
   总览 §4.1 另要求 `control_stream_pending`、`control_stream_dlq_total{reason}`、
@@ -508,6 +510,23 @@ harness 默认严格 skipped，只接受已审计官方 base URL，不接受 fix
     不得写成已验证值。
   - 规则文件有语法校验（`promtool check rules` 或等价），进 CI 或至少进一条可执行的验证命令。
   - 通知通道（谁收、怎么收）属部署边界，**不在本任务范围**——本任务只交付规则与阈值。
+
+  **实现摘要**
+  - `configs/alerts/gateway-platform.rules.yml`：16 条规则、6 个分组。DoD 要求的五个方向全覆盖，
+    另把此前无消费方的 B4.2/B4.3/B4.4 计费指标与 A12 明细指标一并接上。
+  - 阈值来源逐条写在 `threshold_source` 注解里，分两类：`uncalibrated`（起始值，待回调）与
+    "由后果推出"（可容忍量本身为 0，与流量无关，如 DLQ 增长 = 计量缺口）。文件头部有总声明。
+  - 校验双轨：`promtool check rules`（Docker，`prom/prometheus:v3.7.3`）验 PromQL 语法；
+    `internal/observability/alertrules_test.go` 验语义且**不依赖 Docker**——它扫源码取出真正被
+    发射的指标名，规则里引用了仓库不存在的指标就红。写错指标名的规则永远不会触发，
+    读起来却像有覆盖，这是本任务真正要防的失效模式。
+
+  **本轮未做**
+  - 无 CI，两条校验命令均为手动执行（仓库本来就没有 CI 配置）。
+  - 所有阈值未经真实流量校准，且未做告警演练（没有触发过任意一条规则）。
+  - B4.5 对账作业**不发射任何指标**，因此"对账发现不一致"目前无法告警。不在 E1 DoD 的五项内，
+    此处记录，本轮不改。
+  - `control_billing_held_rows` 有了告警，但 held 行仍无人工处理入口（既有未决项）。
 
 - **E2** `[no-cred]` **wrapper 其余 executor 的 no-cred 部分**。
   **状态：未开始。**

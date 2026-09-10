@@ -1,0 +1,288 @@
+# Prometheus 告警规则 —— gateway-platform（E1）
+#
+# 范围：本文件只交付**规则与阈值**。通知通道（谁收、怎么收）属部署边界，按 E1 DoD 不在此文件内。
+#
+# 阈值总声明：**下列所有阈值均未经真实流量校准。**
+# 总览 §6.3.1 已声明冷却时长"待线上回调"，本平台也从未在真实流量下跑过。
+# 每条规则的 `threshold_source` 注解写明该阈值是从哪推出来的；凡是标注
+# `uncalibrated` 的，都只是"能让规则跑起来的起始值"，不是已验证结论。
+# 上线后第一件事是按实际分布回调这些数字，而不是把它们当基线。
+#
+# 指标来源：全部取自 internal/observability 注册表实际发射的指标名，
+# 由 internal/observability/alertrules_test.go 交叉校验——规则里引用了仓库里
+# 不存在的指标，测试就红。
+#
+# job 标签由部署侧的 scrape 配置决定，本文件不假设其取值；
+# gateway 与 control 是两个独立进程的注册表，规则按指标归属分组。
+
+groups:
+  # =========================================================================
+  # 平台级出口健康 —— 总览 §6.3.1 规则 2。
+  # 这一组的价值全在告警上：没有告警，"出口 IP / TLS 指纹被标记"就退化回
+  # 一个号一个号烧着去发现。
+  # =========================================================================
+  - name: gateway-platform-egress
+    rules:
+      - alert: PlatformTransportRejection
+        expr: control_platform_alert{reason="transport_rejections"} > 0
+        for: 5m
+        labels:
+          severity: critical
+          scope: platform
+        annotations:
+          summary: "{{ $labels.provider }} 多账号同时 transport 被拒，疑似出口 IP / TLS 指纹被标记"
+          description: >-
+            control 的平台级判定已置位（distinct 账号数 {{ $value }}）。
+            这是平台问题不是账号问题：换号重试不会好转，先查出口 IP 与 utls profile。
+          runbook: "docs/TODO.md §A9；总览 §6.3.1 规则 2"
+          threshold_source: >-
+            uncalibrated。判定阈值本身在代码里（internal/control 的平台级判定），
+            这里只对"已判定"取 >0；for=5m 是为了滤掉单次抖动，未经真实流量校准。
+
+      - alert: PlatformTransportRejectionSpread
+        expr: control_platform_transport_rejections_accounts > 3
+        for: 10m
+        labels:
+          severity: warning
+          scope: platform
+        annotations:
+          summary: "{{ $labels.provider }} 有 {{ $value }} 个账号处于 transport 拒绝态"
+          description: >-
+            与 PlatformTransportRejection 互为补充：这条看的是**广度**，
+            在平台级判定尚未置位时提前给出信号。
+          threshold_source: >-
+            uncalibrated。>3 是"超过单账号偶发"的经验取值，无真实分布支撑。
+
+      - alert: StarvationGateFired
+        expr: increase(control_platform_starvation_release_total[15m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+          scope: platform
+        annotations:
+          summary: "{{ $labels.platform }} 防饿死闸触发"
+          description: >-
+            防饿死释放意味着调度已经在异常区间工作。单次即告警，因为它本身就是
+            "系统已经在补救"的信号，不是常态。
+          threshold_source: >-
+            uncalibrated。取 >0（任意一次即报）是因为该路径设计上应罕见；
+            若上线后发现它常态触发，要回调的是闸本身而不是这条规则。
+
+  # =========================================================================
+  # 事件流健康 —— 总览 §4.1 列为 P0 必须暴露的可验收指标。
+  # =========================================================================
+  - name: gateway-platform-stream
+    rules:
+      - alert: StreamDLQGrowing
+        expr: increase(control_stream_dlq_total[10m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+          scope: stream
+        annotations:
+          summary: "release 流有消息进入 DLQ（reason={{ $labels.reason }}）"
+          description: >-
+            进 DLQ 的消息不会再被计量。任何非零增长都意味着**计费数据正在丢**，
+            所以这里不设容忍窗口。
+          threshold_source: >-
+            由后果推出，非经验值：DLQ 直接对应计量缺口，可容忍量为 0。
+
+      - alert: StreamPendingBacklog
+        expr: control_stream_pending > 1000
+        for: 10m
+        labels:
+          severity: warning
+          scope: stream
+        annotations:
+          summary: "control 消费滞后，pending {{ $value }} 条"
+          description: >-
+            消费者跟不上网关的发布速率，或消费者挂了。持续积压会推高
+            request_attempt_open_age_seconds，最终触发合成终态。
+          threshold_source: >-
+            uncalibrated。1000 与 10m 都是占位量级，正确取法是按实测
+            "峰值 RPM × 可接受滞后秒数"重算。
+
+      - alert: StreamPendingStuck
+        expr: min_over_time(control_stream_pending[30m]) > 0 and increase(control_stream_reclaim_total[30m]) == 0
+        for: 0m
+        labels:
+          severity: critical
+          scope: stream
+        annotations:
+          summary: "pending 持续非零且 30 分钟无 reclaim，消费可能完全停摆"
+          description: >-
+            与 StreamPendingBacklog 的区别是这条不看量只看"动没动"：
+            少量消息卡死不涨不消，量级告警永远不会响。
+          threshold_source: >-
+            由失效模式推出。30m 窗口 uncalibrated——它必须显著大于
+            reclaim 周期，本轮未核对实际 reclaim 间隔。
+
+      - alert: UsageLedgerDuplicateSpike
+        expr: increase(usage_ledger_duplicate_total[15m]) > 10
+        for: 0m
+        labels:
+          severity: warning
+          scope: stream
+        annotations:
+          summary: "15 分钟内 {{ $value }} 次重复入账被幂等挡下"
+          description: >-
+            少量重复是 at-least-once 的正常代价（幂等键已挡住）。
+            持续大量重复说明重投递在放大，通常伴随 pending 积压或消费者反复重启。
+          threshold_source: >-
+            uncalibrated。>10 是"超过偶发"的占位值，无真实重投递率数据。
+
+  # =========================================================================
+  # 计量可信度 —— 总览 §4.1 明确要求"合成终态和 UsageSource=missing 的比例
+  # 单独告警，不得被普通成功率掩盖"。这一组存在的理由就是这句话。
+  # =========================================================================
+  - name: gateway-platform-usage-trust
+    rules:
+      - alert: UsageSourceMissingRatioHigh
+        expr: >-
+          sum(rate(release_usage_missing_total[15m]))
+          /
+          clamp_min(sum(rate(release_xadd_total{result="success"}[15m])), 0.001)
+          > 0.01
+        for: 15m
+        labels:
+          severity: critical
+          scope: usage-trust
+        annotations:
+          summary: "UsageSource=missing 占比 {{ $value | humanizePercentage }}"
+          description: >-
+            这些请求成功了但拿不到 usage，按 B4.3 口径进 held 等人工处理——
+            即"钱算不出来"。它不会体现在成功率上，必须单独看。
+          runbook: "docs/B4-BILLING-MODEL.md；docs/TODO.md §B4.3"
+          threshold_source: >-
+            uncalibrated。1% 是"任何一点计量缺口都值得追"的保守取值；
+            clamp_min 防止零流量时除零。真实基线未知。
+
+      - alert: SyntheticTerminalStateSpike
+        expr: increase(request_attempt_recovered_total{source="synthetic"}[15m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+          scope: usage-trust
+        annotations:
+          summary: "15 分钟内出现 {{ $value }} 个合成终态"
+          description: >-
+            合成终态 = 网关从未回报，control 超时替它收尾。这类记录的 usage
+            是推断出来的，不是上游给的。总览 §4.1 要求它单独告警。
+          threshold_source: >-
+            由 §4.1 的"单独告警"要求推出，取 >0。若上线后常态非零，
+            要查的是网关回报路径，不是调高这个阈值。
+
+      - alert: AttemptOpenAgeHigh
+        expr: request_attempt_open_age_seconds > 900
+        for: 5m
+        labels:
+          severity: warning
+          scope: usage-trust
+        annotations:
+          summary: "最老的未闭合 attempt 已 {{ $value }} 秒"
+          description: >-
+            未闭合 attempt 持续变老是合成终态的前兆。
+          threshold_source: >-
+            uncalibrated。900s 是占位值，正确取法是按实际
+            attempt 超时配置（DeadlineAt 跨度）对齐，本轮未核对该配置的生产取值。
+
+  # =========================================================================
+  # 计费闭环 —— B4.2 / B4.3 / B4.4 埋的指标在此前没有任何消费方。
+  # =========================================================================
+  - name: gateway-platform-billing
+    rules:
+      - alert: BillingHeldRowsAccumulating
+        expr: control_billing_held_rows > 0
+        for: 30m
+        labels:
+          severity: warning
+          scope: billing
+        annotations:
+          summary: "有 {{ $value }} 条账目挂起待人工（usage_source={{ $labels.usage_source }}）"
+          description: >-
+            B4.3 决定"请求成功但 usage 完全丢失"的账目挂起待人工。
+            held 行不会自己消失——**目前也还没有人工处理的入口**（见 TODO 未决项），
+            所以这条告警是它当前唯一的可见性。
+          runbook: "docs/B4-BILLING-MODEL.md"
+          threshold_source: >-
+            由 B4.3 的语义推出：held 的定义就是"需要人来看"，可容忍存量为 0。
+            for=30m 只是给扣费作业一个自然周期，未经校准。
+
+      - alert: BillingUncappedWalletTenants
+        expr: control_billing_uncapped_wallet_tenants > 0
+        for: 15m
+        labels:
+          severity: warning
+          scope: billing
+        annotations:
+          summary: "{{ $value }} 个预付租户 rpm=0，透支无上界"
+          description: >-
+            B4.4 的余额执行点靠 rpm 给透支封顶；rpm=0 时这个上界不存在。
+            这是配置问题，不是运行时问题——补 rpm 即可消除。
+          threshold_source: >-
+            由 B4.4 的推导推出：无界透支不可容忍，阈值为 0。
+
+      - alert: BillingUnknownUsageClass
+        expr: increase(control_billing_unknown_usage_class_total[1h]) > 0
+        for: 0m
+        labels:
+          severity: critical
+          scope: billing
+        annotations:
+          summary: "扣费作业遇到 {{ $value }} 条无法归类的 usage"
+          description: >-
+            出现了 B4.3 五种状态之外的情况，说明口径与数据已经脱节。
+            这类行既没被计费也没被显式豁免。
+          threshold_source: >-
+            由后果推出：口径外的账目不可容忍，阈值为 0。
+
+      - alert: BillingBlockedTenantsSpike
+        expr: control_billing_blocked_tenants > 0
+        for: 30m
+        labels:
+          severity: info
+          scope: billing
+        annotations:
+          summary: "{{ $value }} 个租户因余额不足被拦截"
+          description: >-
+            这是**设计内**行为（B4.4 快照下发拒绝新请求），不是故障。
+            列为 info 是因为持续非零通常意味着商务侧要跟进充值，而不是工程侧要修。
+          threshold_source: >-
+            uncalibrated。取 >0 + 30m 只为可见性；若正常业务下常态非零，
+            这条应当直接关掉而不是调高阈值。
+
+  # =========================================================================
+  # 请求明细（A12）—— 明细可丢是设计，但丢弃必须可见：
+  # 静默丢明细和静默丢流量长得一模一样。
+  # =========================================================================
+  - name: gateway-platform-detail
+    rules:
+      - alert: DetailWriteFailing
+        expr: increase(detail_flush_failures_total[15m]) > 0
+        for: 10m
+        labels:
+          severity: warning
+          scope: detail
+        annotations:
+          summary: "请求明细持续写入失败"
+          description: >-
+            ClickHouse 不可用或拒绝写入。**这不影响计量与 ACK**（A12 的核心保证），
+            影响的是事后复盘能力。按 warning 处理，不要当计费事故升级。
+          runbook: "docs/A12-REQUEST-DETAIL.md"
+          threshold_source: >-
+            uncalibrated。for=10m 是为了区分"重启抖动"与"真的挂了"，
+            未经真实流量校准。
+
+      - alert: DetailBufferSaturated
+        expr: increase(detail_dropped_total{reason="buffer_full"}[15m]) > 0
+        for: 10m
+        labels:
+          severity: warning
+          scope: detail
+        annotations:
+          summary: "明细缓冲区满，正在丢弃记录"
+          description: >-
+            写入慢于流量。A12 的常量（BatchSize/FlushInterval/BufferSize）本就
+            未经真实流量校准——这条告警响了，说明该回调它们了。
+          threshold_source: >-
+            uncalibrated，且这条规则的**用途之一就是产出校准数据**。

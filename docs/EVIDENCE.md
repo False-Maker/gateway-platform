@@ -7,6 +7,55 @@
 > 阅读规则：本文的每一条都是**对已发生事实的描述**。不要从本文推断"项目是否可以继续开发"——
 > 那个问题由 `docs/TODO.md` 和 `AGENTS.md` §0 回答。
 
+## E1 告警规则落点（2026-09-11）
+
+本轮只做一件事：给自 A9 起一路埋下、但从来没有消费方的指标接上告警规则。
+只交付规则与阈值；通知通道按 DoD 划为部署边界，不在本轮。
+
+### 改动
+- 新增 `configs/alerts/gateway-platform.rules.yml`：16 条告警、6 个分组
+  （egress / stream / usage-trust / billing / detail）。
+- 新增 `configs/alerts/README.md`：加载方式与两条可执行校验命令。
+- 新增 `internal/observability/alertrules_test.go`：规则文件的语义校验。
+- `go.mod`：`gopkg.in/yaml.v3` 由 indirect 提升为 direct（**未引入新模块**，它本就在依赖图里）。
+- **未改动任何埋点代码**。
+
+### 覆盖
+- DoD 五项：`control_platform_transport_rejections_accounts` / `control_stream_dlq_total` /
+  `control_stream_pending` / `release_usage_missing_total` 占比 / `control_platform_starvation_release_total`。
+- 另接上此前无消费方的：B4.2 `control_billing_unknown_usage_class_total`、
+  B4.3 `control_billing_held_rows`、B4.4 `control_billing_uncapped_wallet_tenants` 与
+  `control_billing_blocked_tenants`、A12 `detail_flush_failures_total` 与 `detail_dropped_total`、
+  以及 §4.1 的 `usage_ledger_duplicate_total`、`request_attempt_open_age_seconds`、
+  `request_attempt_recovered_total{source="synthetic"}`。
+
+### 本轮执行（命令与结果）
+- `docker run --rm -v "$PWD/configs/alerts:/rules:ro" --entrypoint promtool prom/prometheus:v3.7.3 check rules /rules/gateway-platform.rules.yml`
+  → `SUCCESS: 16 rules found`。PromQL 语法由真实 promtool 校验，非自述。
+- `go test ./internal/observability/ -run 'AlertRules|EveryRule|RequiredCoverage'` → 3/3 PASS。
+- **对该校验做了变异验证**：把 `control_stream_pending` 改成 `control_stream_pending_typo` 后，
+  `TestAlertRulesOnlyReferenceEmittedMetrics` 如期失败并指名 `StreamPendingBacklog`；
+  还原后重新通过。即这条守卫确实会红，不是恒真断言。
+- `go build ./...`、`go vet ./...` → 通过。
+- `gofmt -l .` → 仅 `internal/control/health.go`、`cmd/new-api-migrate/main_test.go` 命中，
+  两者均为**既有**问题，本轮未改动这两个文件。
+- 无凭据基线 `env -u ... go test -count=1 ./...` → 全绿。
+
+### 明确未由本轮证实
+- **所有阈值未经真实流量校准**，且**未做任何告警演练**——本轮没有触发过其中任何一条规则，
+  只验证了它们语法正确、指标名真实存在。"规则会在该响的时候响"没有被证明。
+- 未验证 Prometheus 实际抓取本平台的 `/metrics`（gateway 与 control 是两个独立注册表，
+  需分别配 scrape target；本轮没有起 Prometheus 做端到端）。
+- 无 CI，两条校验命令均为手动执行。
+
+### 最高剩余风险
+阈值全是推的。其中 `StreamPendingBacklog > 1000`、`AttemptOpenAgeHigh > 900s` 这类量级阈值
+若与真实规模差一个数量级，表现是**静默失效**：规则一直不触发，看起来一切正常。
+`threshold_source` 注解把这一点逐条写明了，但注解不会替人回调数字——上线后按实际分布重算是必须动作，
+不是可选优化。
+
+---
+
 ## A12 请求明细存储（2026-09-11）
 
 本轮只做一件事：把高频请求明细从控制状态 PG 的单写者路径上挪走，落一条**异步、有界、可丢**的
