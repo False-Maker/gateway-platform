@@ -107,6 +107,9 @@ func Run(cfg Config) error {
 	if err := tokenLoop.RunOnce(ctx); err != nil {
 		log.Printf("control initial token publish failed: %v", err)
 	}
+	billingJob := BillingJob{DB: db}
+	billingTicker := time.NewTicker(billingRunInterval)
+	defer billingTicker.Stop()
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 	trimTicker := time.NewTicker(time.Minute)
@@ -148,6 +151,16 @@ func Run(cfg Config) error {
 		case <-quotaReconcileC:
 			if err := quotaReconciler.RunOnce(ctx); err != nil {
 				log.Printf("control quota snapshot reconcile failed: %v", err)
+			}
+		case <-billingTicker.C:
+			billed, err := billingJob.RunOnce(ctx, time.Now())
+			if err != nil {
+				log.Printf("control billing run %s failed: %v", billed.RunID, err)
+			} else if billed.Skipped {
+				log.Printf("control billing run %s skipped: %s", billed.RunID, billed.SkipReason)
+			} else if billed.RowsBilled > 0 || billed.RowsUnpriced > 0 {
+				log.Printf("control billing run %s: %d rows billed (%s debited), %d unpriced, %d tenants failed",
+					billed.RunID, billed.RowsBilled, billed.TotalDebited, billed.RowsUnpriced, billed.TenantsFailed)
 			}
 		case <-ticker.C:
 		}

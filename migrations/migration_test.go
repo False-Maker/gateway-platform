@@ -77,3 +77,35 @@ func TestBillingSchemaKeepsMoneyExactAndPricesImmutable(t *testing.T) {
 		t.Error("wallet_transactions must constrain its kinds")
 	}
 }
+
+func TestUsageBillingSchemaIsAdditiveAndIdempotent(t *testing.T) {
+	data, err := os.ReadFile("006_usage_billing.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	schema := string(data)
+	// usage_ledger already exists and is written by the hot path's event
+	// consumer, so 006 may only add columns, never redefine the table.
+	if strings.Contains(schema, "CREATE TABLE IF NOT EXISTS usage_ledger") || strings.Contains(schema, "DROP TABLE") {
+		t.Error("006 must extend usage_ledger, not recreate it")
+	}
+	for _, column := range []string{"billing_state TEXT NOT NULL DEFAULT 'pending'", "billed_amount NUMERIC(38,12)", "billing_run_id TEXT"} {
+		if !strings.Contains(schema, "ADD COLUMN IF NOT EXISTS "+column) {
+			t.Errorf("missing idempotent column %q", column)
+		}
+	}
+	// ALTER TABLE ... ADD CONSTRAINT has no IF NOT EXISTS, so a re-apply has
+	// to be guarded explicitly or the second boot fails.
+	if !strings.Contains(schema, "FROM pg_constraint WHERE conname = 'usage_ledger_billing_state_check'") {
+		t.Error("the billing_state constraint is not guarded against a re-apply")
+	}
+	if !strings.Contains(schema, "billing_state IN ('pending', 'billed', 'unpriced', 'held')") {
+		t.Error("billing_state must be constrained to the documented values")
+	}
+	if !strings.Contains(schema, "CREATE TABLE IF NOT EXISTS billing_runs") {
+		t.Error("missing billing_runs table")
+	}
+	if !strings.Contains(schema, "total_debited NUMERIC(38,12)") {
+		t.Error("billing_runs.total_debited must be exact decimal")
+	}
+}

@@ -10,6 +10,7 @@ import (
 
 	"github.com/elucid/gateway-platform/pkg/contracts"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -128,6 +129,16 @@ func (r PGBillingRepository) InsertModelPrice(ctx context.Context, price ModelPr
 	return nil
 }
 
+// pgQuerier is satisfied by both *pgxpool.Pool and pgx.Tx, so a price lookup
+// or a wallet movement can either stand alone or join a caller's transaction.
+// The B4.2 billing job needs the latter: debiting the wallet and marking the
+// ledger rows billed must not be two transactions.
+type pgQuerier interface {
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+}
+
 // PriceAt returns the price in effect for a model at a given instant, which
 // for B4.2 is the ledger row's occurred_at -- never the time the billing job
 // happens to run. The second result is false when no price was in effect yet;
@@ -136,9 +147,13 @@ func (r PGBillingRepository) PriceAt(ctx context.Context, provider, model string
 	if r.DB == nil {
 		return ModelPrice{}, false, errors.New("billing database pool is nil")
 	}
+	return priceAt(ctx, r.DB, provider, model, at)
+}
+
+func priceAt(ctx context.Context, q pgQuerier, provider, model string, at time.Time) (ModelPrice, bool, error) {
 	var price ModelPrice
 	var input, output, cacheRead, cacheWrite string
-	err := r.DB.QueryRow(ctx, `
+	err := q.QueryRow(ctx, `
 		SELECT id,provider,model,currency,unit_scale,
 			price_input::text,price_output::text,price_cache_read::text,price_cache_write::text,
 			effective_from,created_at
@@ -207,6 +222,25 @@ func (r PGBillingRepository) ApplyMovement(ctx context.Context, movement WalletM
 	if r.DB == nil {
 		return WalletTransaction{}, errors.New("billing database pool is nil")
 	}
+	tx, err := r.DB.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return WalletTransaction{}, fmt.Errorf("begin wallet movement: %w", err)
+	}
+	defer tx.Rollback(ctx)
+	result, err := applyMovement(ctx, tx, movement)
+	if err != nil {
+		return WalletTransaction{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return WalletTransaction{}, fmt.Errorf("commit wallet movement %s: %w", movement.ID, err)
+	}
+	return result, nil
+}
+
+// applyMovement performs the movement inside the caller's transaction. It is
+// the only writer of tenant_wallets.balance, which is what keeps the balance
+// and the journal from ever disagreeing.
+func applyMovement(ctx context.Context, q pgQuerier, movement WalletMovement) (WalletTransaction, error) {
 	if movement.ID == "" || movement.TenantID == "" {
 		return WalletTransaction{}, errors.New("wallet movement needs an id and tenant id")
 	}
@@ -216,17 +250,12 @@ func (r PGBillingRepository) ApplyMovement(ctx context.Context, movement WalletM
 	if err := checkMovementKind(movement.Kind, movement.Amount); err != nil {
 		return WalletTransaction{}, err
 	}
-	tx, err := r.DB.BeginTx(ctx, pgx.TxOptions{})
-	if err != nil {
-		return WalletTransaction{}, fmt.Errorf("begin wallet movement: %w", err)
-	}
-	defer tx.Rollback(ctx)
 
-	// Lock the wallet first so concurrent debits serialize: without it two
-	// movements could both read the old balance and write conflicting
+	// Lock the wallet first so concurrent movements serialize: without it two
+	// of them could both read the old balance and write conflicting
 	// balance_after values into the journal.
 	var locked string
-	err = tx.QueryRow(ctx, `SELECT balance::text FROM tenant_wallets WHERE tenant_id=$1 FOR UPDATE`, movement.TenantID).Scan(&locked)
+	err := q.QueryRow(ctx, `SELECT balance::text FROM tenant_wallets WHERE tenant_id=$1 FOR UPDATE`, movement.TenantID).Scan(&locked)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return WalletTransaction{}, fmt.Errorf("%w: %s", ErrWalletNotFound, movement.TenantID)
 	}
@@ -235,7 +264,7 @@ func (r PGBillingRepository) ApplyMovement(ctx context.Context, movement WalletM
 	}
 
 	var balanceAfter string
-	if err := tx.QueryRow(ctx, `
+	if err := q.QueryRow(ctx, `
 		UPDATE tenant_wallets SET balance = balance + $2::numeric, updated_at = now()
 		WHERE tenant_id=$1 RETURNING balance::text`,
 		movement.TenantID, string(movement.Amount)).Scan(&balanceAfter); err != nil {
@@ -255,16 +284,13 @@ func (r PGBillingRepository) ApplyMovement(ctx context.Context, movement WalletM
 		BillingRunID: movement.BillingRunID,
 		Note:         movement.Note,
 	}
-	if err := tx.QueryRow(ctx, `
+	if err := q.QueryRow(ctx, `
 		INSERT INTO wallet_transactions (id,tenant_id,kind,amount,balance_after,billing_run_id,note)
 		VALUES ($1,$2,$3,$4::numeric,$5::numeric,$6,$7)
 		RETURNING created_at`,
 		movement.ID, movement.TenantID, movement.Kind, string(movement.Amount),
 		balanceAfter, billingRunID, movement.Note).Scan(&result.CreatedAt); err != nil {
 		return WalletTransaction{}, fmt.Errorf("record wallet transaction %s: %w", movement.ID, err)
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return WalletTransaction{}, fmt.Errorf("commit wallet movement %s: %w", movement.ID, err)
 	}
 	return result, nil
 }

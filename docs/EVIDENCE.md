@@ -7,6 +7,51 @@
 > 阅读规则：本文的每一条都是**对已发生事实的描述**。不要从本文推断"项目是否可以继续开发"——
 > 那个问题由 `docs/TODO.md` 和 `AGENTS.md` §0 回答。
 
+## B4.2 从 `usage_ledger` 到扣费的慢路径作业（2026-09-11）
+
+本轮只做扣费作业，不动 gateway 热路径。
+
+**改动**
+
+- `migrations/006_usage_billing.sql`：`usage_ledger` 追加 `billing_state`（`pending`/`billed`/
+  `unpriced`/`held`）、`billed_amount NUMERIC(38,12)`、`billing_run_id`，加 `pending` 的部分索引；
+  新增 `billing_runs` 记录每轮结果。全部 `ADD COLUMN IF NOT EXISTS`，`ADD CONSTRAINT` 用
+  `pg_constraint` 查询显式挡住重复应用（`ALTER TABLE ... ADD CONSTRAINT` 没有 `IF NOT EXISTS`）。
+- `internal/control/billing_job.go`：`BillingJob.RunOnce(ctx, windowEnd)`。按 tenant 分事务：
+  `SELECT ... FOR UPDATE` 取该 tenant 的待计费行 → 按每行 `occurred_at` 取当时生效的单价 →
+  `big.Rat` 算出行金额 → 一笔 `debit` 扣钱包 + 逐行标记 `billed` → 一起提交。
+- `internal/control/billing.go`：抽出 `pgQuerier` 接口，`priceAt` / `applyMovement` 既可走连接池
+  也可走作业的事务，使"扣钱包"和"标记已计费"落在同一个 `pgx.Tx` 里。
+- `internal/control/run.go`：作业挂进 control 的 select 循环，`billingRunInterval = 5 * time.Minute`。
+
+**本轮执行**
+
+```
+gofmt -l . && go build ./cmd/gwd && go vet ./... && go test -count=1 ./...   # 全部 ok
+set -a; source configs/test-infra/test.env; set +a
+go test -count=1 -p 1 ./...                                                  # 全部 ok
+go test -count=1 -p 1 -run Billing -v ./internal/control/                    # 2 个 PG 用例 PASS，非 skip
+```
+
+- `TestBillingJobSettlesLedgerRowsAndWalletInOneTransaction`（真实 PG）：6 行 fixture 中
+  2 行 `billed`、1 行 `unpriced`、3 行留 `pending`（`estimated` / `partial=true` / 窗口之外）；
+  钱包余额 `10 → 9.987400000000`，`wallet_transactions` 恰好 1 条 `debit = -0.012600000000`，
+  且等于 `sum(billed_amount)`；**再跑一次 `RowsBilled=0`、余额不变、debit 仍只有 1 条**。
+- `TestBillingJobLeavesRowsPendingWhenATenantHasNoWallet`（真实 PG）：没有钱包的 tenant 让本轮
+  `TenantsFailed=1`、run 记为 `failed`，其行仍是 `pending`；补上钱包后下一轮正常结清。
+- `TestLineAmountKeepsPrecisionAFloatWouldLose`：三笔 0.1 相加为精确 `0.300000000000`。
+- 价格表为空时整轮 `skipped` 并记一条 `billing_runs`，一行都不动。
+
+**未由本轮证实**
+
+- **没有任何真实单价**：`model_prices` 仍为空表，上述金额全部来自测试 fixture，
+  不代表任何真实计费结果。本轮**未执行任何生产写入或真实扣费**。
+- new-api quota 整数单位 ↔ 货币金额的换算比例**仍未核对**（`docs/B4-BILLING-MODEL.md` D4）。
+  它不影响本轮的 token × 单价算术，但阻塞把 new-api 余额迁进钱包。
+- 只验证了单进程顺序执行。`FOR UPDATE` 对并发两个 control 实例的保护**未做并发压测**。
+- `held` 状态只在 schema 里预留，无代码路径写入，留给 B4.3。
+- 扣费不检查余额，可以扣成负数；拦截点是 B4.4，本轮不做。
+
 ## B4.1 计价表与钱包 schema（2026-09-11）
 
 本轮只做 schema 与仓储，不做扣费。

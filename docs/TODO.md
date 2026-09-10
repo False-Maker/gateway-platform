@@ -20,7 +20,8 @@
 > 同时把原来只有一行字的 B4 拆成 **B4.0–B4.5**，每项带 DoD。
 >
 > **下一步顺序（已定）**：~~`B4.0 定计费模型（不写代码）`~~（2026-09-10 完成，见 `docs/B4-BILLING-MODEL.md`）
-> → ~~`A11 迁移 tenant 转正`~~（2026-09-11 完成）→ ~~`B4.1 计价表与钱包 schema`~~（2026-09-11 完成）→ `B4.2 扣费作业`。
+> → ~~`A11 迁移 tenant 转正`~~（2026-09-11 完成）→ ~~`B4.1 计价表与钱包 schema`~~（2026-09-11 完成）
+> → ~~`B4.2 扣费作业`~~（2026-09-11 完成）→ `B4.3 UsageSource 可信度口径`。
 > A12/E1/E2 不阻塞 B4，可并行取。P4（B4）在 A11 之前不进入编码——迁移来的用户还停在 staging，没有可扣费主体。
 
 ---
@@ -312,7 +313,7 @@ tenants / principals / tenant_tokens；摘要新增 `tenant_count` / `principal_
   `getUsageLimits` 仅映射已核实字段，未知 envelope/缺失字段保持 missing。快照 JSON、PG quota/outbox
   与 gateway 选号保留精度；选号只在明确余量为零或负数时排除账号。真实 provider schema 对账仍属 C2。
 - **B4** P4 范围：真实用量扣减、调度深化、多租户计费。依赖 §A 打通后才有意义。
-  **状态：未开始。**下列子项按序取；**B4.0 完成前不写任何计费代码**，A11 完成前不进入 B4.1。
+  **状态：进行中。**B4.0–B4.2 已完成；下列子项按序取，下一项是 B4.3。
 
   - **B4.0** `[no-cred]` **定计费模型（只出文档，不写代码）**。
     **状态：已完成（2026-09-10）。决策记录见 `docs/B4-BILLING-MODEL.md`。**
@@ -344,8 +345,18 @@ tenants / principals / tenant_tokens；摘要新增 `tenant_count` / `principal_
     充值入口留在 B5。
 
   - **B4.2** `[no-cred]` 从 `usage_ledger` 到扣费的慢路径作业。
+    **状态：已完成（2026-09-11）。** `migrations/006_usage_billing.sql`（`usage_ledger` 加
+    `billing_state`/`billed_amount`/`billing_run_id` + `billing_runs`）+
+    `internal/control/billing_job.go`（`BillingJob`），挂在 control 的 select 循环上，5 分钟一次。
+    每个 tenant 一个事务：取价 → 扣钱包 → 标记行已计费，一起提交或一起回滚；
+    单个 tenant 失败（例如没有钱包）只让它自己的行留在 `pending`，不影响其他 tenant。
+    取价按行的 `occurred_at`，不是作业运行时刻；取不到价的行进 `unpriced` 且**不**扣费。
+    价格表为空时整轮 `skipped`——否则先上作业后配价会把全部用量永久打成 `unpriced`（D3 不允许补价）。
     **DoD**：control 慢路径按 tenant 聚合未计费的 ledger 行 → 乘单价 → 扣钱包，**热路径零参与**；
     扣费与"标记 ledger 行已计费"在同一 PG 事务；作业重跑不重复扣费（幂等键覆盖到 `event_id`）。
+    **本轮未做**：只对 `usage_source='upstream' AND partial=false` 的行扣费，其余一律留 `pending`
+    交给 B4.3，不做隐式默认；余额扣成负数不拦（B4.4）；三方对账未做（B4.5）；
+    new-api quota 整数单位 ↔ 货币金额的换算比例**仍未核对**（B4-BILLING-MODEL D4 的遗留项）。
 
   - **B4.3** `[no-cred]` `UsageSource` 可信度口径。
     总览 §6.2 要求计费层用 `UsageSource` 区分可信度，但**没定不可信时怎么办**——这是 B4.0 的遗留问题。
