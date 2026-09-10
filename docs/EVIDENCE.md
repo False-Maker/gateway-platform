@@ -7,6 +7,51 @@
 > 阅读规则：本文的每一条都是**对已发生事实的描述**。不要从本文推断"项目是否可以继续开发"——
 > 那个问题由 `docs/TODO.md` 和 `AGENTS.md` §0 回答。
 
+## 计划补全 + `internal/migration/newapi` 测试补全（2026-09-10）
+
+本轮只做两件事：把第二次结构复盘的结论补进 `docs/TODO.md`（新增 A11、A12、C6、E1、E2，B4 拆为
+B4.0–B4.5），以及给 `internal/migration/newapi` 补测试。**未写任何 B4 实现代码，未改设计文档，
+未改其他包的非测试代码。**
+
+补测试前的基线：该包 983 行实现只有 116 行测试，且全部针对 `BuildPlan`；`apply.go`（唯一写目标库的
+路径）与 `source.go`（唯一读生产 new-api 库的路径）**零测试覆盖**。
+
+新增：
+- `source_test.go`（无基础设施，始终运行）：`validIdentifier` 拒绝 8 类可逃逸出 SQL 的 schema 名；
+  `requiredInt` 对缺失/空白/非数字一律报错而非退化为 0；`optionalInt` 只在缺失或不可解析时用 fallback
+  （显式 `0` 必须存活）；`optionalInt64`；`parseProxy` 对不可用 setting 返回空而不猜；
+  `Apply` 的 nil db / nil cipher 双重 fail-closed 守卫（用不拨号的 pool 触达 cipher 守卫）。
+- `source_integration_test.go`（`GATEWAY_TEST_DATABASE_URL` 门禁）：在测试库里建一次性 schema 跑
+  `LoadSnapshot`——完整 schema 下 channels 按 id 排序、`setting.proxy` 与 codex OAuth key JSON 不丢、
+  数值列以原文文本到达；最小 schema（只有 id/type/key）不报错而是产出 users/tokens/quota/groups 四条
+  schema warning 且缺失可选列返回空值，warning 传递到 plan summary；`status` 列存在但为 NULL 或未知值时
+  **不猜测为 active**，`BuildPlan` 全部 rejected 且理由含 status；缺 `channels.key` 列显式报错并点名该列；
+  channels 表整体缺失报错；注入型 schema 名被拒且源表未被破坏，另单独验证该库在
+  `pgx.ReadOnly` 事务下确实拒绝 INSERT（否则"从不写源库"这条断言等于没测）。
+- `apply_integration_test.go`（同门禁）：一次 run 原子写入 accounts / credentials / migration_records，
+  凭据能按 accountID 解密回原 bundle 且换 accountID 解密必失败；**明文扫描**——把 accounts、credentials、
+  migration_records、migration_runs 每行整行转文本，断言四个 fixture 明文密钥均不出现，并反向确认
+  key 摘要确实在 staging 里（否则扫描不证明什么）；重复 apply 幂等（行数不变、`fence_epoch` 2、
+  `credentials.version` 1、records 重新指向最新 run）；run id 冲突时整个 run 回滚且 `fence_epoch` 不前移；
+  空 run id 自动生成 `new-api-` 前缀并回填到 records。
+
+本轮实际执行并通过（本机，2026-09-10）：
+- 无基础设施：`go build ./cmd/gwd`、`go vet ./...`、`go test -count=1 ./...` 23 包全绿，门禁用例严格 skip。
+- 带基础设施（Docker `postgres:16-alpine` + `redis:7.0.15-alpine`，`configs/test-infra/`）：
+  `internal/migration/newapi` 22 个用例全部真实跑通（含全部 11 个 PG 门禁用例）；
+  `source configs/test-infra/test.env && go test -count=1 -p 1 ./...` 23 包全绿；
+  `go test -race -count=1 -p 1 ./pkg/contracts ./internal/control/... ./internal/migration/...` 全绿。
+
+**本轮发现并修掉的一个测试隔离问题**：新增 PG 用例最初会把 `source_system='new-api'` 的账号留在共享测试库里，
+这些账号的 credential 是用本包测试密钥加密的，而 `cmd/gwd/import_integration_test.go:41` 只删自己那一行、
+随后按全量账号构建快照，于是 `-p 1` 全量跑时 `cmd/gwd` 报 `invalid credential ciphertext` 并连带
+`TestProcessE2EControlGatewayRelease` 超时失败。已在本包加 `t.Cleanup` 按 `source_system` 定向清理，
+并实测清理后库中 accounts/credentials/migration_runs/migration_records 均为 0、全量套件恢复全绿。
+**未改 `cmd/gwd` 的测试**——该包"只删自己的行却读全量账号"的脆弱性本轮只记录，不在本次范围内。
+
+**未由本轮证实**：真实 new-api 生产库上的只读探测与 dry-run（本轮只在本地测试库里用合成 schema 验证）；
+任何真实 provider 行为。上述明文不落库的断言只覆盖 `Apply` 写的四张表，不覆盖日志输出。
+
 ## A10 粘滞会话 + per-tenant 限流（2026-09-10）
 
 实现见 `docs/TODO.md` A10。本轮实际执行并通过：

@@ -12,8 +12,15 @@
 >
 > 当前状态：**A1-A5、B1、B2、B3 已完成，2026-09-06 审查修复、B2 多模态切片与 B3 quota 精度扩展已收口。** A5 的数据库实跑仍按可选 PostgreSQL 环境执行；缺少环境不等于缺少 provider 凭据，也不阻塞本地转换验证。
 >
-> **2026-09-10 复盘新增 A6、A7、A8（均 `[no-cred]`），并给 D1 定了解法。** 复盘发现设计文档要求但代码中不存在、且 TODO 从未列出的三个缺口：gateway 鉴权面/多 bucket、utls TLS profile、文档与代码漂移。D1、A6、A7、A8、A9、A10 已于 2026-09-10 完成。§A 全部收口。**下一步：B4 P4 计费**（tenant、
-> per-tenant 限流、ledger 幂等均已就位；先定计费模型再动代码，见 B4 条目）。 P4（B4）在 A6 之前不启动——没有 tenant 就没有可扣费主体。
+> **2026-09-10 复盘新增 A6、A7、A8（均 `[no-cred]`），并给 D1 定了解法。** 复盘发现设计文档要求但代码中不存在、且 TODO 从未列出的三个缺口：gateway 鉴权面/多 bucket、utls TLS profile、文档与代码漂移。D1、A6、A7、A8、A9、A10 已于 2026-09-10 完成。§A 全部收口。
+>
+> **2026-09-10 第二次复盘（结构分析）：**用与 A8 相同的口径把设计文档逐条对照代码，又找出四个"设计要求但从未进过任务清单"的缺口，已编号为
+> **A11**（迁移 tenant 转正）、**A12**（请求明细存储）、**E1**（告警规则落点）、**E2**（wrapper 其余 executor 的 no-cred 部分）；
+> 另把总览附录那条"每请求 PoW/turnstile 可能击穿热/慢拆分"从脚注提升为 **C6**——它的爆炸半径是契约级的，不该继续以附录形式存在。
+> 同时把原来只有一行字的 B4 拆成 **B4.0–B4.5**，每项带 DoD。
+>
+> **下一步顺序（已定）**：`B4.0 定计费模型（不写代码）` → `A11 迁移 tenant 转正` → `B4.1+ 计费编码`。
+> A12/E1/E2 不阻塞 B4，可并行取。P4（B4）在 A11 之前不进入编码——迁移来的用户还停在 staging，没有可扣费主体。
 
 ---
 
@@ -232,6 +239,49 @@ refresh loop 结果驱动的语义已存在于 `refresh.go`，本轮未改；冷
 证据见 `docs/EVIDENCE.md`。**未做**：按 principal 或按 token 的更细粒度限流；粘滞 pin 在 gateway 多实例
 间天然共享（Redis），但未做 pin 与账号删除的主动清理，靠 TTL 过期。
 
+### A11 `[no-cred]` A5 迁移的 `staging_only` 记录转正为 tenants / principals 行
+
+**状态：未开始。B4 编码的硬前置。**
+
+**基线**
+- A5 实现时目标库还没有 tenants 表，因此 `internal/migration/newapi/plan.go` 的 `addSourceRecords`
+  把 users / tokens 一律写成 `migration_records` 里的 `staging_only` 行，没有任何目标实体。
+- A6 的 `migrations/002_tenants.sql` 之后建了 tenants / principals / tenant_tokens，但**迁移侧没有回头补这一步**。
+  A6 条目把它记在"未做"的小字里，从未升为任务。
+- 总览 §6.1 的映射表明确要求：一个 new-api user → 一个 tenant + 一个默认 principal，`tokens` → tenant API token
+  （只迁 hash / 过期 / 撤销状态）。
+
+**结论**：迁移来的用户目前没有可扣费主体。B4 若在此之前编码，只能对着空的 tenants 表做计费。
+
+**DoD**
+- `BuildPlan` 为每个 source user 产出 planned tenant + 默认 principal，沿用 `source_system + source_id` 幂等键；
+  `Apply` 在同一事务内 upsert 到 tenants / principals，重复执行不新建。
+- `tokens` 只迁移 hash、过期、撤销状态到 `tenant_tokens`；**明文 key 不得进入 staging、日志或 records**
+  （现有 `TestBuildPlanStagesUsersTokensQuotaWithoutSecrets` 的断言必须继续成立并扩展到新路径）。
+- 无法映射的 user / token（缺 id、状态未知）进 rejected 并记原因，不猜测、不补默认租户。
+- quota / balance 仍只保留 source unit 与原始值，本任务**不做任何换算或扣费**——那是 B4。
+- 回归：dry-run 摘要新增 tenant / principal / token 计数；PG 下断言重复 apply 幂等、明文不落库。
+
+### A12 `[no-cred]` 请求明细存储缺失（总览 §6.4 的 P0 级共享决策）
+
+**状态：未开始。不阻塞 B4，可并行。**
+
+**基线**
+- 总览 §6.4 把"计量流水"与"高频请求明细日志"的**物理分离**定为 P0 级共享决策，理由是 control 的
+  单写者路径不能随 RPM 增长；§6.5 又把"实时请求日志"列为控制台三个预留钩子之一。
+- 全仓库 `clickhouse|request_logs|detail_log` 零命中，migration 中也没有对应表。
+  A8 已确认 `request_logs` 在 `keyhive/docs/architecture.md` 的建表清单里但实际不存在。
+
+**结论**：这是一条 P0 级决策，但从未进入过任务清单。当前所有 Release 都只落 `usage_ledger`，
+一旦 RPM 上来，"control 负载只随账号数增长"这个立论就不成立。
+
+**DoD**
+- 先定形态再动代码：明细走独立可丢 / 可抽样存储，**不进控制状态 PG**、不经单写者路径。
+  选型（ClickHouse / 抽样落文件 / 直接丢弃 + 仅保留指标）需先写一段决策记录，不默认引入新中间件。
+- 决策为"引入存储"时：写入路径与 `usage_ledger` 事务解耦，明细写失败不得影响计量与 ACK。
+- 决策为"暂不引入"时：显式在文档中记为已评估的取舍，并保留采样指标，**不留空白**。
+- 凭据、token 明文、refresh token 不得进入明细。
+
 ---
 
 ## §B 功能扩展（不阻塞 §A，全部 `[no-cred]` 除非另注）
@@ -256,6 +306,40 @@ refresh loop 结果驱动的语义已存在于 `refresh.go`，本轮未改；冷
   `getUsageLimits` 仅映射已核实字段，未知 envelope/缺失字段保持 missing。快照 JSON、PG quota/outbox
   与 gateway 选号保留精度；选号只在明确余量为零或负数时排除账号。真实 provider schema 对账仍属 C2。
 - **B4** P4 范围：真实用量扣减、调度深化、多租户计费。依赖 §A 打通后才有意义。
+  **状态：未开始。**下列子项按序取；**B4.0 完成前不写任何计费代码**，A11 完成前不进入 B4.1。
+
+  - **B4.0** `[no-cred]` **定计费模型（只出文档，不写代码）**。
+    这一项的产物是一段可评审的决策记录，不是实现。必须回答清楚：计费单位（token / request / credit）与
+    输入、输出、cache read、cache write 四类 token 的**分别单价**；单价的存放位置（配置 / PG 表 / 随
+    provider 走）与生效时间语义（改价是否追溯）；钱包是预付余额还是后付账单；余额不足时的行为
+    （拒绝新请求 / 允许透支到阈值 / 仅告警）——这条直接决定 gateway 是否需要在热路径读余额，
+    影响 §1 的"热路径不调用 control"立论，**必须显式回答**。
+    **DoD**：决策记录进 `docs/`，含被否决的选项与否决理由；B4.1–B4.5 的 DoD 据此细化。
+
+  - **B4.1** `[no-cred]` 计价表与钱包 schema。
+    **DoD**：新增 migration（单价表 + 钱包/账单表），单价带生效时间且历史单价不可变；
+    钱包余额为精确十进制，**不经 `float64`**（沿用 B3 已建立的 `contracts.Decimal` 口径）；
+    重复应用 migration 幂等。
+
+  - **B4.2** `[no-cred]` 从 `usage_ledger` 到扣费的慢路径作业。
+    **DoD**：control 慢路径按 tenant 聚合未计费的 ledger 行 → 乘单价 → 扣钱包，**热路径零参与**；
+    扣费与"标记 ledger 行已计费"在同一 PG 事务；作业重跑不重复扣费（幂等键覆盖到 `event_id`）。
+
+  - **B4.3** `[no-cred]` `UsageSource` 可信度口径。
+    总览 §6.2 要求计费层用 `UsageSource` 区分可信度，但**没定不可信时怎么办**——这是 B4.0 的遗留问题。
+    **DoD**：`upstream` / `estimated` / `missing` 与 `Partial=true` 四种组合各自的计费行为明确落地
+    （计费 / 不计费 / 挂起待人工），**不得由代码隐式默认**；`missing` 的量单独可查询、单独告警，
+    不被计入正常收入。
+
+  - **B4.4** `[no-cred]` 余额不足的执行点。
+    **DoD**：按 B4.0 的结论实现。若结论是"拒绝新请求"，则必须走**已有的 tenant 快照下发通道**
+    （A6 的 `snap:auth:tokens:v1` 已经在下发 tenant 限额，余额状态同理），
+    **不允许 gateway 在热路径同步查 PG 或调用 control**。
+
+  - **B4.5** `[no-cred]` 对账。
+    **DoD**：给定一段时间窗，能对齐 ledger 行数、扣费总额、钱包变动三者；差额可解释到具体
+    `event_id`；对账本身只读，不修数据。
+
 - **B5** P6 范围：控制台。
 
 ---
@@ -270,6 +354,16 @@ refresh loop 结果驱动的语义已存在于 `refresh.go`，本轮未改；冷
 - **C3** 真实服务端拒绝条件与 `ErrorClass` 分类校准、429 退避真实语义。
 - **C4** Copilot device authorization 端到端流程。
 - **C5** Antigravity / Kiro / Windsurf 的真实协议 harness。
+- **C6** **codex CLI 的 API 端点是否需要每请求 PoW / turnstile**。
+  **爆炸半径是契约级的，不是一个渠道的适配问题** —— 这是它区别于 C1–C5 的地方，取任务时优先核实。
+  出处：总览"附：未决架构问题"与 `fluxgate/docs/architecture.md` §7。原文标注"P2 打通 codex 前必须核实"，
+  但 P2、P3 都已过去，这条既未核实也未关闭，一直以附录脚注形式存在——2026-09-10 复盘将其提升为编号任务。
+  **若结论为"需要每请求 challenge"**：`UpstreamProfile` 这个**静态**配方就覆盖不了，
+  受影响的是两角色唯一深耦合点（总览 §5），要么给该 provider 开一条 gateway 可调用的 per-request minter 旁路，
+  要么承认该渠道不适用无状态热路径模型。两条路都会改契约，**不要在核实前先写实现**。
+  **可先做的 no-cred 部分**：读 `chatgpt2api/services/proxy_service.py` 与 `utils/pow.py`
+  确认其 PoW 调用点究竟在 `chat-requirements` 还是仅在登录，把结论写进文档；
+  真正的端到端确认需要真实 codex 账号，属 live-gate。
 
 harness 契约（变量、约束）见 `docs/EVIDENCE.md` 中"项目结束真实 provider 验收"一节。
 harness 默认严格 skipped，只接受已审计官方 base URL，不接受 fixture 或 loopback。
@@ -291,3 +385,42 @@ harness 默认严格 skipped，只接受已审计官方 base URL，不接受 fix
 - **D3** Redis HA 拓扑与演练参数（部署侧）。冷启动拉不到快照即无法加入，无降级路径。
 - **D4** utls JA3 指纹跟随上游客户端版本更新 —— 目前是人工流程，无自动化
   （检测已有，见总览 §6.3.1 规则 2；缺的是"更新"不是"发现"）。
+
+---
+
+## §E 可观测性与运维闭环（2026-09-10 复盘新增）
+
+- **E1** `[no-cred]` **告警规则没有落点：指标埋了但没有消费方**。
+  **状态：未开始。不阻塞 B4，可并行。**
+  **基线**：A9 产出了 `control_platform_alert{provider,reason}`、`control_platform_error_total{provider,class}`、
+  `control_platform_transport_rejections_accounts`、`control_platform_starvation_release_total`；
+  总览 §4.1 另要求 `control_stream_pending`、`control_stream_dlq_total{reason}`、
+  `usage_ledger_duplicate_total`、`request_attempt_open_age_seconds`、
+  `request_attempt_recovered_total{source}`、`release_xadd_total{result}` 为"P0 必须暴露的可验收指标"，
+  并明确"合成终态和 `UsageSource=missing` 的比例**单独告警**，不得被普通成功率掩盖"。
+  这些指标都已存在，但 **A9 把告警本身记为"属部署侧"后就没有任何落点**，§D 也没有对应条目。
+  **结论**：埋了没人看。总览 §6.3.1 规则 2 那条"多账号同时 transport 被拒 = 出口 IP / TLS 指纹被标记"
+  的价值全在告警上——没有告警，它就退化回"一个号一个号烧着去发现"。
+  **DoD**
+  - 仓库内提供可直接加载的告警规则文件（Prometheus rule 形式即可），至少覆盖：
+    平台级 transport 拒绝、DLQ 增长、stream pending 积压、`UsageSource=missing` 占比、防饿死闸触发。
+  - 每条规则写明阈值来源。**总览 §6.3.1 已声明冷却时长"待线上回调"，因此阈值必须标注为"未经真实流量校准"**，
+    不得写成已验证值。
+  - 规则文件有语法校验（`promtool check rules` 或等价），进 CI 或至少进一条可执行的验证命令。
+  - 通知通道（谁收、怎么收）属部署边界，**不在本任务范围**——本任务只交付规则与阈值。
+
+- **E2** `[no-cred]` **wrapper 其余 executor 的 no-cred 部分**。
+  **状态：未开始。**
+  **基线**：A3 的 DoD 是"至少打通一个 provider 的一种模式"，PKCE 已达标，A3 的验收成立。
+  但 device / CLI / PoW / turnstile executor 一个都没有实现，
+  `internal/control/wrapper/run.go:43` 在无配置时仍回落到 `FixtureExecutor`
+  （其自述为 "test-only"，注释已声明"Production configuration uses PKCEExecutor"）。
+  **结论**：这与当初 A3 是同一性质的缺口——**参数生成、job 分发、错误归类这些不需要真实账号的部分
+  现在不在任何清单上**，只有端到端授权属 live-gate。
+  **DoD**
+  - 按 A3 已建立的模式，为 device flow 补 executor 骨架：参数生成、回调 / 轮询处理、错误归类，
+    用本地 fixture HTTP server 验证；真实授权码交换属 C4，不在本任务内。
+  - `FixtureExecutor` 的生产回落路径收紧：生产配置下选不到真实 executor 应**显式失败**，
+    而不是静默跑 stub（这正是 A3 基线里"永远收不到活、收到也只跑 stub"的成因）。
+  - CLI / PoW / turnstile：先只确认各自需要哪些 no-cred 前置（总览 §9 标注 turnstile 保留 Python），
+    写进文档，不在本任务内实现。
