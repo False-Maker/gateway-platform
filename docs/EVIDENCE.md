@@ -7,6 +7,61 @@
 > 阅读规则：本文的每一条都是**对已发生事实的描述**。不要从本文推断"项目是否可以继续开发"——
 > 那个问题由 `docs/TODO.md` 和 `AGENTS.md` §0 回答。
 
+## 第三次结构性复盘（2026-09-13）
+
+**改动**：纯文档轮，**零代码改动、零契约改动**。更新 `docs/TODO.md`（新增 A13、改写顶部指针）。
+
+**动机**：上一轮收尾时写下"`§A`/`§B`/`§E` 的 `[no-cred]` 已清空"。按 AGENTS.md §0，
+这类接近"全局封顶"的判断应当被验证而不是被继承，故用与 A8 / 二次复盘相同的口径重跑一遍对照。
+
+**本轮执行（命令与结果）**
+
+```
+$ go build ./... && go vet ./...            # 通过
+$ go test -count=1 ./...                    # 全绿（无基础设施环境，PG/Redis/ClickHouse 用例 skip）
+$ grep -ri "usage_integrity\|UsageIntegrity" --include=*.go --include=*.sql .
+                                            # 零命中  ← A13 的直接依据
+```
+
+**逐条核对结果**
+
+| 设计要求 | 出处 | 代码 | 结论 |
+|---|---|---|---|
+| 七个 P0 可验收指标 | 总览 §4.1 | 均有非测试发射点 | 一致 |
+| 快照键族 `buckets/active/ver/epoch/data/retired/lock` | 总览 §3.1 | 七个齐全 | 一致 |
+| gateway 增量更新 | 总览 §3.1 | 版本号轮询（`run.go:45`），非 pub/sub | 一致（原文即"pub/sub **或**版本号轮询"） |
+| 强注 `stream_options.include_usage` | 总览 §6.2 | `server.go:266`、`:461` | 一致 |
+| 断连继续 drain | 总览 §6.2 | `drainSSEProtocol` / `drainKiroStream` | 一致 |
+| 冷却 ±20% 抖动 | §6.3.1 规则 4 | `chooser.go:309` `withJitter` | 一致 |
+| 新凭据版本/新 epoch 清本地冷却 | §6.3.1 分层原则 | `chooser.go:82`、`:134` | 一致 |
+| `DegradePolicy` fail_open 按渠道配 | 总览 §4 | `limiter.go:55` 读取 | 一致 |
+| Stream 按 `occurred_at` 保留 7 天 | 总览 §4.1 | `events/stream.go:23` | 一致 |
+| `attempt_started` 写失败即 503、不调上游 | 总览 §4.1 | `server.go:1290-1293` | 一致 |
+| failover 最多两次、仅首字节前 | fluxgate §5 | `server.go:1323` `attemptNo < 2` | 一致 |
+| 两份角色文档交付物清单 | — | 无未勾选项 | 一致 |
+| **每上游 `usage_integrity`，未配置不得进快照** | **总览 §6.2 / fluxgate §4 / AUDIT-CONTEXT** | **零实现** | **缺口 → A13** |
+
+**A13 的事实依据（本轮实际核对到的）**
+
+- `internal/control/provider/provider.go:16` 的 `Provider` 接口无 usage-integrity 方法；registry 无该配置。
+- `internal/control/snapshot_loop.go:75-76` 的可调度过滤只有 `status='active'`
+  与 `cooldown_until`，无 §6.2 要求的 fail-closed 闸门。
+- `internal/gateway/server.go:1295`（非流式）与 `:1215`（流式）把 `UsageSource` 初始化为
+  `missing`，有 usage 才改写为 `upstream`；`:1323` 的 failover 条件是 `status >= 400`。
+  因此"上游 200 但无 usage"直接成功返回，不换号。
+- 其下游后果可追到 `internal/control/billing_policy.go:69`：
+  `(missing, partial=false, 成功)` → `held`，即每一次都变成待人工裁定的账目。
+
+**明确未由本轮证实**
+
+1. **本轮只读，没有实现 A13，也没有改动任何代码或契约。**
+2. **未起 PostgreSQL / Redis / ClickHouse**，依赖它们的用例本轮是 skip 而非通过；
+   上一轮（B5）那批集成结果属历史证据，不计入本轮结论。
+3. 真实 provider 是否会"成功但不给 usage"**未经核实**，属 C2/C3 的 live-gate 范围。
+   A13 的依据是**设计文档的明文要求**与代码现状之差，不是对上游行为的观测。
+4. 本轮核对以设计文档的**明文要求**为基准，不覆盖文档未写而实现可能欠缺的部分；
+   "一致"只表示该条要求有对应实现，**不表示该实现已在真实流量下验证**。
+
 ## B5 控制台后端 API（2026-09-11）
 
 **改动**：新增 `internal/control/console.go`（路由、授权中间件、账号与明细读端点）、

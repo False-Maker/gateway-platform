@@ -33,9 +33,22 @@
 > `B5 控制台（后端 API）` 2026-09-11 完成，见 `docs/B5-CONSOLE.md`。**§B 到此闭合。**
 > `held` 人工处理入口（B4.3/B4.5/E1 三处遗留）、充值入口与单价录入入口（B4.1 遗留）一并闭合。
 >
-> 下一步：`§A`、`§B`、`§E` 的全部 `[no-cred]` 条目已清空，剩余的是 §C 的 `[live-gate]`
-> 与 §D 的部署边界。按 AGENTS.md §0，取任务规则见该节；`§B` 之后没有继承它的 `[no-cred]` 待办，
-> 但这**不等于**项目停机——§C/§D 各条的当前状态见其正文。
+> ~~下一步：`§A`、`§B`、`§E` 的全部 `[no-cred]` 条目已清空~~ —— **该判断由第三次复盘推翻，见下。**
+>
+> **2026-09-13 第三次复盘（结构分析）**：用与 A8 / 二次复盘相同的口径再对照一遍设计文档与代码，
+> 起因正是上一轮"`[no-cred]` 已清空"这个结论——它值得被验证而不是被接受。结果找出**一个**
+> 设计文档明确要求、代码中零实现、且从未进过任务清单的缺口，编号 **A13**（每上游
+> `usage_integrity` 策略）。它是总览 §6.2 的 P0 级契约要求，`fluxgate/docs/architecture.md` §4
+> 列为硬约束，`docs/AUDIT-CONTEXT.md` 两处提及，而全仓库 `usage_integrity` 零命中。
+>
+> 本次复盘**核对通过**（设计与代码一致，不再重复列为缺口）的项：§4.1 七个 P0 指标全部有发射点、
+> §3.1 快照七个键族齐全、§6.2 强注 `include_usage` 与断连 drain、§6.3.1 的 ±20% 抖动与
+> 「新凭据版本/新 epoch 清本地冷却」、`AccountLimits.DegradePolicy` 的 fail_open 分支、
+> §4.1 的 7 天 trim 与「`attempt_started` 写入失败即 503」、fluxgate/keyhive 两份交付物清单
+> 已无未勾选项。
+>
+> **下一步：`A13`**（`[no-cred]`）。其余：§C 全部 `[live-gate]`（C6 的 no-cred 部分已完成），
+> §D 为部署边界（D1 已完成）。
 > A12/E1/E2 不阻塞 B4，可并行取。P4（B4）在 A11 之前不进入编码——迁移来的用户还停在 staging，没有可扣费主体。
 
 ---
@@ -324,6 +337,58 @@ tenants / principals / tenant_tokens；摘要新增 `tenant_count` / `principal_
 - 无 ClickHouse 集群、副本、备份与保留策略；测试与本地只有单实例。
 - 控制台查询界面属于 B5。
 - 明细与 `usage_ledger` 的交叉核对未做（B4.5 对账只覆盖账侧三方）。
+
+### A13 `[no-cred]` 每上游 `usage_integrity` 策略缺失（总览 §6.2 的 P0 级契约要求）
+
+**状态：未开始。2026-09-13 第三次结构性复盘发现。**
+
+**基线**
+- 总览 §6.2 写明：「**P0 为每个已注册 provider 必须显式配置 `usage_integrity`（没有配置不得进入可调度快照）**」，
+  并给出首批取值表（P1 非流式静态 apikey / Anthropic+Gemini / Grok / Codex+Kiro 四行，**首批全部为 `failover`**），
+  末句「策略结果必须写入 `Release.UsageSource` 和 `Partial`，**不能由计费层猜测**」。
+- `fluxgate/docs/architecture.md` §4 把它列为**硬约束**：「如 Grok 成功但无 usage → 转 failover 报错，**不静默计 0**」。
+- `docs/AUDIT-CONTEXT.md` 两处（v2 新增、P0 具体契约）同样列入。
+- **代码中 `grep -ri "usage_integrity\|UsageIntegrity"` 在 `.go` 与 `.sql` 全仓库零命中。**
+  `provider.Provider` 接口（`internal/control/provider/provider.go:16`）无对应方法，registry 无该配置，
+  `snapshot_loop.go:75` 的可调度过滤只看 `status='active'` 与 `cooldown_until`，**没有任何 usage_integrity 闸门**。
+
+**当前实际行为（与设计不符的地方）**
+- 非流式：`internal/gateway/server.go:1295` 把 `UsageSource` 初始化为 `missing`，
+  仅当上游给了 usage 才改写为 `upstream`；`server.go:1323` 的 failover 条件是 `status >= 400`。
+  因此**上游 200 但无 usage → 直接成功返回客户端，不换号、不重试**，
+  正是 §6.2 Grok 行明令禁止的那条路径的另一半（没有静默计 0，但也没有 failover）。
+- 流式：`server.go:1215` 同构。
+- 三个不同 provider（OpenAI-compatible / Anthropic / Grok）走的是**同一条隐式路径**，
+  而设计要求逐 provider 显式配置。
+
+**结论**
+后果不是丢数据，而是**把收入问题转嫁给人工**：B4.3 的处置表把
+`(missing, partial=false, 成功)` 判为 `held`（`billing_policy.go:69`），
+于是每一次「上游成功但没给 usage」都变成一行待人工裁定的 held 账目，
+靠 B5 刚建的控制台托盘一条条捞。§6.2 设计 `failover` 的用意正是让这类请求
+**在网关侧就换号重来**，根本不产生 held 行。B4.3/B5 是在为一个本应更早拦掉的缺口做兜底。
+这条与 A11/A12/E1/E2 同性质：设计文档明确要求、代码中不存在、且从未列入任务清单。
+
+**DoD**
+- `usage_integrity` 成为 provider 的**显式**配置（取值 `failover` / `zero` / `estimated`），
+  未配置的 provider **不得进入可调度快照**——闸门加在 `snapshot_loop.go` 的可调度过滤里，
+  与 `status` / `cooldown_until` 同层，fail-closed 而非默认放行。
+- 首批取值按总览 §6.2 表落 `failover`，**不得**为图省事给一个全局默认值；
+  `zero` 仅在评审后对具体 provider 显式选择（§6.2 原文），`estimated` 本轮不启用
+  （需 tokenizer 版本与校准报告，且 B4.3 已把 `estimated` 判为 `held`，无生产者）。
+- 网关侧按策略执行，并区分流式与非流式——这是 §6.2 表里两行的差别，不能合并：
+  - 非流式：完整响应已缓冲但无 usage → 换号重试，用尽预算后返回 502 且 `UsageSource=missing`。
+  - 流式：**首字节前**缺 usage 可换号；**首字节后不得重放**，保留响应并标记 `missing` / `partial`。
+- 复用既有的 failover 预算（`attemptNo < 2`，fluxgate §5 已定「最多两次、仅首字节前」），
+  **不新开一套重试计数**，否则两套预算会互相叠乘。
+- 回归：本地 fixture 上游返回「200 + 无 usage」，断言换号重试发生、
+  用尽后终态为 `missing`；断言未配置 `usage_integrity` 的账号不出现在快照里。
+- **本任务不改 B4.3 的处置表**——它对 `missing` 的判定仍然正确，
+  A13 要减少的是 `missing` 的**产生量**，不是改变它的账务含义。
+
+**已知取舍（记录，避免被当成遗漏）**
+- 真实 provider 到底会不会「成功但不给 usage」属 `[live-gate]`（C2/C3）。
+  本任务只交付策略机制与本地 fixture 验证，**不声称**任何 provider 的真实行为已核实。
 
 ---
 
