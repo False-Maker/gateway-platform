@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"crypto/rand"
+	"net/url"
 	"sort"
 	"strings"
 	"sync"
@@ -33,15 +34,24 @@ type Chooser struct {
 	owner    map[string]string // account ID -> bucket key
 	cooling  map[cooldownKey]cooldown
 	failures map[cooldownKey]int
-	now      func() time.Time
-	epoch    int64
+	// egress short-circuits outbound paths, keyed by egressKey. It is
+	// deliberately a separate table from cooling: one is about paths, the other
+	// about accounts, and §6.3.1 requires forbidden_transport to touch only the
+	// first. Merging them is the mistake the design warns about.
+	egress map[string]time.Time
+	// egressSeen is the evidence behind egress: which distinct accounts were
+	// refused on a path recently. Without it a single ambiguous 403 would take
+	// out a whole path and delete the failover §6.3.1 keeps.
+	egressSeen map[string]map[string]time.Time
+	now        func() time.Time
+	epoch      int64
 }
 
 func NewChooser(now func() time.Time) *Chooser {
 	if now == nil {
 		now = time.Now
 	}
-	return &Chooser{accounts: make(map[string]contracts.Account), buckets: make(map[string]bucketState), owner: make(map[string]string), cooling: make(map[cooldownKey]cooldown), failures: make(map[cooldownKey]int), now: now}
+	return &Chooser{accounts: make(map[string]contracts.Account), buckets: make(map[string]bucketState), owner: make(map[string]string), cooling: make(map[cooldownKey]cooldown), failures: make(map[cooldownKey]int), egress: make(map[string]time.Time), egressSeen: make(map[string]map[string]time.Time), now: now}
 }
 
 func bucketKey(platform, group string) string { return platform + "\x00" + group }
@@ -161,6 +171,7 @@ func (c *Chooser) AcquirePreferring(criteria contracts.Criteria, preferred strin
 	ids := make([]string, 0)
 	quotaExcluded := false
 	staleExcluded := false
+	egressExcluded := false
 	for id, account := range c.accounts {
 		if _, skip := excluded[id]; skip {
 			continue
@@ -186,6 +197,15 @@ func (c *Chooser) AcquirePreferring(criteria contracts.Criteria, preferred strin
 		if blocked, ok := c.cooling[cooldownKey{id, criteria.Model}]; ok && blocked.until.After(now) {
 			continue
 		}
+		// A14: the account may be perfectly healthy while the path it dials
+		// through is being refused. Skipping it here is what stops a blocked
+		// egress from being retried at full request rate -- including within a
+		// single request's failover, where the next account would otherwise go
+		// out the same door and burn a second attempt for nothing.
+		if until, ok := c.egress[egressKey(account.Profile)]; ok && until.After(now) {
+			egressExcluded = true
+			continue
+		}
 		if !hasQuota(account, criteria.Model) {
 			quotaExcluded = true
 			continue
@@ -198,6 +218,12 @@ func (c *Chooser) AcquirePreferring(criteria contracts.Criteria, preferred strin
 		}
 		if staleExcluded {
 			return contracts.Lease{}, ErrSnapshotStale
+		}
+		// Every remaining candidate is behind a short-circuited egress. Failing
+		// closed is the point: dialling anyway would defeat the short circuit,
+		// and the caller turns this into a 503.
+		if egressExcluded {
+			return contracts.Lease{}, ErrEgressBlocked
 		}
 		return contracts.Lease{}, ErrNoAccount
 	}
@@ -283,8 +309,101 @@ func supports(account contracts.Account, model string) bool {
 	return false
 }
 
+// egressShortCircuit is how long an outbound path stays short-circuited after a
+// transport-level rejection. Overview §6.3.1 and fluxgate §2.1 both specify
+// "5–10s"; 7s with the same ±20% jitter as every other local cooldown lands in
+// [5.6s, 8.4s], inside that range. **Not calibrated against real traffic** --
+// what a real WAF does, and how long it keeps doing it, is C3 (live-gate).
+const egressShortCircuit = 7 * time.Second
+
+// egressSignalWindow / egressSignalAccounts are §6.3.1 rule 2's judgement:
+// several accounts failing the same way on one path inside one window is a path
+// problem. Same numbers as control's platformSignalWindow / platformSignalAccounts.
+const (
+	egressSignalWindow   = 60 * time.Second
+	egressSignalAccounts = 2
+)
+
+// egressKey identifies the outbound path a lease dials through -- the same
+// value clientForProxy dials with, so the key cannot drift from reality. An
+// empty proxy is the single "direct" bucket.
+//
+// The raw string can carry credentials (`scheme://user:password@host`), so it
+// is only ever an in-memory map key: never logged, never a metric label. Use
+// redactEgress for anything that leaves the process.
+func egressKey(profile contracts.UpstreamProfile) string {
+	return strings.TrimSpace(profile.Proxy)
+}
+
+// redactEgress renders an egress for humans and metrics with any userinfo
+// removed. A proxy that will not parse is reported as "unparsable" rather than
+// echoed, because echoing it is exactly how a password reaches a dashboard.
+func redactEgress(key string) string {
+	if key == "" {
+		return "direct"
+	}
+	parsed, err := url.Parse(key)
+	if err != nil || parsed.Host == "" {
+		return "unparsable"
+	}
+	return parsed.Scheme + "://" + parsed.Host
+}
+
+// MarkEgressRejected records a transport-level rejection (403 with an HTML
+// body) against the outbound path the lease dialled, and short-circuits that
+// path once the evidence says the path -- not an account -- is the problem.
+//
+// The threshold is the point. Overview §6.3.1 rule 2 states the judgement
+// explicitly: one account seeing an HTML 403 proves nothing, but "同平台多个
+// 账号同时开始返回 HTML 403,那不是账号问题,是出口 IP 或 TLS 指纹被标记了".
+// The same row of the ErrorClass table also keeps `failover = 是`, so
+// short-circuiting on the first rejection would delete a retry the design
+// deliberately kept. Waiting for a second distinct account preserves both:
+// the first rejection still fails over, and a genuinely burned egress stops
+// being dialled instead of being retried at full request rate.
+//
+// Window and threshold mirror control's PlatformSignals (60s, 2 distinct
+// accounts) because §6.3.1 rule 2 is one rule; the two layers should not
+// disagree about when it has fired.
+//
+// Returns true when this rejection tripped the short circuit.
+func (c *Chooser) MarkEgressRejected(lease contracts.Lease) bool {
+	key := egressKey(lease.Profile)
+	now := c.now()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.egressSeen == nil {
+		c.egressSeen = make(map[string]map[string]time.Time)
+	}
+	seen := c.egressSeen[key]
+	if seen == nil {
+		seen = make(map[string]time.Time)
+		c.egressSeen[key] = seen
+	}
+	seen[lease.AccountID] = now
+	for accountID, at := range seen {
+		if now.Sub(at) > egressSignalWindow {
+			delete(seen, accountID)
+		}
+	}
+	if len(seen) < egressSignalAccounts {
+		return false
+	}
+	if c.egress == nil {
+		c.egress = make(map[string]time.Time)
+	}
+	until := now.Add(withJitter(egressShortCircuit))
+	if current, ok := c.egress[key]; ok && current.After(until) {
+		return true
+	}
+	c.egress[key] = until
+	return true
+}
+
 func (c *Chooser) MarkFailure(accountID, model string, class contracts.ErrorClass, reset time.Duration) {
 	if class == contracts.ErrorForbiddenTransport || class == contracts.ErrorNetwork {
+		// Deliberately no account cooldown: see MarkEgressBlocked, which the
+		// caller invokes instead for forbidden_transport.
 		return
 	}
 	key := cooldownKey{accountID: accountID, model: model}

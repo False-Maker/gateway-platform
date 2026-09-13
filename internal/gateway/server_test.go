@@ -1496,3 +1496,133 @@ func TestUnstampedLeaseStillRefusesUnmeteredTraffic(t *testing.T) {
 		t.Fatalf("unstamped lease failed open: status=%d err=%v", status, err)
 	}
 }
+
+// A14 / overview §6.3.1 + fluxgate §2.1: a 403 with an HTML body is evidence
+// about the outbound path, not the account. The account must stay selectable
+// and the egress must be short-circuited -- including for the very next account
+// inside the same request's failover, which would otherwise go out the same
+// blocked door.
+func TestForbiddenTransportShortCircuitsTheEgressNotTheAccount(t *testing.T) {
+	mini := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mini.Addr()})
+	var calls int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte("<!doctype html><title>blocked</title>"))
+	}))
+	defer upstream.Close()
+	server := NewServer(events.Producer{Redis: rdb, ProducerID: "gateway-test"}, "apikey")
+	// Both accounts dial the same egress (no proxy = the "direct" bucket).
+	accounts := []contracts.Account{
+		{ID: "a", Provider: "apikey", Platform: "apikey", Group: "default", Status: "active", UsageIntegrity: contracts.UsageIntegrityFailover, Credential: contracts.Credential{Kind: "static", AccessToken: "a", Version: 1}, Profile: contracts.UpstreamProfile{BaseURL: upstream.URL}},
+		{ID: "b", Provider: "apikey", Platform: "apikey", Group: "default", Status: "active", UsageIntegrity: contracts.UsageIntegrityFailover, Credential: contracts.Credential{Kind: "static", AccessToken: "b", Version: 1}, Profile: contracts.UpstreamProfile{BaseURL: upstream.URL}},
+	}
+	server.Chooser.Replace(accounts)
+
+	_, status, err := server.HandleNonStreaming(context.Background(), "tenant", "default", ChatCompletionRequest{Model: "m", Messages: []map[string]any{{"role": "user", "content": "hi"}}})
+	if status != http.StatusForbidden {
+		t.Fatalf("blocked egress result: status=%d err=%v", status, err)
+	}
+	// Exactly two dials: §6.3.1 keeps `failover = 是` for this class, so the
+	// first rejection still fails over. The second distinct account failing the
+	// same way on the same path is what rule 2 calls a path problem.
+	if calls != 2 {
+		t.Fatalf("upstream was dialled %d times, want 2 (one failover, then the short circuit)", calls)
+	}
+	// The accounts themselves are untouched: §6.3.1 says this class must not
+	// penalise them, because "混进账号冷却表会误杀健康号".
+	server.Chooser.mu.Lock()
+	cooling := len(server.Chooser.cooling)
+	server.Chooser.mu.Unlock()
+	if cooling != 0 {
+		t.Fatalf("forbidden_transport put %d entries in the account cooldown table", cooling)
+	}
+	// And with every candidate behind that egress, selection fails closed.
+	if _, err := server.Chooser.Acquire(contracts.Criteria{Platform: "apikey", Model: "m", Group: "default"}); !errors.Is(err, ErrEgressBlocked) {
+		t.Fatalf("selection during a short circuit = %v, want ErrEgressBlocked", err)
+	}
+}
+
+// The short circuit is on the path, so an account reachable by a different path
+// keeps serving. This is the property that makes it safe to fail closed above.
+func TestEgressShortCircuitSparesOtherEgresses(t *testing.T) {
+	mini := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mini.Addr()})
+	server := NewServer(events.Producer{Redis: rdb, ProducerID: "gateway-test"}, "apikey")
+	blocked := contracts.Lease{AccountID: "a", Profile: contracts.UpstreamProfile{Proxy: "http://user:secret@proxy-one:8080"}}
+	server.Chooser.Replace([]contracts.Account{
+		{ID: "a", Provider: "apikey", Platform: "apikey", Group: "default", Status: "active", Credential: contracts.Credential{Kind: "static", AccessToken: "a", Version: 1}, Profile: blocked.Profile},
+		{ID: "b", Provider: "apikey", Platform: "apikey", Group: "default", Status: "active", Credential: contracts.Credential{Kind: "static", AccessToken: "b", Version: 1}, Profile: contracts.UpstreamProfile{Proxy: "http://proxy-two:8080"}},
+	})
+	// Two distinct accounts refused on that path is what trips the short circuit.
+	server.Chooser.MarkEgressRejected(blocked)
+	server.Chooser.MarkEgressRejected(contracts.Lease{AccountID: "a2", Profile: blocked.Profile})
+	lease, err := server.Chooser.Acquire(contracts.Criteria{Platform: "apikey", Model: "m", Group: "default"})
+	if err != nil || lease.AccountID != "b" {
+		t.Fatalf("selection skipped the wrong egress: lease=%+v err=%v", lease, err)
+	}
+}
+
+// The short circuit expires on its own; it is a bridge, not a penalty.
+func TestEgressShortCircuitExpires(t *testing.T) {
+	current := time.Now()
+	chooser := NewChooser(func() time.Time { return current })
+	chooser.Replace([]contracts.Account{
+		{ID: "a", Provider: "apikey", Platform: "apikey", Group: "default", Status: "active", Credential: contracts.Credential{Kind: "static", AccessToken: "a", Version: 1}},
+	})
+	chooser.MarkEgressRejected(contracts.Lease{AccountID: "a"})
+	chooser.MarkEgressRejected(contracts.Lease{AccountID: "a2"})
+	if _, err := chooser.Acquire(contracts.Criteria{Platform: "apikey", Model: "m", Group: "default"}); !errors.Is(err, ErrEgressBlocked) {
+		t.Fatalf("egress was not short-circuited: %v", err)
+	}
+	// Upper bound of the documented 5-10s window plus jitter headroom.
+	current = current.Add(11 * time.Second)
+	if _, err := chooser.Acquire(contracts.Criteria{Platform: "apikey", Model: "m", Group: "default"}); err != nil {
+		t.Fatalf("short circuit did not expire: %v", err)
+	}
+}
+
+// The egress key can carry proxy credentials, so nothing that leaves the
+// process may echo it. redactEgress is the only thing metrics and logs see.
+func TestRedactEgressNeverLeaksProxyCredentials(t *testing.T) {
+	for _, tc := range []struct{ raw, want string }{
+		{"", "direct"},
+		{"http://user:hunter2@proxy.internal:8080", "http://proxy.internal:8080"},
+		{"socks5://proxy.internal:1080", "socks5://proxy.internal:1080"},
+		{"://not a url", "unparsable"},
+	} {
+		got := redactEgress(tc.raw)
+		if got != tc.want {
+			t.Errorf("redactEgress(%q) = %q, want %q", tc.raw, got, tc.want)
+		}
+		if strings.Contains(got, "hunter2") {
+			t.Fatalf("redactEgress leaked a proxy password: %q", got)
+		}
+	}
+}
+
+// §6.3.1 rule 2 in one assertion: a single account's HTML 403 is not evidence
+// about the path. Short-circuiting on it would delete the failover the same
+// table row keeps (`failover = 是`) and take a whole egress out on an
+// ambiguous signal.
+func TestOneAccountsTransportRejectionDoesNotShortCircuitTheEgress(t *testing.T) {
+	chooser := NewChooser(nil)
+	chooser.Replace([]contracts.Account{
+		{ID: "a", Provider: "apikey", Platform: "apikey", Group: "default", Status: "active", Credential: contracts.Credential{Kind: "static", AccessToken: "a", Version: 1}},
+	})
+	if tripped := chooser.MarkEgressRejected(contracts.Lease{AccountID: "a"}); tripped {
+		t.Fatal("one account's rejection tripped the short circuit")
+	}
+	// Repeating the same account must not count twice: rule 2 is about distinct
+	// accounts, and a retry loop on one account would otherwise fake the signal.
+	if tripped := chooser.MarkEgressRejected(contracts.Lease{AccountID: "a"}); tripped {
+		t.Fatal("the same account counted twice toward the threshold")
+	}
+	if _, err := chooser.Acquire(contracts.Criteria{Platform: "apikey", Model: "m", Group: "default"}); err != nil {
+		t.Fatalf("egress was short-circuited on one account's rejection: %v", err)
+	}
+	if tripped := chooser.MarkEgressRejected(contracts.Lease{AccountID: "b"}); !tripped {
+		t.Fatal("a second distinct account did not trip the short circuit")
+	}
+}

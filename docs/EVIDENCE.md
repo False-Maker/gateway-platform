@@ -7,6 +7,69 @@
 > 阅读规则：本文的每一条都是**对已发生事实的描述**。不要从本文推断"项目是否可以继续开发"——
 > 那个问题由 `docs/TODO.md` 和 `AGENTS.md` §0 回答。
 
+## A14 出口路径短路（2026-09-14）
+
+**改动**：`internal/gateway/chooser.go`（`egress` / `egressSeen` 两张表、`MarkEgressRejected`、
+`egressKey` / `redactEgress`、选号过滤）、`internal/gateway/server.go`
+（`ErrEgressBlocked`、`markTransportOrAccount` 分派、两处调用点接线）。
+**无契约改动、无 migration、未改 `ErrorClass` 表、未改 control 侧判罚。**
+
+**一处实现时的自我更正（本轮最值得记的事）**
+
+第一版按字面实现成「收到 403-HTML 立即短路该出口」，跑全量时打破了既有测试
+`TestForbiddenTransportFailoverUsesDifferentAccount`（6 次全量 6 次失败）。
+原因是我只读了 §6.3.1 那一行的「出口路径 5–10s 短路」，**漏看了同一行的 `failover = 是`**
+——与第三次复盘同一种错法：只读了证据的一部分就下结论。
+
+§6.3.1 规则 2 本身给了正确判据：「单次不罚号，但若**同平台多个账号同时**开始返回 HTML 403，
+那不是账号问题，是出口 IP 或 TLS 指纹被标记了」。据此改为**阈值触发**：
+60s 窗口内 ≥2 个**不同**账号在同一出口被拒才短路，与 A9 `PlatformSignals` 的
+`platformSignalWindow` / `platformSignalAccounts` 同一口径。这样两个要求同时满足——
+第一次拒绝照常 failover（设计保留的重试没被删掉），真正烧掉的出口才停止拨号。
+
+**是既有测试挡住了这个错误。** 如果当初没有那条测试，这个改动会带着"删掉一条设计保留的重试"
+悄悄合进去。
+
+**本轮执行（命令与结果）**
+
+```
+$ go build ./... && go vet ./...                 # 通过
+$ gofmt -l .                                     # 本轮文件无输出
+$ go test -race -count=1 ./internal/gateway/     # ok 2.684s
+$ source configs/test-infra/test.env && go test -count=1 -p 1 ./...   # 连跑 8 次，0 失败
+```
+
+**跑通的新用例**
+
+- `TestForbiddenTransportShortCircuitsTheEgressNotTheAccount` —— 两个账号同出口都返回
+  403+HTML：上游**恰好被拨 2 次**（第一次 failover、第二次触发短路），随后
+  `Acquire` 返回 `ErrEgressBlocked`（fail-closed），且**账号冷却表为空**
+  （§6.3.1 要求本类不罚账号）。
+- `TestOneAccountsTransportRejectionDoesNotShortCircuitTheEgress` —— 单账号被拒不短路；
+  同一账号重复被拒**不重复计数**（否则一个账号的重试循环就能伪造出「多账号」信号）。
+- `TestEgressShortCircuitSparesOtherEgresses` —— 短路的是路径：另一条 proxy 上的账号照常可选。
+- `TestEgressShortCircuitExpires` —— 到期自动恢复（桥接，不是惩罚）。
+- `TestRedactEgressNeverLeaksProxyCredentials` —— `http://user:hunter2@host` 脱敏为
+  `http://host`，非法 URL 报 `unparsable` 而**不回显原串**。
+
+**测试经反向验证**：临时把 A14 的接线短路掉后，
+`TestForbiddenTransportShortCircuitsTheEgressNotTheAccount` 立即报
+`upstream was dialled 2 times through a short-circuited egress, want 1`（旧断言），
+确认它确实在抓这个缺陷，随即还原。
+
+**明确未由本轮证实**
+
+1. **5–10s、60s、2 个账号这几个数字未经真实流量校准**（与 E1 阈值同一处理）。
+   真实 WAF 的拦截特征与恢复时间属 C3 `[live-gate]`；本轮全部由本地 httptest fixture 驱动，
+   **没有向任何真实上游发过请求**。
+2. **短路是进程内的**：多个 gateway 实例各自独立积累证据、各自短路，不共享。
+   跨实例的那一半仍由 A9 的 control 侧聚合承担。
+3. 新指标 `gateway_egress_short_circuit_total` **无告警规则消费**（E1 已闭合，A14 的 DoD 未要求）。
+4. **本轮观察到一次未复现的失败**：在 A14 第一版（错误实现）期间的某次全量中，
+   `cmd/gwd` 的 `TestProcessE2EControlGatewayRelease` 报
+   `request without tenant token: status=200`，此后 8 次全量未再出现。
+   与 A14 无明显关联，**本轮对它没有结论**，不宣称它不存在。
+
 ## 第四次结构性复盘（2026-09-14）
 
 **改动**：**零代码改动、零契约改动。**更新 `docs/TODO.md`（新增 A14、改写顶部指针）；

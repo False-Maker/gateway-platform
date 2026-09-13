@@ -30,6 +30,7 @@ var (
 	ErrAttemptFailed    = errors.New("attempt_started event could not be persisted")
 	ErrNetwork          = errors.New("network_error")
 	ErrUsageUnavailable = errors.New("upstream response did not contain usage")
+	ErrEgressBlocked    = errors.New("every eligible account is behind a short-circuited egress")
 )
 
 const releaseWriteTimeout = 3 * time.Second
@@ -406,7 +407,8 @@ func (s *Server) handleProtocolStreaming(ctx context.Context, tenantID, group st
 		if releaseErr != nil {
 			return http.StatusServiceUnavailable, releaseErr
 		}
-		s.Chooser.MarkFailure(lease.AccountID, model, classifyHTTPWithReset(response.StatusCode, body, retryAfter(response.Header, time.Now())), retryAfter(response.Header, time.Now()))
+		streamClass := classifyHTTPWithReset(response.StatusCode, body, retryAfter(response.Header, time.Now()))
+		s.markTransportOrAccount(lease, model, streamClass, retryAfter(response.Header, time.Now()))
 		return response.StatusCode, callErr
 	}
 
@@ -1353,8 +1355,12 @@ func (s *Server) handleNonStreaming(ctx context.Context, tenantID, group string,
 		}
 		if status >= 400 {
 			lastStatus, lastErr = status, callErr
+			// A14: a transport rejection is recorded before deciding whether to
+			// retry, so the short circuit is already in place when the next
+			// Acquire runs -- otherwise the retry would pick another account on
+			// the same blocked egress and burn a second attempt.
+			s.markTransportOrAccount(lease, request.Model, release.ErrorClass, reset)
 			if shouldFailoverStatus(status) && attemptNo < 2 {
-				s.Chooser.MarkFailure(lease.AccountID, request.Model, release.ErrorClass, reset)
 				continue
 			}
 			if lastErr == nil {
@@ -1782,6 +1788,22 @@ func retryAfter(header http.Header, now time.Time) time.Duration {
 		}
 	}
 	return 0
+}
+
+// markTransportOrAccount routes a failure to the table that owns it. Overview
+// §6.3.1 splits these deliberately: forbidden_transport is evidence about the
+// outbound path, every other class is evidence about the account. Keeping the
+// split in one function is what stops a future caller from quietly folding a
+// transport rejection back into the account cooldown table.
+func (s *Server) markTransportOrAccount(lease contracts.Lease, model string, class contracts.ErrorClass, reset time.Duration) {
+	if class == contracts.ErrorForbiddenTransport {
+		if s.Chooser.MarkEgressRejected(lease) {
+			observability.Default.AddCounter("gateway_egress_short_circuit_total", 1,
+				"egress", redactEgress(egressKey(lease.Profile)))
+		}
+		return
+	}
+	s.Chooser.MarkFailure(lease.AccountID, model, class, reset)
 }
 
 func shouldFailoverStatus(status int) bool {
