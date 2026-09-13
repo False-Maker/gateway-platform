@@ -207,8 +207,21 @@ func TestWalletBalanceAndJournalMoveInOneTransaction(t *testing.T) {
 		t.Fatalf("EnsureWallet changed the balance to %q (err=%v)", again, err)
 	}
 
-	// The journal reconciles with the balance by construction: the last
-	// balance_after is the balance, and the entries sum to it.
+	// The journal reconciles with the balance, and the entries sum to it.
+	//
+	// Addressed by id rather than by position. ListWalletTransactions orders by
+	// `created_at, id`, and neither column carries insertion order here: the 101
+	// movements are applied faster than the timestamp resolution, and the text
+	// id tiebreak is lexicographic, so "b41-debit-10" sorts before
+	// "b41-debit-9" and "b41-topup" sorts after every debit. Asserting on
+	// transactions[0] / transactions[len-1] was therefore asserting on an order
+	// the query never promised -- it failed in 1 of 12 full runs with
+	// `last balance_after "9.330000000000" != balance "9.050000000000"` and a
+	// first entry of b41-debit-96, while the balance itself was correct.
+	//
+	// B4.5 reached the same conclusion about this table from the other side and
+	// refused to verify the balance_after chain for exactly this reason; see
+	// docs/TODO.md B4.5 "不校验 wallet_transactions.balance_after 的逐行链条".
 	transactions, err := repo.ListWalletTransactions(ctx, tenantID)
 	if err != nil {
 		t.Fatal(err)
@@ -216,14 +229,19 @@ func TestWalletBalanceAndJournalMoveInOneTransaction(t *testing.T) {
 	if len(transactions) != 101 {
 		t.Fatalf("journal has %d entries, want 101", len(transactions))
 	}
-	if transactions[len(transactions)-1].BalanceAfter != balance {
-		t.Errorf("last balance_after %q != balance %q", transactions[len(transactions)-1].BalanceAfter, balance)
+	byID := make(map[string]WalletTransaction, len(transactions))
+	for _, transaction := range transactions {
+		byID[transaction.ID] = transaction
 	}
-	if transactions[0].Kind != "topup" || transactions[0].Note != "fixture topup" || transactions[0].BillingRunID != "" {
-		t.Errorf("first journal entry = %+v", transactions[0])
+	// The last movement applied is the last debit, by construction of the loop.
+	if final := byID["b41-debit-99"]; final.BalanceAfter != balance {
+		t.Errorf("balance_after on the final movement = %q, want %q", final.BalanceAfter, balance)
 	}
-	if transactions[1].BillingRunID != "b41-run" {
-		t.Errorf("debit lost its billing run id: %+v", transactions[1])
+	if topup := byID["b41-topup"]; topup.Kind != "topup" || topup.Note != "fixture topup" || topup.BillingRunID != "" {
+		t.Errorf("topup journal entry = %+v", topup)
+	}
+	if debit := byID["b41-debit-0"]; debit.BillingRunID != "b41-run" {
+		t.Errorf("debit lost its billing run id: %+v", debit)
 	}
 	var journalSum string
 	if err := db.QueryRow(ctx, `SELECT COALESCE(sum(amount),0)::text FROM wallet_transactions WHERE tenant_id=$1`, tenantID).Scan(&journalSum); err != nil {

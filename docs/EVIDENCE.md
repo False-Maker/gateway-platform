@@ -7,6 +7,77 @@
 > 阅读规则：本文的每一条都是**对已发生事实的描述**。不要从本文推断"项目是否可以继续开发"——
 > 那个问题由 `docs/TODO.md` 和 `AGENTS.md` §0 回答。
 
+## 计费测试两个偶发失败的根因（2026-09-14）
+
+**改动**：只动测试，**产品代码零改动**。`billing_job_integration_test.go` 新增 `isolateBillingRun`
+并在两处断言性 `RunOnce` 前调用；`billing_integration_test.go` 把钱包流水断言从「按位置」改为「按 id」。
+
+### 一、`TestBillingJobSettlesLedgerRowsAndWalletInOneTransaction`
+
+**根因**：`BillingJob.RunOnce` 遍历**所有**有 pending 行的租户（`pendingTenants`），
+`RowsBilled` / `RowsHeld` / `RowsNotBillable` / `TotalDebited` 全是**跨租户的聚合计数**；
+而该测试只清理自己那个 `b42-tenant` 的行，却拿这些全局计数做断言。
+共享测试库里任何一条落在窗口内的外来 pending 行，都会直接进入它的断言。
+
+**这一条是被演示出来的，不是推断出来的**：注入一条属于别的租户的
+`(upstream, 非 partial, 失败)` pending 行后，测试报出
+
+```
+billing_job_integration_test.go: B4.3 buckets = held 2, not billable 2, unknown 0
+```
+
+与 B5 那一轮记录的历史症状「`B4.3 buckets = held 2, not billable 2`（期望 not billable 1）」
+**逐字一致**。此前几轮它一直以「疑似共享测试库 `billing_state='pending'` 的遗留行」的形式挂着，
+本轮才坐实。
+
+**修法**：`isolateBillingRun` 在断言性运行前删掉不属于本测试租户的 pending 行，
+让「全局计数」名副其实。这与该文件既有的 `purgeAllTestPrices`（直接清空整张价格表）同一前提：
+`-p 1` + 一次性测试库，不存在并发的其它断言。受影响的断言共三处（两个测试）。
+
+**修复经反向验证**：把同一条注入行加回去，修复前必红、修复后通过。
+
+### 二、`TestWalletBalanceAndJournalMoveInOneTransaction`（本轮新发现）
+
+**现象**：余额本身正确（9.05），但「最后一条流水的 `balance_after`」是 9.33，
+且「第一条流水」是 `b41-debit-96`。
+
+**根因**：`ListWalletTransactions` 用 `ORDER BY created_at, id`，**这两列都不携带插入顺序**——
+101 次 movement 快于时间戳分辨率，而 `id` 是文本、按字典序断连，于是 `b41-debit-10` 排在
+`b41-debit-9` 之前，`b41-topup` 排在所有 debit 之后。测试却按位置取 `transactions[0]` 与
+`transactions[len-1]`，等于断言一个查询从未承诺过的顺序。
+
+**这不是新发现的性质**：B4.5 从另一侧得出过同一结论，并据此**拒绝**校验
+`wallet_transactions.balance_after` 的逐行链条（见 `docs/TODO.md` B4.5「同 `created_at` 的顺序
+不唯一，会造假阳性」）。该测试没有享受到同样的处理。
+
+**修法**：改为按 id 定位（`b41-debit-99` 是构造上的最后一笔、`b41-topup`、`b41-debit-0`），
+与顺序无关，断言反而更强。
+
+**未解释的部分（诚实记录）**：单纯的字典序断连**不足以**解释「第一条是 `b41-debit-96`」——
+那还需要 `created_at` 非单调。本轮**未**证实 PostgreSQL 侧存在时钟回退，
+只证实了「该排序不等于插入顺序」这一条，而这一条已足以支撑修法。
+考虑到同一环境下 Redis 服务端时钟确实会回退（见上一节），PG 侧同样回退是**合理怀疑但未经证实**。
+
+**本轮执行（命令与结果）**
+
+```
+$ go build ./... && go vet ./...            # 通过
+$ gofmt -l .                                # 本轮文件无输出
+$ source configs/test-infra/test.env && go test -count=1 -p 1 ./...   # 连跑 14 次，0 失败
+```
+
+**明确未由本轮证实**
+
+1. **`TestBillingJobSettles...` 在本轮 27 次全量中一次都没自然复现**（修复前 15 次 + 修复后 12 次）。
+   它的修复依据是**注入实验**与结构分析，不是一次自然复现。这是有意的取舍：
+   等一个 1/12 概率的事件不如直接证明机制。
+2. **谁在共享库里留下那条外来 pending 行，未查明。** 候选包括 `ledger.go` 的合成 504 行
+   （`missing/partial/504` → `not_billable`，与症状吻合）以及按 `account_id`/`attempt_id`
+   而非按租户清理的几个用例。本轮只让断言不再受它影响，**没有消除那条行本身**。
+3. PG 侧时钟单调性未测（见上）。
+4. 产品代码未改动，因此本轮**不构成**对任何产品行为的新验证。
+5. 仍是单机单实例、无真实上游请求。
+
 ## wrapper reclaim 偶发失败的根因（2026-09-14）
 
 **改动**：只动测试，**产品代码零改动**。`internal/control/wrapper/queue_integration_test.go` 新增

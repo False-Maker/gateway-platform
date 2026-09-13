@@ -24,6 +24,29 @@ func purgeAllTestPrices(ctx context.Context, db *pgxpool.Pool) error {
 	return deleteErr
 }
 
+// isolateBillingRun removes pending ledger rows belonging to anyone but
+// tenantID, so that BillingJob.RunOnce's run-wide counters describe only what
+// this test set up.
+//
+// It is needed because RunOnce settles *every* tenant with pending rows in the
+// window and reports totals across all of them, while these tests clean up only
+// their own tenant. One leftover row from another test therefore lands straight
+// in this test's assertions. That is not a hypothesis: injecting a single
+// foreign (upstream, !partial, failed) row into the window reproduces the
+// historical failure `B4.3 buckets = held 2, not billable 2` character for
+// character -- which is how this flake was finally pinned down after it had
+// survived several rounds as "疑似共享测试库残留".
+//
+// Deleting other tenants' pending rows is safe here for the same reason
+// purgeAllTestPrices may empty the entire price table: the gated suite runs
+// with -p 1 against a disposable database, so no other test is mid-assertion.
+func isolateBillingRun(ctx context.Context, t *testing.T, db *pgxpool.Pool, tenantID string) {
+	t.Helper()
+	if _, err := db.Exec(ctx, `DELETE FROM usage_ledger WHERE billing_state='pending' AND tenant_id <> $1`, tenantID); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // insertTestUsage writes a row for a request that was served: 200 with
 // error_class=ok. B4.3 keys its policy off the outcome as well as the usage
 // source, so the outcome has to be a real value here and not a placeholder.
@@ -126,6 +149,7 @@ func TestBillingJobSettlesLedgerRowsAndWalletInOneTransaction(t *testing.T) {
 		[4]int64{7000, 3000, 0, 0}, 500, string(contracts.ErrorUpstream5xx))
 	insertTestUsage(ctx, t, db, tenantID, "b42-future", "b42-model", "upstream", false, now.Add(time.Hour), [4]int64{9999, 9999, 0, 0})
 
+	isolateBillingRun(ctx, t, db, tenantID)
 	run, err := job.RunOnce(ctx, windowEnd)
 	if err != nil {
 		t.Fatal(err)
@@ -293,6 +317,10 @@ func TestBillingJobLeavesRowsPendingWhenATenantHasNoWallet(t *testing.T) {
 	}
 	insertTestUsage(ctx, t, db, tenantID, "b42-walletless-usage", "b42-model", "upstream", false, now.Add(-time.Hour), [4]int64{1000, 0, 0, 0})
 
+	// TenantsFailed==1 below is also a run-wide count: another tenant's pending
+	// row would either add a second failure or settle successfully and break
+	// RowsBilled==0.
+	isolateBillingRun(ctx, t, db, tenantID)
 	run, err := job.RunOnce(ctx, now)
 	// Usage with no wallet to charge is an operator error, not a free ride:
 	// it must surface, and the rows must stay pending for a retry.
