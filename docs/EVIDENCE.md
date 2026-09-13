@@ -7,6 +7,41 @@
 > 阅读规则：本文的每一条都是**对已发生事实的描述**。不要从本文推断"项目是否可以继续开发"——
 > 那个问题由 `docs/TODO.md` 和 `AGENTS.md` §0 回答。
 
+## 文档漂移复核（2026-09-14，A14 之后）
+
+**改动**：**零代码改动、零契约改动。**仅 `keyhive/docs/architecture.md`「平台级速率告警」一条。
+
+**本轮执行（命令与结果）**
+
+```
+$ go build ./cmd/gwd                 # 通过
+$ go vet ./...                       # 无输出
+$ go test -count=1 ./...             # 全绿
+$ git status --porcelain             # 干净；HEAD == origin/main (5697474)
+```
+
+**发现的漂移（1 处，已修）**
+
+`keyhive/docs/architecture.md` 的「平台级速率告警」条写着「§6.3.1 要求的**处置**（出口路径
+5–10s 短路）**仍未实现**，见 `docs/TODO.md` A14」。该句在写下时（第四次复盘 `b98deb0`）正确，
+但紧接着的 A14 实现提交（`5697474`）只更新了 `docs/TODO.md` 与本文，**漏了这行回指**，
+于是同一事实在仓库里出现两种说法。已改为指向 A14 已交付，并写明短路是进程内的、
+跨实例聚合仍由 `PlatformSignals` 承担。
+
+**核对通过、未发现漂移的项**：文档引用的产物全部在位
+（`internal/control/wrapper/device.go`、`configs/alerts/gateway-platform.rules.yml`、
+`internal/observability/alertrules_test.go`、`configs/test-infra/*`）；
+A14 实现摘要逐项与代码对得上（`egress` / `egressSeen`、`ErrEgressBlocked`、`redactEgress`、
+`markTransportOrAccount`、`gateway_egress_short_circuit_total`）；
+全仓库 markdown 无未勾选 checkbox。
+
+**明确未由本轮证实**
+
+1. 本轮**未** source `configs/test-infra/test.env`，PG / Redis / ClickHouse 用例为 skipped 状态，
+   不是跑通。上一次真实基础设施全量的证据见下方 A14 小节。
+2. 本轮是**针对既有结论的复核**，不是第五次结构性复盘——没有按 A8 口径重新逐条对照设计文档，
+   因此**不声称**"设计与代码已无缺口"。
+
 ## A14 出口路径短路（2026-09-14）
 
 **改动**：`internal/gateway/chooser.go`（`egress` / `egressSeen` 两张表、`MarkEgressRejected`、
