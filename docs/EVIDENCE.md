@@ -7,6 +7,89 @@
 > 阅读规则：本文的每一条都是**对已发生事实的描述**。不要从本文推断"项目是否可以继续开发"——
 > 那个问题由 `docs/TODO.md` 和 `AGENTS.md` §0 回答。
 
+## B5 控制台后端 API（2026-09-11）
+
+**改动**：新增 `internal/control/console.go`（路由、授权中间件、账号与明细读端点）、
+`console_auth.go`（运营 token 与身份模型）、`console_billing.go`（钱包、充值、单价、对账）、
+`console_held.go`（held 托盘与裁定）、`internal/detail/query.go`（明读取侧，绑定参数）、
+`migrations/008_billing_resolutions.sql`（裁定审计表）。
+改动既有文件：`internal/control/run.go`（Config 增 `ConsoleToken`/`ConsoleAddr`，起第二个 listener）、
+`internal/control/billing_job.go`（抽出 `newBillingRunIDPrefixed`，供人工计费行复用 run id 约定）、
+`internal/detail/sink.go`（`execIntoParams`，ClickHouse 绑定参数）、
+`configs/alerts/gateway-platform.rules.yml`（新增 `gateway-platform-console` 组，
+并更新 B4.3 held 告警的 runbook 指向已存在的处置入口）。
+决策记录见 `docs/B5-CONSOLE.md`。
+
+**本轮执行（命令与结果）**
+
+```
+$ go build ./... && go vet ./...            # 通过
+$ gofmt -l .                                # 本轮新增/改动的文件均无输出
+internal/control/health.go                  # 先于本轮（A9，b826df3），注释缩进，未改
+cmd/new-api-migrate/main_test.go            # 先于本轮，注释缩进，未改
+$ source configs/test-infra/test.env && go test -count=1 -p 1 ./internal/detail/
+ok  github.com/elucid/gateway-platform/internal/detail  0.388s
+$ source configs/test-infra/test.env && go test -count=1 -p 1 -run 'TestConsole|TestHeldReason|TestWalletBlocked|TestOperator' ./internal/control/
+ok  github.com/elucid/gateway-platform/internal/control  (连跑 4 次，均 ok)
+$ go test -race -count=1 ./pkg/contracts ./internal/detail/...
+ok  github.com/elucid/gateway-platform/pkg/contracts  1.023s
+ok  github.com/elucid/gateway-platform/internal/detail 1.053s
+$ go test -count=1 ./internal/observability/   # 告警规则一致性（规则引用的指标必须真实存在）
+ok  github.com/elucid/gateway-platform/internal/observability  0.063s
+```
+
+**跑通的新用例（真实 PostgreSQL 与真实 ClickHouse，非 fixture）**
+
+- `TestConsoleResolveHeldBillsARowAndReconciles` —— held 行按 `bill` 裁定后：钱包扣款
+  0.033000000000、ledger 行转 `billed` 且携带与钱包扣款**同一个** `billing_run_id`、
+  `billing_resolutions` 留下带 operator 的裁定，且 **B4.5 三方对账仍然 `Balanced()`**。
+- `TestConsoleResolveHeldWritesOffWithoutMovingMoney` —— `write_off` 转 `not_billable` 且
+  `billed_amount` 为 NULL、余额不变。
+- `TestConsoleResolveHeldWithoutAPriceBecomesUnpriced` —— 无生效单价时 `bill` 落到终态
+  `unpriced`、不动钱、响应里 `outcome` 如实回报。
+- `TestConsoleResolveHeldZeroAmountWritesNoJournalEntry` —— 零金额结算写 0 条流水，对账仍平衡。
+- `TestConsoleResolveHeldIsNotRepeatable` / `SeparatesNotFoundFromConflict` —— 重复裁定 409、
+  未知 event 404、裁定表只有一行。
+- `TestConsoleTopupIsIdempotent` —— 同一 id 重放返回原始流水、余额只加一次、
+  操作者与备注进入 `wallet_transactions.note`。
+- `TestConsoleWalletReportsTheSameBlockedVerdict` / `WalletWithNoRowIsNotBlocked` ——
+  控制台的 `blocked` 与 B4.4 的发布口径一致（含"无钱包行的租户永不被拦"）。
+- `TestConsolePriceInsertAppendsAndCannotRewriteHistory` —— 插入成功、
+  同 `(provider,model,effective_from)` 冲突 409、**触发器仍然拒绝 UPDATE**（控制台不是改价的后门）。
+- `TestConsoleHeldTrayListsRowsWithTheirReason` —— 托盘返回 token 计数与 `held_because` 解释。
+- `TestConsoleRequestLogReadsDetail` —— 端到端读 ClickHouse；"无匹配"是空列表 200，
+  与"未配置明细"的 503 可区分。
+- `TestConsoleRequestLogBindsTheTenantFilter` —— 租户名含引号与 `DROP TABLE`：返回零行、
+  不报错、表仍在。
+- 无依赖与鉴权面（无需 PG）：`TestConsoleRefusesEverythingWhenDisabled`（无 token 全 401）、
+  `TestConsoleAuthorizesEveryRoute`（10 条路由逐一验证 401）、
+  `TestConsoleRejectsWrongOrMalformedTokens`（8 种畸形头）、
+  `TestOperatorHeaderIsNotAuthorization`（`X-Operator` 不参与授权）、
+  `TestConsoleRejectsMalformedBodies`（未知字段 / 双文档 / 非法 decision 均 400）、
+  `TestConsoleTopupValidatesBeforeTouchingTheDatabase`、
+  `TestConsoleReconcileRequiresAnExplicitWindow`、`TestConsolePriceRejectsRetroactiveEffect`。
+- `TestRecordColumnsMatchTheStruct` —— 明细读取侧的 SELECT 列表由 `Record` 的 json tag 推导，
+  两者不可能漂移。
+
+**明确未由本轮证实**
+
+1. **未接真实前端，也未做真实人工流程演练。** 所有端点由 `httptest` 驱动，
+   没有浏览器、没有运营真人操作。
+2. **运营 token 的强度与分发未做任何工程保证**：它是环境变量里的一个字符串，
+   没有轮换、没有过期、没有台账。这是 §2 的取舍，不是遗漏，但**不能**读作"运营鉴权已完成"。
+3. **没有速率限制、没有并发保护、没有分页游标。** 控制台的假设调用方是运营而非客户端。
+4. **控制台端点未做真实流量校准**，与仓库既有常量同一口径。
+5. **账号的人工操作（封禁/解封、清冷却、清 `excluded_models`）仍只读**，本轮未做。
+6. 明细查询只返回行、不做求和；**没有**做"明细 vs 账"的交叉核对（A12 的遗留项仍在）。
+
+**本轮发现的历史问题（未修，不属 B5 范围）**
+
+`internal/control` 的 `TestBillingJobSettlesLedgerRowsAndWalletInOneTransaction` 存在
+**先于本轮**的偶发失败：全量跑时 `B4.3 buckets = held 2, not billable 2`（期望 not billable 1）。
+已在**未含本轮改动的 HEAD**（`git stash -u` 后）复现，确认与本轮改动无关；
+单独跑该测试必过，与其它用例同跑时偶发。疑似共享测试库中 `billing_state='pending'` 的
+遗留行被计入同一窗口。按 AGENTS.md「发现范围外的问题只陈述一次、不顺手修」，本轮不改动它。
+
 ## C6 codex 端点是否需每请求 PoW/turnstile（no-cred 部分）（2026-09-11）
 
 **改动**：纯文档轮，**零代码改动、零契约改动**。

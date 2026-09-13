@@ -427,9 +427,24 @@ func (j BillingJob) closeRun(ctx context.Context, result BillingRunResult, statu
 }
 
 func newBillingRunID() string {
-	var random [12]byte
-	if _, err := rand.Read(random[:]); err == nil {
-		return "bill-" + hex.EncodeToString(random[:])
+	id, err := newBillingRunIDPrefixed("bill")
+	if err != nil {
+		// Only reached if the system entropy source fails, in which case a
+		// timestamp still gives a unique-enough id for a run's journal rows.
+		return fmt.Sprintf("bill-%d", time.Now().UnixNano())
 	}
-	return fmt.Sprintf("bill-%d", time.Now().UnixNano())
+	return id
+}
+
+// newBillingRunIDPrefixed builds a run id under a caller-chosen prefix. The
+// console uses it for the synthetic run a manually billed held row carries, so
+// that row's run id is recognisable in a journal while still working as an
+// ordinary run id everywhere B4.5 reconciles (it groups by this column and
+// compares the group's ledger total to the wallet debit carrying the same id).
+func newBillingRunIDPrefixed(prefix string) (string, error) {
+	var random [12]byte
+	if _, err := rand.Read(random[:]); err != nil {
+		return "", fmt.Errorf("generate %s id: %w", prefix, err)
+	}
+	return prefix + "-" + hex.EncodeToString(random[:]), nil
 }

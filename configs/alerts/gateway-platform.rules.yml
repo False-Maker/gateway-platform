@@ -201,9 +201,11 @@ groups:
           summary: "有 {{ $value }} 条账目挂起待人工（usage_source={{ $labels.usage_source }}）"
           description: >-
             B4.3 决定"请求成功但 usage 完全丢失"的账目挂起待人工。
-            held 行不会自己消失——**目前也还没有人工处理的入口**（见 TODO 未决项），
-            所以这条告警是它当前唯一的可见性。
-          runbook: "docs/B4-BILLING-MODEL.md"
+            held 行不会自己消失，处置入口是控制台的 held 托盘
+            （`GET /v1/billing/held` 与 `POST /v1/billing/held/{event_id}/resolve`，
+            见 docs/B5-CONSOLE.md §4.1）：`bill` 按 occurred_at 当时的单价计费，
+            `write_off` 判定为零。B5 之前这条告警是它唯一的可见性。
+          runbook: "docs/B5-CONSOLE.md §4.1；docs/B4-BILLING-MODEL.md"
           threshold_source: >-
             由 B4.3 的语义推出：held 的定义就是"需要人来看"，可容忍存量为 0。
             for=30m 只是给扣费作业一个自然周期，未经校准。
@@ -286,3 +288,65 @@ groups:
             未经真实流量校准——这条告警响了，说明该回调它们了。
           threshold_source: >-
             uncalibrated，且这条规则的**用途之一就是产出校准数据**。
+
+  # =========================================================================
+  # 控制台（B5）—— 运营面的异常有两个方向，都得看得见：
+  # 一是"有人在敲门"（鉴权拒绝），二是"有人在动钱"（写操作）。
+  # 两者都不是客户端流量，误报代价低，但静默的代价高——运营在动钱这件事
+  # 本身就该留下可查的痕迹。
+  # =========================================================================
+  - name: gateway-platform-console
+    rules:
+      - alert: ConsoleAuthRejections
+        expr: increase(control_console_rejected_total[15m]) > 5
+        for: 10m
+        labels:
+          severity: warning
+          scope: console
+        annotations:
+          summary: "控制台持续收到未通过鉴权的请求（{{ $labels.path }}）"
+          description: >-
+            控制台只对持有运营 token 的调用方开放。持续被拒意味着有人在扫，
+            或者某处的运营凭据配错了——两种都值得看一眼。
+            注意：`GATEWAY_CONSOLE_TOKEN` 未配置时控制台整体不启动，
+            所以这条规则响**不**是配置缺失导致的。
+          runbook: "docs/B5-CONSOLE.md §2"
+          threshold_source: >-
+            uncalibrated。>5 次 / 15m 只是把"偶发手误"与"持续尝试"分开的起始值；
+            真实值取决于控制台是否被暴露在可达网络上。
+
+      - alert: ConsoleWalletTopUp
+        expr: increase(control_console_topup_total[5m]) > 0
+        for: 0m
+        labels:
+          severity: info
+          scope: console
+        annotations:
+          summary: "有运营正在给租户钱包充值"
+          description: >-
+            充值会直接改变某个租户的可服务状态（B4.4 的余额门槛），
+            因此是值得留痕的动作。流水与操作者记录在 `wallet_transactions` 的 note
+            与 `billing_resolutions.operator`；这条规则只是"发生了"的即时可见性。
+            列为 info：正常运营动作，不是故障。
+          runbook: "docs/B5-CONSOLE.md §4.2"
+          threshold_source: >-
+            取 >0 且 for=0m 由这条规则的**用途**推出：它是审计信号而不是故障信号，
+            延迟一分钟看见它没有意义，所以不设 for。次数阈值本身不存在，故无需校准。
+
+      - alert: ConsoleHeldUnpricedResolution
+        expr: increase(control_console_held_unpriced_total[1h]) > 0
+        for: 0m
+        labels:
+          severity: warning
+          scope: billing
+        annotations:
+          summary: "人工裁定计费的 held 行里，有行落到了 unpriced"
+          description: >-
+            运营要求按单价计费，但该行 `occurred_at` 时无生效单价（D3 禁止倒填），
+            因此终态是 `unpriced` 而非 `billed`——**这笔收入没有收到，且不可能自动收到**，
+            只能靠显式钱包调整修正。托盘在"清空"，但收入没有跟上，这条规则就是
+            用来区分这两种"托盘在缩小"的。
+          runbook: "docs/B5-CONSOLE.md §4.1"
+          threshold_source: >-
+            取 >0 由 unpriced 的**语义**推出：它的定义就是"我们的定价配置有缺口"，
+            可容忍存量为 0，与 held 桶同一口径；数值本身无待校准的余量。

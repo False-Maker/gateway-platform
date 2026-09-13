@@ -30,7 +30,12 @@
 > `E2 wrapper 其余 executor（no-cred 部分）` 2026-09-11 完成。
 > ~~下一步在 `B5 控制台` 与 `C6(no-cred 部分)` 之间取。~~
 >
-> 下一步：`B5 控制台`（并行项已清空；C6 只剩 live-gate）。
+> `B5 控制台（后端 API）` 2026-09-11 完成，见 `docs/B5-CONSOLE.md`。**§B 到此闭合。**
+> `held` 人工处理入口（B4.3/B4.5/E1 三处遗留）、充值入口与单价录入入口（B4.1 遗留）一并闭合。
+>
+> 下一步：`§A`、`§B`、`§E` 的全部 `[no-cred]` 条目已清空，剩余的是 §C 的 `[live-gate]`
+> 与 §D 的部署边界。按 AGENTS.md §0，取任务规则见该节；`§B` 之后没有继承它的 `[no-cred]` 待办，
+> 但这**不等于**项目停机——§C/§D 各条的当前状态见其正文。
 > A12/E1/E2 不阻塞 B4，可并行取。P4（B4）在 A11 之前不进入编码——迁移来的用户还停在 staging，没有可扣费主体。
 
 ---
@@ -372,8 +377,8 @@ tenants / principals / tenant_tokens；摘要新增 `tenant_count` / `principal_
     钱包余额为精确十进制，**不经 `float64`**（沿用 B3 已建立的 `contracts.Decimal` 口径）；
     重复应用 migration 幂等。
     **本轮未做**：未写入任何真实单价数值（业务定价，非工程决策）；
-    new-api quota 整数单位 ↔ 货币金额的换算比例**仍未核对**（B4-BILLING-MODEL D4 的遗留项），
-    充值入口留在 B5。
+    new-api quota 整数单位 ↔ 货币金额的换算比例**仍未核对**（B4-BILLING-MODEL D4 的遗留项）。
+    充值入口与单价录入入口**已由 B5 闭合**（2026-09-11）。
 
   - **B4.2** `[no-cred]` 从 `usage_ledger` 到扣费的慢路径作业。
     **状态：已完成（2026-09-11）。** `migrations/006_usage_billing.sql`（`usage_ledger` 加
@@ -438,14 +443,31 @@ tenants / principals / tenant_tokens；摘要新增 `tenant_count` / `principal_
     `missing_wallet`），能归因到请求的都带 `EventIDs`。
     **DoD**：给定一段时间窗，能对齐 ledger 行数、扣费总额、钱包变动三者；差额可解释到具体
     `event_id`；对账本身只读，不修数据。
-    **本轮未做**：只提供库内 API，没有 CLI/HTTP 入口，也没有定时运行与指标（告警仍属 E1）；
+    **本轮未做**：没有定时运行与指标（告警仍属 E1）；按需查询的入口**已由 B5 闭合**
+    （`GET /v1/billing/reconcile`，2026-09-11）；
     只比较金额，不重算单价（不做"应收 vs 实收"的重新定价核对）；
     不校验 `wallet_transactions.balance_after` 的逐行链条（同 `created_at` 的顺序不唯一，
     会造假阳性），只用与顺序无关的"余额 == 流水求和"这一恒等式；
-    `held` 的人工处理入口仍未做（B4.3 遗留）；`estimated` 仍无生产者；
+    `held` 的人工处理入口**已由 B5 闭合**（2026-09-11）；`estimated` 仍无生产者；
     new-api quota 整数单位 ↔ 货币金额的换算比例**仍未核对**（B4-BILLING-MODEL D4 的遗留项）。
 
-- **B5** P6 范围：控制台。
+- **B5** P6 范围：控制台。**本轮交付后端 API，不含前端界面**（理由与取舍见 `docs/B5-CONSOLE.md` §1）。
+  **状态：后端 API 已完成（2026-09-11）。** 证据见 `docs/EVIDENCE.md` 同名小节。
+  新增 `internal/control/console{,_auth,_billing,_held}.go`、`internal/detail/query.go`、
+  `migrations/008_billing_resolutions.sql`；控制面首次有了 HTTP 表面（此前只有 metrics server）。
+  **DoD**：§6.5 预埋的三处钩子（账号健康 / 用量对账 / 实时请求日志）各有可调用的端点；
+  控制面鉴权与租户凭据**分离**，未配置 token 时控制台整体关闭而非无鉴权开放；
+  三个写操作（held 裁定 / 充值 / 单价录入）各自与账目在同一事务内落盘，且**各自关闭一处
+  此前被显式记录为"没有入口"的缺口**；人工计费行在 B4.5 对账下仍然平衡。
+  结论摘要：端点见 `docs/B5-CONSOLE.md` §3；身份决策（**不复用租户 token**，也不加运营标记）
+  见 §2，含两个被否决选项；`bill` 在无单价时落到终态 `unpriced` 而非拒绝或按零（§4.1）；
+  明细查询全部走 ClickHouse 绑定参数、只返回行不做求和（§5）。
+  **本轮未做**：前端界面（§1）；运营者目录 / 真实 RBAC——`X-Operator` 只是审计归属，
+  **不参与授权**，见 §2；账号的人工操作（封禁、清冷却、清 `excluded_models`）仍只读（§6）；
+  对账的定时运行与指标仍属 B4.5 遗留；列表无游标分页；控制台无速率限制；
+  控制台端点的**无真实流量校准**（与仓库现有常量同一口径）。
+  `held` 的人工处理入口**到此闭合**（B4.3/B4.5/E1 三处记录的缺口）。
+  充值入口**到此闭合**（B4.1 遗留）。单价录入入口**到此闭合**（B4.1 只交付了表与触发器，没有写入方）。
 
 ---
 

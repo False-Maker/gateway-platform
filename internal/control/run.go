@@ -35,6 +35,15 @@ type Config struct {
 	DetailClickHouseURL string
 	DetailDatabase      string
 	DetailTable         string
+
+	// ConsoleToken enables B5's operator API. Empty means no console at all:
+	// the role simply does not serve those routes, so a missing token cannot
+	// become an unauthenticated console.
+	ConsoleToken string
+	// ConsoleAddr defaults to loopback. It is a separate listener from the
+	// metrics server, which has no authentication and must not acquire a
+	// privileged neighbour on the same port.
+	ConsoleAddr string
 }
 
 func ConfigFromEnv() Config {
@@ -51,6 +60,8 @@ func ConfigFromEnv() Config {
 		DetailClickHouseURL:     os.Getenv("GATEWAY_DETAIL_CLICKHOUSE_URL"),
 		DetailDatabase:          getenv("GATEWAY_DETAIL_DATABASE", detail.DefaultDatabase),
 		DetailTable:             getenv("GATEWAY_DETAIL_TABLE", detail.DefaultTable),
+		ConsoleToken:            os.Getenv(ConsoleTokenEnv),
+		ConsoleAddr:             getenv(ConsoleAddrEnv, defaultConsoleAddr),
 	}
 }
 
@@ -93,19 +104,19 @@ func Run(cfg Config) error {
 	// purpose -- a control plane that refuses to boot because the detail store
 	// is down would have made metering depend on detail, which is precisely
 	// what this package is built to prevent.
+	detailWriter := detail.ClickHouseWriter{
+		URL:      cfg.DetailClickHouseURL,
+		Database: cfg.DetailDatabase,
+		Table:    cfg.DetailTable,
+	}
 	if cfg.DetailClickHouseURL != "" {
-		writer := detail.ClickHouseWriter{
-			URL:      cfg.DetailClickHouseURL,
-			Database: cfg.DetailDatabase,
-			Table:    cfg.DetailTable,
-		}
 		schemaCtx, cancelSchema := context.WithTimeout(ctx, 30*time.Second)
-		err := writer.EnsureSchema(schemaCtx)
+		err := detailWriter.EnsureSchema(schemaCtx)
 		cancelSchema()
 		if err != nil {
 			log.Printf("control detail schema unavailable, running without request detail: %v", err)
 		} else {
-			sink := &detail.Sink{Writer: writer, Metrics: observability.Default}
+			sink := &detail.Sink{Writer: detailWriter, Metrics: observability.Default}
 			sink.Start()
 			defer sink.Stop()
 			ledger.Detail = sink
@@ -152,6 +163,19 @@ func Run(cfg Config) error {
 	go func() {
 		metricsErr <- http.ListenAndServe(cfg.MetricsAddr, observability.Default)
 	}()
+	// B5: the operator API is a separate listener with its own credential. It
+	// is off unless a token was configured, and its failure takes the role down
+	// the same way the metrics server's does -- silently serving without the
+	// console would leave an operator believing a held backlog was empty.
+	if cfg.ConsoleToken != "" {
+		console := Console{Auth: ConsoleAuth{Token: cfg.ConsoleToken}, DB: db, Detail: detailWriter}
+		log.Printf("control console listening on %s", cfg.ConsoleAddr)
+		go func() {
+			metricsErr <- http.ListenAndServe(cfg.ConsoleAddr, console.Handler())
+		}()
+	} else {
+		log.Printf("control console disabled: %s is not set", ConsoleTokenEnv)
+	}
 	for {
 		if err := consumer.RunOnce(ctx); err != nil {
 			log.Printf("control consumer iteration failed: %v", err)

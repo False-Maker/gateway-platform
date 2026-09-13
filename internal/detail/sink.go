@@ -258,6 +258,13 @@ func (w ClickHouseWriter) exec(ctx context.Context, query string, body io.Reader
 // execInto runs a statement and copies the response body to out. Reads (as
 // opposed to inserts) go through here.
 func (w ClickHouseWriter) execInto(ctx context.Context, query string, body io.Reader, out io.Writer) error {
+	return w.execIntoParams(ctx, query, nil, body, out)
+}
+
+// execIntoParams is execInto with bound parameters. ClickHouse binds `{name:Type}`
+// placeholders from `param_<name>` query parameters, which is what lets the
+// console filter by tenant and window without ever splicing a value into SQL.
+func (w ClickHouseWriter) execIntoParams(ctx context.Context, query string, values url.Values, body io.Reader, out io.Writer) error {
 	if strings.TrimSpace(w.URL) == "" {
 		return errors.New("clickhouse url is empty")
 	}
@@ -269,6 +276,12 @@ func (w ClickHouseWriter) execInto(ctx context.Context, query string, body io.Re
 	endpoint.User = nil
 	parameters := endpoint.Query()
 	parameters.Set("query", query)
+	for name, value := range values {
+		if len(value) == 0 {
+			continue
+		}
+		parameters.Set("param_"+name, value[0])
+	}
 	endpoint.RawQuery = parameters.Encode()
 
 	if body == nil {
