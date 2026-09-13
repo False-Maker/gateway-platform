@@ -7,6 +7,80 @@
 > 阅读规则：本文的每一条都是**对已发生事实的描述**。不要从本文推断"项目是否可以继续开发"——
 > 那个问题由 `docs/TODO.md` 和 `AGENTS.md` §0 回答。
 
+## 真实基础设施集成测试复跑（2026-09-13）
+
+**改动**：**零代码改动。**本轮只跑测试并记录结果。
+
+**动机**：B5 与 A13 都从未在真实基础设施上被**本人**跑过——B5 那轮的「真实 PostgreSQL 与真实
+ClickHouse」是上一轮的历史证据，A13 的快照闸门只在 miniredis + 内存 repository 下验证过。
+而这两轮的验收结论都建立在 `go test` 上。
+
+**环境**
+
+```
+$ docker version --format '{{.Server.Version}}'      # 29.4.0
+$ docker compose -f configs/test-infra/docker-compose.yml up -d
+  gateway-test-pg / gateway-test-redis / gateway-test-clickhouse 均 healthy
+$ source configs/test-infra/test.env
+```
+
+PostgreSQL 16-alpine、Redis 7.0.15-alpine（带 ACL）、ClickHouse 24.8-alpine。
+
+**本轮执行（命令与结果）**
+
+```
+$ go test -count=1 -p 1 ./...        # 连跑 5 次
+  第 1 次：FAIL  —— internal/control: TestConsoleRequestLogReadsDetail
+  第 2-5 次：全部通过（EXIT=0）
+$ go test -race -count=1 -p 1 ./pkg/contracts ./internal/control/...
+  全部通过（RACE_EXIT=0）
+```
+
+**确认为真实跑通的（真 PG / 真 Redis / 真 ClickHouse）**
+
+- A13 的快照闸门首次在真实 PostgreSQL 下执行，日志可见：
+  `control excluded 1 account(s) of provider "provider-that-was-never-registered" from
+  snapshot codex/default: no usage_integrity declared (overview §6.2)`。
+- B5 控制台的 PG 与 ClickHouse 用例、B4.x 计费与对账、A4 进程级 e2e、wrapper 进程用例、
+  events DLQ/reclaim、真实 Redis ACL 等在 4 次全量中通过。
+
+**本轮发现：`TestConsoleRequestLogReadsDetail` 是有竞态的测试（测试缺陷，非产品缺陷）**
+
+失败现象：`got 0 detail rows, want 1`。隔离单跑连续 3 次均通过，全量跑 5 次中失败 1 次。
+
+根因**已由直接实验证明**，不是推断：
+
+```
+$ 用测试同款 2022-03-07 时间戳插一行
+  插入后立即查                : 1
+  OPTIMIZE TABLE ... FINAL 后 : 0      ← 行被 TTL 清掉
+$ 对照，用 now() 时间戳插一行
+  OPTIMIZE TABLE ... FINAL 后 : 1      ← 仍在
+```
+
+`internal/detail/schema.go:141` 的建表语句是 `TTL toDateTime(occurred_at) + INTERVAL 30 DAY`，
+而 `console_integration_test.go:30` 的 `b5OccurredAt = 2022-03-07` **写进去的那一刻就已过期四年半**。
+ClickHouse 在后台 merge 时应用 TTL，所以该行能否被读到取决于「写入到读取之间有没有发生 merge」——
+隔离跑来不及 merge 故必过，全量跑时其它用例的写入触发 merge 故偶尔失败。
+
+**产品侧 TTL 按设计工作**，A12 的保留策略没有问题。受影响的只有 B5 的两处 fixture 常量
+（`console_integration_test.go:30` 与 `:603` 的同一字面量）；`internal/detail` 的 fixture 用
+2026-09-11，在 30 天窗口内，因此不受影响；`billing_reconcile_integration_test.go` 的 2021 年
+日期落在 PG 上，无 TTL，同样不受影响。
+
+按 AGENTS.md §6「发现范围外的问题，在报告里说一次，不自行修复」，**本轮未修**。
+
+**明确未由本轮证实**
+
+1. **此前记录的 `TestBillingJobSettlesLedgerRowsAndWalletInOneTransaction` 偶发失败，
+   本轮 5 次全量一次都没复现。** 既不能据此认为它已消失，也不能据此认为它仍然存在——
+   本轮对该条目**没有结论**。
+2. **单机单实例**：ClickHouse 无集群/副本/备份，Redis 无 HA 拓扑，PG 无主备。D2/D3 仍是部署边界。
+3. 所有 provider 交互仍走本地 fixture；**没有任何真实上游请求**（§C live-gate 未动）。
+4. 未做负载、并发或长时间稳定性测试；5 次全量只是同一环境下的重复，不构成流量校准。
+5. ClickHouse 的 `OPTIMIZE TABLE ... FINAL` 是本轮为定位问题而手工执行的**诊断操作**，
+   生产路径不会执行它。
+
 ## A13 每上游 `usage_integrity` 策略（2026-09-13）
 
 **改动**：`pkg/contracts/contracts.go`（`UsageIntegrity` 类型与三个取值、`Account`/`Lease` 新字段、
@@ -187,6 +261,9 @@ ok  github.com/elucid/gateway-platform/internal/observability  0.063s
 - `TestConsoleHeldTrayListsRowsWithTheirReason` —— 托盘返回 token 计数与 `held_because` 解释。
 - `TestConsoleRequestLogReadsDetail` —— 端到端读 ClickHouse；"无匹配"是空列表 200，
   与"未配置明细"的 503 可区分。
+  **后续更正（2026-09-13）**：该用例的 fixture 时间戳早于表的 30 天 TTL，因此**有竞态**，
+  全量跑时会偶发失败。详见本文"真实基础设施集成测试复跑"一节，那里有直接实验证据。
+  这不影响 B5 端点本身的正确性，但本条"跑通"应读作"该次运行通过"，不是"稳定通过"。
 - `TestConsoleRequestLogBindsTheTenantFilter` —— 租户名含引号与 `DROP TABLE`：返回零行、
   不报错、表仍在。
 - 无依赖与鉴权面（无需 PG）：`TestConsoleRefusesEverythingWhenDisabled`（无 token 全 401）、
