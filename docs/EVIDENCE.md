@@ -7,6 +7,65 @@
 > 阅读规则：本文的每一条都是**对已发生事实的描述**。不要从本文推断"项目是否可以继续开发"——
 > 那个问题由 `docs/TODO.md` 和 `AGENTS.md` §0 回答。
 
+## B4.6 new-api `QuotaPerUnit` 换算比例的读取（2026-09-14）
+
+**改动**：`internal/migration/newapi/types.go`（`SourceQuotaPerUnit`，进 `SourceSnapshot` 与 `Summary`）、
+`internal/migration/newapi/source.go`（`loadQuotaPerUnit` + 六个 reason 常量）、
+`internal/migration/newapi/plan.go`（把比例带进 summary）。
+**无 migration、无契约改动、无扣费逻辑改动。**
+
+**这条为什么拖到现在**
+
+它在 `docs/B4-BILLING-MODEL.md` D4 被写明是 **B4.1 的硬输入**，却在 B4.1–B4.5 五条的
+"本轮未做"里**重复出现五次而从未获得编号**。扫编号清单的 agent 看不见"本轮未做"段落里的东西，
+于是它安然活过了第三、第四次复盘。**这是继 A11–A14 之后的第二类漏网机制**：
+前者是"设计文档要求但从未进清单"，本条是"进过文档、反复记录，但从未编号"。
+
+**核实了什么（对 new-api 源码，非对真实部署）**
+
+- `common/constants.go:22`：`var QuotaPerUnit = 500 * 1000.0`，带注释 `$0.002 / 1K tokens`。
+- `model/option.go:159` 把它写进 `OptionMap`，`model/option.go:597-598` 在读取 options 时
+  用 `options` 表的值 `ParseFloat` **覆盖**它。
+- 结论：**编译期的 500000 只是初值，不是任何部署的实际比例。**
+  只有该部署 `options` 表里的 `QuotaPerUnit` 行才是答案。这恰好印证了 D4 当初
+  "不得按默认值假定"的判断——本轮把它从一句约定变成了代码强制。
+
+**本轮执行（命令与结果）**
+
+```
+$ go build ./... && go vet ./...                       # 通过
+$ gofmt -l internal cmd pkg                            # 本轮文件无输出
+$ docker compose -f configs/test-infra/docker-compose.yml up -d
+$ source configs/test-infra/test.env
+$ go test -count=1 -run 'QuotaPerUnit|LoadSnapshot' ./internal/migration/newapi/   # ok
+$ go test -count=1 -p 1 ./...                          # 全绿（真实 PG/Redis/ClickHouse）
+```
+
+**跑通的新用例**
+
+- `TestLoadSnapshotReadsAllSourceTablesAndPreservesRawValues` 扩展：fixture 的 options 行
+  刻意写 **250000 而非 500000**——若有人日后把默认值硬编码进来，该断言会红。
+- `TestLoadSnapshotNeverSubstitutesTheDefaultQuotaPerUnit`，六个子用例覆盖六种"没有"：
+  options 表不存在 / 无 key-value 列 / 无该行 / 值为空白 / 值非十进制（`500,000`）/ 值为 `0`。
+  每个都断言三件事：`Found==false`、`Value` 保持**空串**（不是 500000 也不是 0）、
+  原始值仍进审计记录。并断言缺失原因**进到 `plan.Summary`**——dry-run 审阅者读的是摘要，不是结构体。
+
+**测试经反向验证**：临时把"无该行"分支改成返回 `{Value:"500000", Found:true}`，
+子用例 `no_QuotaPerUnit_row` 立即报
+`QuotaPerUnit reported as found: {Raw: Value:500000 Found:true Reason:}`，随即还原。
+确认这组测试真的在挡"偷偷补默认值"这一种失效。
+
+**明确未由本轮证实**
+
+1. **真实 new-api 部署的取值仍未读到。** 全部由本地合成 schema 驱动，
+   `GATEWAY_NEW_API_DATABASE_URL` 未指向任何真实库。剩余部分需要的不是 provider 凭据，
+   而是**生产 new-api 库的只读访问**，属 `[live-gate]`。
+2. **本轮没有执行任何换算。** 只把比例读出来并记录；A11 的"quota / balance 只保留 source unit
+   与原始值"仍然成立，`PlannedTenant` 依旧不带 quota / balance。
+   把 balance 变成钱包余额是另一条路径，**有意未做**——它应当在拿到真实取值之后再写。
+3. 上面对 new-api 源码的核实基于本机 `~/projects/new-api` 工作副本，
+   **未核对该副本与目标部署所运行版本是否一致**。
+
 ## 文档漂移复核（2026-09-14，A14 之后）
 
 **改动**：**零代码改动、零契约改动。**仅 `keyhive/docs/architecture.md`「平台级速率告警」一条。

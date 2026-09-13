@@ -79,6 +79,11 @@ func TestLoadSnapshotReadsAllSourceTablesAndPreservesRawValues(t *testing.T) {
 		`INSERT INTO {schema}.quota_data VALUES (21, 3, 'claude-3', 1757000000, 17, 2, 340, 'default')`,
 		`CREATE TABLE {schema}.groups (id TEXT PRIMARY KEY, name TEXT, status TEXT)`,
 		`INSERT INTO {schema}.groups VALUES ('g1', 'default', 'enabled')`,
+		// Deliberately not 500000: a deployment that overrode new-api's default
+		// is exactly the case the loader exists to catch, so the fixture must
+		// not be able to pass by accident if someone hardcodes the default.
+		`CREATE TABLE {schema}.options (key TEXT PRIMARY KEY, value TEXT)`,
+		`INSERT INTO {schema}.options VALUES ('QuotaPerUnit', '250000'), ('SomethingElse', '1')`,
 	)
 
 	snapshot, err := LoadSnapshot(ctx, db, schema)
@@ -128,6 +133,115 @@ func TestLoadSnapshotReadsAllSourceTablesAndPreservesRawValues(t *testing.T) {
 	}
 	if snapshot.CapturedAt.IsZero() {
 		t.Error("CapturedAt was not stamped")
+	}
+	if !snapshot.QuotaPerUnit.Found {
+		t.Fatalf("QuotaPerUnit was not read: %+v", snapshot.QuotaPerUnit)
+	}
+	if snapshot.QuotaPerUnit.Value != "250000" {
+		t.Errorf("QuotaPerUnit = %q, want the deployment's 250000 and not new-api's 500000 default", snapshot.QuotaPerUnit.Value)
+	}
+}
+
+// The ratio decides what a migrated balance is worth, so every way of not
+// having it must arrive as missing rather than as new-api's compiled-in
+// 500000. A wrong-but-plausible ratio is undetectable downstream: the wallet
+// would simply hold the wrong amount of money.
+func TestLoadSnapshotNeverSubstitutesTheDefaultQuotaPerUnit(t *testing.T) {
+	ctx, db := openSourceTestPool(t)
+	for _, tc := range []struct {
+		name       string
+		schemaName string
+		statements []string
+		wantReason string
+		wantRaw    string
+	}{
+		{
+			name:       "options table absent",
+			schemaName: "newapi_src_qpu_notable",
+			wantReason: quotaPerUnitOptionsTableAbsent,
+		},
+		{
+			name:       "options table has no key/value columns",
+			schemaName: "newapi_src_qpu_nocols",
+			statements: []string{`CREATE TABLE {schema}.options (name TEXT PRIMARY KEY, setting TEXT)`},
+			wantReason: quotaPerUnitColumnsAbsent,
+		},
+		{
+			name:       "no QuotaPerUnit row",
+			schemaName: "newapi_src_qpu_norow",
+			statements: []string{
+				`CREATE TABLE {schema}.options (key TEXT PRIMARY KEY, value TEXT)`,
+				`INSERT INTO {schema}.options VALUES ('SomethingElse', '1')`,
+			},
+			wantReason: quotaPerUnitRowAbsent,
+		},
+		{
+			name:       "empty value",
+			schemaName: "newapi_src_qpu_empty",
+			statements: []string{
+				`CREATE TABLE {schema}.options (key TEXT PRIMARY KEY, value TEXT)`,
+				`INSERT INTO {schema}.options VALUES ('QuotaPerUnit', '   ')`,
+			},
+			wantReason: quotaPerUnitEmpty,
+			wantRaw:    "   ",
+		},
+		{
+			name:       "not a decimal",
+			schemaName: "newapi_src_qpu_bad",
+			statements: []string{
+				`CREATE TABLE {schema}.options (key TEXT PRIMARY KEY, value TEXT)`,
+				`INSERT INTO {schema}.options VALUES ('QuotaPerUnit', '500,000')`,
+			},
+			wantReason: quotaPerUnitUnparsable,
+			wantRaw:    "500,000",
+		},
+		{
+			name:       "zero would divide by zero downstream",
+			schemaName: "newapi_src_qpu_zero",
+			statements: []string{
+				`CREATE TABLE {schema}.options (key TEXT PRIMARY KEY, value TEXT)`,
+				`INSERT INTO {schema}.options VALUES ('QuotaPerUnit', '0')`,
+			},
+			wantReason: quotaPerUnitNotPositive,
+			wantRaw:    "0",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			statements := append([]string{
+				`CREATE TABLE {schema}.channels (id BIGINT PRIMARY KEY, type INT, key TEXT, status INT)`,
+				`INSERT INTO {schema}.channels VALUES (1, 14, 'sk-a', 1)`,
+			}, tc.statements...)
+			schema := createSourceSchema(t, ctx, db, tc.schemaName, statements...)
+
+			snapshot, err := LoadSnapshot(ctx, db, schema)
+			if err != nil {
+				t.Fatalf("a source without a usable ratio must still load: %v", err)
+			}
+			if snapshot.QuotaPerUnit.Found {
+				t.Fatalf("QuotaPerUnit reported as found: %+v", snapshot.QuotaPerUnit)
+			}
+			if snapshot.QuotaPerUnit.Value != "" {
+				t.Errorf("a missing ratio carried a value %q; it must stay empty, not 500000 and not 0", snapshot.QuotaPerUnit.Value)
+			}
+			if snapshot.QuotaPerUnit.Reason != tc.wantReason {
+				t.Errorf("reason = %q, want %q", snapshot.QuotaPerUnit.Reason, tc.wantReason)
+			}
+			if snapshot.QuotaPerUnit.Raw != tc.wantRaw {
+				t.Errorf("raw = %q, want %q kept for the audit record", snapshot.QuotaPerUnit.Raw, tc.wantRaw)
+			}
+			if !strings.Contains(strings.Join(snapshot.SchemaWarnings, "\n"), "quota_per_unit is missing") {
+				t.Errorf("no schema warning about the missing ratio: %v", snapshot.SchemaWarnings)
+			}
+
+			// A dry-run reviewer reads the summary, not the snapshot struct.
+			plan, err := BuildPlan(snapshot)
+			if err != nil {
+				t.Fatalf("BuildPlan: %v", err)
+			}
+			if plan.Summary.QuotaPerUnit.Found || plan.Summary.QuotaPerUnit.Reason != tc.wantReason {
+				t.Errorf("summary.quota_per_unit = %+v, want the same missing reason", plan.Summary.QuotaPerUnit)
+			}
+		})
 	}
 }
 

@@ -120,7 +120,9 @@ wallet_transactions(
 
 选预付还有一个迁移上的理由：new-api 的 `users.quota` / `tokens.remain_quota` 本身就是预付余量语义，A11 迁移过来时是同构映射，不需要在迁移里发明一套语义转换。
 
-> **未核实**：new-api 的 quota 整数单位与货币金额之间的换算比例（其默认配置中的 `QuotaPerUnit`）**本轮未做任何核对**。A11 的 DoD 已明确"quota / balance 仍只保留 source unit 与原始值，本任务不做任何换算"。换算比例是 B4.1 的输入，届时必须**读实际 new-api 部署的配置**确认，不得按默认值假定。
+> **~~未核实~~ → 读取路径已建（2026-09-14，B4.6）**：new-api 的 quota 整数单位与货币金额之间的换算比例（`QuotaPerUnit`）现由 `LoadSnapshot` 从**源部署的 `options` 表**读出，进 `Summary.quota_per_unit`。
+> 核实结论：`common/constants.go:22` 的 `500000` 只是编译期初值，`model/option.go:597` 启动时会用 `options` 表的行覆盖它，因此**默认值对任何部署都不是可靠答案**——这正是本条当初写"不得按默认值假定"的理由，现已由代码强制（读不到即 `Found=false` 并附原因，不补默认值、不补零）。
+> **仍未做**：真实部署的取值尚未读到（需生产 new-api 库只读访问，属 `[live-gate]`），且**本轮没有执行任何换算**——A11 的 "quota / balance 只保留 source unit 与原始值" 依然成立。
 
 **被否决的选项**
 
@@ -223,6 +225,6 @@ wallet_transactions(
 
 - 本文**未写任何代码、未建任何表、未跑任何测试**。文中所有 schema 是待实现形状。
 - 引用到的现有代码位置（`usage_ledger` 四列、`snap:auth:tokens:v1`、`TokenRecord`、15s tick、`contracts.Decimal`、A10 的 `tenants.rpm`）均在本轮**实际读取源码核对**，不是凭记忆。
-- **new-api quota 单位与货币金额的换算比例未核对**，见 D4 中的说明。这是 B4.1 的硬输入。
+- **new-api quota 单位与货币金额的换算比例**：读取路径已由 B4.6 建立（2026-09-14），见 D4 中的说明；**真实取值仍未读到**（`[live-gate]`），且尚未执行任何换算。
 - 四类 token 的**具体单价数值本文不给**——那是业务定价，不是工程决策；B4.1 只负责让它可配、可追溯、不可篡改历史。
 - 透支上界公式是**结构性推导**，未经真实流量校准。E1 的告警阈值同理，按其 DoD 必须标注为"未经真实流量校准"。

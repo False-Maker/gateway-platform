@@ -576,7 +576,7 @@ E1 也接上了规则。但 §6.3.1 规则 2 的价值是「不要一个号一�
     钱包余额为精确十进制，**不经 `float64`**（沿用 B3 已建立的 `contracts.Decimal` 口径）；
     重复应用 migration 幂等。
     **本轮未做**：未写入任何真实单价数值（业务定价，非工程决策）；
-    new-api quota 整数单位 ↔ 货币金额的换算比例**仍未核对**（B4-BILLING-MODEL D4 的遗留项）。
+    new-api quota 整数单位 ↔ 货币金额的换算比例**已由 B4.6 读取**（2026-09-14），但真实部署的取值仍未读到（`[live-gate]`）。
     充值入口与单价录入入口**已由 B5 闭合**（2026-09-11）。
 
   - **B4.2** `[no-cred]` 从 `usage_ledger` 到扣费的慢路径作业。
@@ -591,7 +591,7 @@ E1 也接上了规则。但 §6.3.1 规则 2 的价值是「不要一个号一�
     扣费与"标记 ledger 行已计费"在同一 PG 事务；作业重跑不重复扣费（幂等键覆盖到 `event_id`）。
     **本轮未做**：只对 `usage_source='upstream' AND partial=false` 的行扣费，其余一律留 `pending`
     交给 B4.3，不做隐式默认；余额扣成负数不拦（B4.4）；三方对账未做（B4.5）；
-    new-api quota 整数单位 ↔ 货币金额的换算比例**仍未核对**（B4-BILLING-MODEL D4 的遗留项）。
+    new-api quota 整数单位 ↔ 货币金额的换算比例**已由 B4.6 读取**（2026-09-14），但真实部署的取值仍未读到（`[live-gate]`）。
 
   - **B4.3** `[no-cred]` `UsageSource` 可信度口径。
     **状态：已完成（2026-09-11）。** 证据见 `docs/EVIDENCE.md` 同名小节。
@@ -609,7 +609,7 @@ E1 也接上了规则。但 §6.3.1 规则 2 的价值是「不要一个号一�
     **本轮未做**：`estimated` 仍无生产者，只留口径不造数据；`held` 的人工处理入口未做，
     只有 `control_billing_held_rows{usage_source}` 这个 gauge 和按 `usage_source` 的索引供查询；
     余额扣成负数仍不拦（B4.4）；三方对账仍未做（B4.5）；
-    new-api quota 整数单位 ↔ 货币金额的换算比例**仍未核对**（B4-BILLING-MODEL D4 的遗留项）。
+    new-api quota 整数单位 ↔ 货币金额的换算比例**已由 B4.6 读取**（2026-09-14），但真实部署的取值仍未读到（`[live-gate]`）。
 
   - **B4.4** `[no-cred]` 余额不足的执行点。
     **状态：已完成（2026-09-11）。** 证据见 `docs/EVIDENCE.md` 同名小节。
@@ -625,7 +625,7 @@ E1 也接上了规则。但 §6.3.1 规则 2 的价值是「不要一个号一�
     **本轮未做**：`rpm = 0` 的预付租户敞口无上界，只上报
     `control_billing_uncapped_wallet_tenants` gauge + log 点名，**不自动处置**，
     告警规则本身留给 E1；三方对账未做（B4.5）；
-    new-api quota 整数单位 ↔ 货币金额的换算比例**仍未核对**（B4-BILLING-MODEL D4），
+    new-api quota 整数单位 ↔ 货币金额的换算比例**已由 B4.6 读取**（2026-09-14，真实取值仍属 `[live-gate]`），
     因此"余额 ≤ 0"的绝对刻度仍未验证。
 
   - **B4.5** `[no-cred]` 对账。
@@ -648,7 +648,37 @@ E1 也接上了规则。但 §6.3.1 规则 2 的价值是「不要一个号一�
     不校验 `wallet_transactions.balance_after` 的逐行链条（同 `created_at` 的顺序不唯一，
     会造假阳性），只用与顺序无关的"余额 == 流水求和"这一恒等式；
     `held` 的人工处理入口**已由 B5 闭合**（2026-09-11）；`estimated` 仍无生产者；
-    new-api quota 整数单位 ↔ 货币金额的换算比例**仍未核对**（B4-BILLING-MODEL D4 的遗留项）。
+    new-api quota 整数单位 ↔ 货币金额的换算比例**已由 B4.6 读取**（2026-09-14），但真实部署的取值仍未读到（`[live-gate]`）。
+
+- **B4.6** `[no-cred]` **new-api `QuotaPerUnit` 换算比例的读取**。
+    **状态：no-cred 部分已完成（2026-09-14）。** 证据见 `docs/EVIDENCE.md` 同名小节。
+    **基线**：这条缺口在 `docs/B4-BILLING-MODEL.md` D4 与 §"未决"里写明是 **B4.1 的硬输入**，
+    却在 B4.1–B4.5 五条的"本轮未做"里**重复出现五次而从未编号**，因此扫编号清单的 agent 看不见它。
+    这是它能一直活到第四次复盘之后的原因，本轮据此补编号。
+    **为什么它比其他遗留项更该先做**：换算比例错了，B4.1 单价、B4.2 扣费、B4.5 对账会**一起错**，
+    而且是"平衡地错"——对账用的恒等式（余额 == 流水求和）在错误比例下依然成立，查不出来。
+    **DoD**
+    - 迁移读取路径从**源部署本身**读出该比例，不使用 new-api 编译期默认值。
+      （核实结论：`common/constants.go:22` 的 `500000` 只是初值，
+      `model/option.go:597` 会在启动时用 `options` 表的 `QuotaPerUnit` 行覆盖它，
+      所以**默认值不是任何部署的可靠答案**，只有那一行是。）
+    - 读不到时按 `missing` 上报并给出原因，**不得**按默认值补齐、不得按零补齐（AGENTS.md §2）。
+    - 原始值进迁移审计记录，即使它无法解析。
+    **实现摘要**
+    - `SourceQuotaPerUnit{Raw, Value, Found, Reason}` 进 `SourceSnapshot` 与 `Summary`（JSON 键
+      `quota_per_unit`），dry-run 摘要里因此能看到"这次迁移观察到的比例是多少 / 或者为什么没有"。
+    - `Value` 是 `contracts.Decimal` 而非 float64，与 B4.1 「money is exact decimal everywhere」同一口径。
+    - 六种"没有"各自有稳定的 reason 串：`options_table_absent` / `options_table_missing_key_or_value_column` /
+      `quota_per_unit_option_absent` / `quota_per_unit_option_empty` / `quota_per_unit_option_unparsable` /
+      `quota_per_unit_option_not_positive`（`0` 单列，否则下游是除零）。
+    **本轮未做**
+    - **没有任何换算被执行**：本轮只把比例读出来并记录，A11 的"只保留 source unit 与原始值、
+      不做换算"**仍然成立**，`PlannedTenant` 依旧不带 quota / balance。
+      要把 balance 变成钱包余额，还需要一条把 `Found==true` 的比例真正用起来的迁移路径——
+      本轮**有意**不做，因为那要求先有真实取值。
+    - **真实 new-api 部署的 `QuotaPerUnit` 取值仍未读到**：本轮全部由本地合成 schema 驱动，
+      `GATEWAY_NEW_API_DATABASE_URL` 未指向任何真实库。**这部分是 `[live-gate]`**——
+      它要的不是 provider 凭据，而是生产 new-api 库的只读访问。
 
 - **B5** P6 范围：控制台。**本轮交付后端 API，不含前端界面**（理由与取舍见 `docs/B5-CONSOLE.md` §1）。
   **状态：后端 API 已完成（2026-09-11）。** 证据见 `docs/EVIDENCE.md` 同名小节。

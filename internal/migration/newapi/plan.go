@@ -31,6 +31,7 @@ func BuildPlan(snapshot SourceSnapshot) (Plan, error) {
 		ProviderCounts: map[string]int{}, StatusCounts: map[string]int{},
 		UnknownChannelTypes: map[string]int{}, RejectionReasons: map[string]int{},
 		GroupCounts: map[string]int{}, SchemaWarnings: append([]string(nil), snapshot.SchemaWarnings...),
+		QuotaPerUnit: snapshot.QuotaPerUnit,
 	}
 	seen := make(map[string]bool)
 	seenKeyDigests := make(map[string]bool)

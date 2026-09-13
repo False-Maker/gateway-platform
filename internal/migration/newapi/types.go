@@ -19,7 +19,27 @@ type SourceSnapshot struct {
 	Tokens         []SourceToken
 	Quota          []SourceQuota
 	Groups         []SourceGroup
+	QuotaPerUnit   SourceQuotaPerUnit
 	SchemaWarnings []string
+}
+
+// SourceQuotaPerUnit is new-api's quota-integer to currency ratio, as read
+// from the source deployment rather than assumed.
+//
+// new-api compiles in 500000 (common/constants.go:22) but overwrites it at
+// boot from the options table (model/option.go:597), so the ratio a given
+// deployment actually bills with is a row, not a constant. Filling in the
+// default when the row is absent would misprice every converted balance
+// silently, so Found stays false and Reason records why. Callers must treat
+// Found == false as missing and refuse to convert, never as zero.
+type SourceQuotaPerUnit struct {
+	// Raw is the option value exactly as stored, kept for the audit record
+	// even when it could not be parsed.
+	Raw   string            `json:"raw,omitempty"`
+	Value contracts.Decimal `json:"value,omitempty"`
+	Found bool              `json:"found"`
+	// Reason is one of the quotaPerUnit* constants; empty when Found.
+	Reason string `json:"reason,omitempty"`
 }
 
 type SourceChannel struct {
@@ -151,5 +171,8 @@ type Summary struct {
 	GroupCounts         map[string]int `json:"group_counts"`
 	QuotaRows           int            `json:"quota_rows"`
 	QuotaRawDigest      string         `json:"quota_raw_digest"`
-	SchemaWarnings      []string       `json:"schema_warnings,omitempty"`
+	// QuotaPerUnit is carried into the summary so a migration run records the
+	// ratio it actually observed, including the fact that it observed none.
+	QuotaPerUnit   SourceQuotaPerUnit `json:"quota_per_unit"`
+	SchemaWarnings []string           `json:"schema_warnings,omitempty"`
 }

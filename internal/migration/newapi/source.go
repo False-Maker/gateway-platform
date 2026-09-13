@@ -2,11 +2,13 @@ package newapi
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/elucid/gateway-platform/pkg/contracts"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -73,6 +75,10 @@ func LoadSnapshot(ctx context.Context, db *pgxpool.Pool, schema string) (SourceS
 		return SourceSnapshot{}, err
 	}
 	snapshot.Groups, snapshot.SchemaWarnings, err = loadGroups(ctx, tx, schema, snapshot.SchemaWarnings)
+	if err != nil {
+		return SourceSnapshot{}, err
+	}
+	snapshot.QuotaPerUnit, snapshot.SchemaWarnings, err = loadQuotaPerUnit(ctx, tx, schema, snapshot.SchemaWarnings)
 	if err != nil {
 		return SourceSnapshot{}, err
 	}
@@ -256,6 +262,65 @@ func loadGroups(ctx context.Context, tx pgx.Tx, schema string, warnings []string
 		result = append(result, SourceGroup{ID: id, Name: row["name"], Status: row["status"]})
 	}
 	return result, warnings, nil
+}
+
+// Reasons a source deployment yielded no usable QuotaPerUnit. They are part of
+// the migration record, so they are stable strings rather than free text.
+const (
+	quotaPerUnitOptionsTableAbsent = "options_table_absent"
+	quotaPerUnitColumnsAbsent      = "options_table_missing_key_or_value_column"
+	quotaPerUnitRowAbsent          = "quota_per_unit_option_absent"
+	quotaPerUnitEmpty              = "quota_per_unit_option_empty"
+	quotaPerUnitUnparsable         = "quota_per_unit_option_unparsable"
+	quotaPerUnitNotPositive        = "quota_per_unit_option_not_positive"
+)
+
+// quotaPerUnitOptionKey is new-api's option key (model/option.go:597).
+const quotaPerUnitOptionKey = "QuotaPerUnit"
+
+// loadQuotaPerUnit reads the deployment's quota-to-currency ratio.
+//
+// This never falls back to new-api's compiled-in 500000: a deployment that
+// overrode the option would be migrated at the wrong ratio, and the error
+// would be invisible because both the wrong and the right number look like a
+// plausible balance. Missing is reported as missing, per AGENTS.md section 2.
+func loadQuotaPerUnit(ctx context.Context, tx pgx.Tx, schema string, warnings []string) (SourceQuotaPerUnit, []string, error) {
+	columns, err := tableColumns(ctx, tx, schema, "options")
+	if err != nil {
+		return SourceQuotaPerUnit{}, warnings, err
+	}
+	if len(columns) == 0 {
+		return SourceQuotaPerUnit{Reason: quotaPerUnitOptionsTableAbsent},
+			append(warnings, "source table options is absent; quota_per_unit is missing and no balance may be converted"), nil
+	}
+	if !columns["key"] || !columns["value"] {
+		return SourceQuotaPerUnit{Reason: quotaPerUnitColumnsAbsent},
+			append(warnings, "source table options lacks key/value columns; quota_per_unit is missing and no balance may be converted"), nil
+	}
+	var raw string
+	row := tx.QueryRow(ctx, `SELECT COALESCE(CAST("value" AS TEXT),'') FROM "`+schema+`"."options" WHERE "key"=$1`, quotaPerUnitOptionKey)
+	switch err := row.Scan(&raw); {
+	case errors.Is(err, pgx.ErrNoRows):
+		return SourceQuotaPerUnit{Reason: quotaPerUnitRowAbsent},
+			append(warnings, "source options has no QuotaPerUnit row; quota_per_unit is missing and no balance may be converted"), nil
+	case err != nil:
+		return SourceQuotaPerUnit{}, warnings, fmt.Errorf("read options.QuotaPerUnit: %w", err)
+	}
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return SourceQuotaPerUnit{Raw: raw, Reason: quotaPerUnitEmpty},
+			append(warnings, "source options.QuotaPerUnit is empty; quota_per_unit is missing and no balance may be converted"), nil
+	}
+	value := contracts.Decimal(trimmed)
+	if !value.Valid() {
+		return SourceQuotaPerUnit{Raw: raw, Reason: quotaPerUnitUnparsable},
+			append(warnings, fmt.Sprintf("source options.QuotaPerUnit %q is not a decimal; quota_per_unit is missing and no balance may be converted", raw)), nil
+	}
+	if sign, ok := value.Sign(); !ok || sign <= 0 {
+		return SourceQuotaPerUnit{Raw: raw, Reason: quotaPerUnitNotPositive},
+			append(warnings, fmt.Sprintf("source options.QuotaPerUnit %q is not positive; quota_per_unit is missing and no balance may be converted", raw)), nil
+	}
+	return SourceQuotaPerUnit{Raw: raw, Value: value, Found: true}, warnings, nil
 }
 
 func requiredInt(row map[string]string, field string) (int64, error) {
