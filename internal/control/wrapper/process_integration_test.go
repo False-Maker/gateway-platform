@@ -124,7 +124,10 @@ func TestP2RealRedisWrapperProcessLifecycle(t *testing.T) {
 	if err := crashed.Wait(); err == nil {
 		t.Fatal("SIGKILL helper exited normally")
 	}
-	time.Sleep(1200 * time.Millisecond)
+	// No sleep here on purpose. The reclaimer polls for itself, so how long the
+	// killed worker's 1s lease takes to look expired is waitForTerminal's
+	// problem, not a number to guess at. See reclaimDeadline in
+	// queue_integration_test.go for why guessing does not work.
 	reclaimer := startWrapperProcess(t, wrapperBinary, cfg, "reclaimer-worker", 30, 0)
 	waitForTerminal(t, wrapperQueue, crashJob.JobID)
 	stopWrapperProcess(t, reclaimer)
@@ -137,11 +140,7 @@ func TestP2RealRedisWrapperProcessLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(1200 * time.Millisecond)
-	_, currentLease, err := wrapperQueue.Claim(ctx, contracts.WrapperClaim{SchemaVersion: contracts.SchemaVersion, WorkerID: "current-worker", LeaseTTLSeconds: 30})
-	if err != nil {
-		t.Fatal(err)
-	}
+	currentLease := claimReclaimedLease(t, ctx, wrapperQueue, "current-worker", oldLease)
 	stale := contracts.WrapperCompletion{SchemaVersion: contracts.SchemaVersion, JobID: oldJob.JobID, LeaseID: oldLease.LeaseID, WorkerID: oldLease.WorkerID, AccountID: oldLease.AccountID, FenceEpoch: oldLease.FenceEpoch, EncryptedOutput: []byte("stale-output")}
 	if err := wrapperQueue.Complete(ctx, oldLease, stale); !errors.Is(err, ErrLeaseLost) {
 		t.Fatalf("old worker completion: %v", err)
@@ -219,7 +218,10 @@ func stopWrapperProcess(t *testing.T, cmd *exec.Cmd) {
 
 func waitForTerminal(t *testing.T, queue Queue, jobID string) {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
+	// reclaimDeadline rather than a few seconds: reaching a terminal here
+	// requires the reclaimer to get past XCLAIM's MinIdle, which a backward step
+	// of the Redis server clock can delay by more than a second at a time.
+	deadline := time.Now().Add(reclaimDeadline)
 	for time.Now().Before(deadline) {
 		if _, err := queue.Terminal(context.Background(), jobID); err == nil {
 			return

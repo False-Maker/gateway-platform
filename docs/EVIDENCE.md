@@ -7,6 +7,71 @@
 > 阅读规则：本文的每一条都是**对已发生事实的描述**。不要从本文推断"项目是否可以继续开发"——
 > 那个问题由 `docs/TODO.md` 和 `AGENTS.md` §0 回答。
 
+## wrapper reclaim 偶发失败的根因（2026-09-14）
+
+**改动**：只动测试，**产品代码零改动**。`internal/control/wrapper/queue_integration_test.go` 新增
+`reclaimDeadline` 与 `claimReclaimedLease` 轮询辅助；两处「sleep 固定时长后断言可 reclaim」
+改为轮询；`process_integration_test.go` 去掉 reclaimer 之前那次 sleep（reclaimer 自己会轮询），
+`waitForTerminal` 的期限由 5s 改为 `reclaimDeadline`。
+
+**根因：测试 Redis 容器的时钟会向后跳，且跳幅无有用上界**
+
+`Queue.nextMessage` 用 `XCLAIM MinIdle=minClaimIdle`（1 秒）做 reclaim，而流条目的 idle 由 Redis
+按 **`服务端当前时间 − 上次投递时间`** 计算，完全取自**服务端**时钟。服务端时钟向后跳多少，
+idle 就凭空少多少，于是一个**真的已经过期**的租约被 `XCLAIM` 拒绝；`nextMessage` 退到
+`XREADGROUP` 又没有新消息，`Claim` 返回 `redis.Nil`。
+
+两次独立的服务端侧观测：
+
+1. `MONITOR` 日志（时间戳由 Redis 服务端生成）中，同一条消息上后写入的行时间戳**早于**先写入的行：
+   ```
+   360: 1789316045.775847  pttl   ← t+950ms 采样
+   363: 1789316045.342952  pttl   ← t+1050ms 采样，时间戳反而早 433ms
+   ```
+   全量统计 2204 个服务端时间戳，**倒退 2 次，均约 435ms**；而那一轮恰好失败 2 次，一一对应。
+2. 加宽到 2 秒后仍失败的那次，失败点转储显示：sleep 2000ms 后 pending 条目
+   `idle=866ms`，且 TTL=1s 的两个 lease 键**仍然存在** —— 一次约 **1.13 秒**的倒退。
+
+**因此固定余量的修法是错的**（这是本轮先走过的弯路）：先把 1100ms/1200ms 统一加宽到 2s，
+queue 用例好了，进程用例照失败，正是因为 1.13s 的跳幅吃掉了 1s 余量。跳幅没有有用上界，
+任何固定数字都只是把失败率压低而非消除。改为轮询后，断言的性质不变
+（「过期租约可被另一个 worker 取走，且换了新 lease id」），但不再编码环境需要多久才能到那个状态。
+
+**中途被证伪的两个假设（记录下来，避免后人重走）**
+
+- *残留 wrapper 进程在抢消息*：查证否定，三个进程都有 SIGTERM/Kill + `Wait()` 回收。
+- *时钟稳定*：第一次时钟探测（9 秒、3000 次采样）得到「0 次跳变」，据此一度排除了时钟。
+  该否定结论**不成立**——探测跑在空载下，而跳变只在测试负载下出现。
+  后来一次 `MONITOR` 统计也报「0 次倒退」，但那次只抓到 893 行，MONITOR 中途已死，同样不可信。
+  **教训**：用「没测到」否定一个假设之前，先确认观测手段在目标条件下真的有效。
+
+**本轮执行（命令与结果）**
+
+```
+$ go build ./... && go vet ./...                      # 通过
+$ gofmt -l .                                          # 本轮文件无输出
+$ go test -count=1 ./internal/control/wrapper/        # 连跑 20 次，0 失败
+                                                      #（修复前同口径：16 次失败 2 次）
+$ source configs/test-infra/test.env
+$ go test -count=1 -p 1 ./...                         # 连跑 8 次，0 失败
+```
+
+**产品侧观察（未改，不属本轮范围）**
+
+`minClaimIdle` 依赖 Redis **服务端**时间的单调性，而 `WrapperLease.ExpiresAt` 用的是 control
+进程的 Go 时钟。两个时钟不是同一个。生产宿主机时钟稳定时没有影响；服务端时钟回退会**推迟**
+reclaim（偏保守，不会导致双 worker 持同一租约，因为 `Complete` 另有 lease id 校验）。
+仓库中此前无任何关于该依赖的记录，此处记一次。
+
+**明确未由本轮证实**
+
+1. **未修 `TestBillingJobSettlesLedgerRowsAndWalletInOneTransaction`**（先于本轮存在的第三个
+   偶发失败）。本轮 8 次全量未复现它，**这不等于它已消失**——上一轮 12 次里它复现过 1 次。
+2. 时钟跳变的**成因**未查明（疑为 Docker Desktop on Windows 的虚拟机时钟校正），
+   也未测出其跳幅上界；本轮只是让测试不再依赖这个上界。
+3. 产品代码未改动，因此本轮**不构成**对任何产品行为的新验证。
+4. 仍是单机单实例、无真实上游请求。
+
 ## 修复 detail fixture 的 TTL 竞态（2026-09-13）
 
 **改动**：只动测试，**产品代码零改动**。`internal/control/console_integration_test.go`：

@@ -12,6 +12,49 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
+// reclaimDeadline bounds how long these tests wait for a lease taken with
+// LeaseTTLSeconds=1 to become reclaimable by another worker.
+//
+// Do not replace the polling below with `time.Sleep(something just over 1s)`.
+// That is what these tests used to do, and it made them flaky: Queue.nextMessage
+// reclaims through XCLAIM with MinIdle=minClaimIdle (1s), and a stream entry's
+// idle time is computed by Redis as `server_now - last_delivery`, entirely from
+// the *server's* clock. Under load the test Redis container's clock steps
+// backward, which shrinks idle by the size of the step and makes XCLAIM refuse a
+// lease that has really expired; nextMessage then falls through to XREADGROUP,
+// finds nothing new, and Claim returns redis.Nil.
+//
+// Two instrumented observations, both server-side:
+//   - 2 of 2204 MONITOR timestamps went backward by ~435ms, and each of those
+//     two steps produced exactly one failure of the queue test.
+//   - after a 2s sleep the pending entry still reported idle=866ms and the 1s
+//     lease keys had not expired -- a step of roughly 1.13s.
+//
+// The steps have no useful upper bound, so no fixed margin is safe. Polling is:
+// it asserts the same property ("an expired lease becomes reclaimable, under a
+// new lease id") without encoding how long the environment takes to get there.
+// This is an environment property (Docker Desktop on Windows), not a defect in
+// the queue: see docs/EVIDENCE.md, "wrapper reclaim 偶发失败的根因".
+const reclaimDeadline = 30 * time.Second
+
+// claimReclaimedLease polls until the previous lease has been handed to another
+// worker, and fails the test if that never happens.
+func claimReclaimedLease(t *testing.T, ctx context.Context, queue Queue, workerID string, previous contracts.WrapperLease) contracts.WrapperLease {
+	t.Helper()
+	deadline := time.Now().Add(reclaimDeadline)
+	var lastErr error
+	for time.Now().Before(deadline) {
+		_, lease, err := queue.Claim(ctx, contracts.WrapperClaim{SchemaVersion: contracts.SchemaVersion, WorkerID: workerID, LeaseTTLSeconds: 30})
+		if err == nil && lease.LeaseID != previous.LeaseID {
+			return lease
+		}
+		lastErr = err
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("lease %s was never reclaimed within %s (last claim error %v)", previous.LeaseID, reclaimDeadline, lastErr)
+	return contracts.WrapperLease{}
+}
+
 func TestP2RealRedisQueueLifecycleAndGatewayIsolation(t *testing.T) {
 	addr := os.Getenv("GATEWAY_TEST_REDIS_ADDR")
 	adminUser := os.Getenv("GATEWAY_TEST_REDIS_ADMIN_USERNAME")
@@ -60,11 +103,7 @@ func TestP2RealRedisQueueLifecycleAndGatewayIsolation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(1100 * time.Millisecond)
-	_, currentLease, err := queue.Claim(ctx, contracts.WrapperClaim{SchemaVersion: contracts.SchemaVersion, WorkerID: "worker-current", LeaseTTLSeconds: 30})
-	if err != nil || currentLease.LeaseID == oldLease.LeaseID {
-		t.Fatalf("reclaimed lease=%#v old=%#v err=%v", currentLease, oldLease, err)
-	}
+	currentLease := claimReclaimedLease(t, ctx, queue, "worker-current", oldLease)
 	stale := contracts.WrapperCompletion{
 		SchemaVersion:   contracts.SchemaVersion,
 		JobID:           job.JobID,
