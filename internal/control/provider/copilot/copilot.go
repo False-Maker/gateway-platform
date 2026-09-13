@@ -28,6 +28,12 @@ func (p *Provider) Kind() string { return providerapi.KindCopilot }
 
 func (p *Provider) AuthMode() string { return p.Config.AuthMode }
 
+// UsageIntegrity: §6.2 的首批表**没有点名** copilot(总览 §6.1 已记录 new-api 无此渠道类型)。
+// 取值理由同 antigravity:表内四行全为 failover,zero/estimated 均被 §6.2 设了前置条件。
+func (p *Provider) UsageIntegrity() contracts.UsageIntegrity {
+	return contracts.UsageIntegrityFailover
+}
+
 func (p *Provider) Authorize(_ context.Context, req contracts.ImportRequest) (contracts.TokenBundle, error) {
 	if req.Provider != "" && req.Provider != p.Kind() {
 		return contracts.TokenBundle{}, fmt.Errorf("%w: provider mismatch", contracts.ErrInvalidContract)

@@ -33,6 +33,13 @@ func (p *Provider) Kind() string { return providerapi.KindAntigravity }
 
 func (p *Provider) AuthMode() string { return p.Config.AuthMode }
 
+// UsageIntegrity: §6.2 的首批表**没有点名** antigravity。取 failover 的理由是该表四行
+// 全部为 failover,且 §6.2 明确 zero "仅未来 provider 在评审后显式选择"、estimated 需
+// tokenizer 校准报告——在未评审前,failover 是唯一不违反该节的取值。真实 usage 行为属 C2。
+func (p *Provider) UsageIntegrity() contracts.UsageIntegrity {
+	return contracts.UsageIntegrityFailover
+}
+
 func (p *Provider) Authorize(_ context.Context, req contracts.ImportRequest) (contracts.TokenBundle, error) {
 	if req.Provider != "" && req.Provider != p.Kind() {
 		return contracts.TokenBundle{}, fmt.Errorf("%w: provider mismatch", contracts.ErrInvalidContract)

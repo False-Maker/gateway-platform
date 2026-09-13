@@ -1336,3 +1336,163 @@ func TestNonStreamingAllowsImageContentAndStreamingRejectsIt(t *testing.T) {
 		t.Fatalf("streaming image result: status=%d err=%v called=%v", streamStatus, streamErr, called)
 	}
 }
+
+// releasesByAttempt returns every terminal Release on the stream, oldest first.
+// A13's assertions are about the abandoned attempt, not just the last one, so
+// latestRelease is not enough here.
+func releasesByAttempt(t *testing.T, rdb *redis.Client) []contracts.Release {
+	t.Helper()
+	messages, err := rdb.XRange(context.Background(), events.StreamKey, "-", "+").Result()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var releases []contracts.Release
+	for _, message := range messages {
+		if message.Values["event_type"] != string(contracts.EventTypeRelease) {
+			continue
+		}
+		payload, ok := message.Values["payload"].(string)
+		if !ok {
+			t.Fatalf("invalid event payload: %#v", message.Values["payload"])
+		}
+		var release contracts.Release
+		if err := json.Unmarshal([]byte(payload), &release); err != nil {
+			t.Fatal(err)
+		}
+		releases = append(releases, release)
+	}
+	return releases
+}
+
+// A13 / overview §6.2: a 200 that carries no usage block is an integrity
+// failure under `failover`. The response must be discarded and another account
+// tried -- and, the part that actually costs money, the abandoned attempt must
+// not be recorded as a success, or B4.3 parks it in `held` for a human.
+func TestUsageIntegrityFailoverAbandonsTheAttemptWithoutHoldingIt(t *testing.T) {
+	mini := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mini.Addr()})
+	var tokens []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tokens = append(tokens, r.Header.Get("Authorization"))
+		if len(tokens) == 1 {
+			// Structurally valid, complete, and with no usage block at all.
+			_, _ = w.Write([]byte(`{"choices":[{"index":0,"message":{"role":"assistant","content":"hi"}}]}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"choices":[],"usage":{"prompt_tokens":7,"completion_tokens":3}}`))
+	}))
+	defer upstream.Close()
+	server := NewServer(events.Producer{Redis: rdb, ProducerID: "gateway-test"}, "apikey")
+	server.Chooser.Replace([]contracts.Account{
+		{ID: "a", Provider: "apikey", Platform: "apikey", Group: "default", Status: "active", UsageIntegrity: contracts.UsageIntegrityFailover, Credential: contracts.Credential{Kind: "static", AccessToken: "a", Version: 1}, Profile: contracts.UpstreamProfile{BaseURL: upstream.URL}},
+		{ID: "b", Provider: "apikey", Platform: "apikey", Group: "default", Status: "active", UsageIntegrity: contracts.UsageIntegrityFailover, Credential: contracts.Credential{Kind: "static", AccessToken: "b", Version: 1}, Profile: contracts.UpstreamProfile{BaseURL: upstream.URL}},
+	})
+	_, status, err := server.HandleNonStreaming(context.Background(), "tenant", "default", ChatCompletionRequest{Model: "m", Messages: []map[string]any{{"role": "user", "content": "hi"}}})
+	if err != nil || status != http.StatusOK {
+		t.Fatalf("failover result: status=%d err=%v", status, err)
+	}
+	if len(tokens) != 2 || tokens[0] != "Bearer a" || tokens[1] != "Bearer b" {
+		t.Fatalf("integrity failover did not move to another account: %v", tokens)
+	}
+	releases := releasesByAttempt(t, rdb)
+	if len(releases) != 2 {
+		t.Fatalf("expected one release per attempt, got %d", len(releases))
+	}
+	abandoned, served := releases[0], releases[1]
+	if abandoned.ErrorClass != contracts.ErrorUsageMissing || abandoned.UsageSource != contracts.UsageSourceMissing {
+		t.Fatalf("abandoned attempt was not recorded as an integrity failure: %+v", abandoned)
+	}
+	// The whole point: B4.3 must settle this as not_billable, not hold it. That
+	// requires releaseSucceeded to be false, which requires a non-ok class.
+	if abandoned.ErrorClass == contracts.ErrorOK {
+		t.Fatal("abandoned attempt would be held for a human")
+	}
+	if served.UsageSource != contracts.UsageSourceUpstream || served.TokensIn != 7 || served.TokensOut != 3 {
+		t.Fatalf("served attempt lost its usage: %+v", served)
+	}
+	if abandoned.AttemptID == served.AttemptID {
+		t.Fatal("both attempts shared an attempt id")
+	}
+}
+
+// §6.2: "达到预算则返回 502,Release 标记 UsageSource=missing". The budget is
+// fluxgate §5's existing two attempts -- A13 must not add a third.
+func TestUsageIntegrityFailoverStopsAtTheExistingTwoAttemptBudget(t *testing.T) {
+	mini := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mini.Addr()})
+	calls := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		_, _ = w.Write([]byte(`{"choices":[{"index":0,"message":{"role":"assistant","content":"hi"}}]}`))
+	}))
+	defer upstream.Close()
+	server := NewServer(events.Producer{Redis: rdb, ProducerID: "gateway-test"}, "apikey")
+	server.Chooser.Replace([]contracts.Account{
+		{ID: "a", Provider: "apikey", Platform: "apikey", Group: "default", Status: "active", UsageIntegrity: contracts.UsageIntegrityFailover, Credential: contracts.Credential{Kind: "static", AccessToken: "a", Version: 1}, Profile: contracts.UpstreamProfile{BaseURL: upstream.URL}},
+		{ID: "b", Provider: "apikey", Platform: "apikey", Group: "default", Status: "active", UsageIntegrity: contracts.UsageIntegrityFailover, Credential: contracts.Credential{Kind: "static", AccessToken: "b", Version: 1}, Profile: contracts.UpstreamProfile{BaseURL: upstream.URL}},
+		{ID: "c", Provider: "apikey", Platform: "apikey", Group: "default", Status: "active", UsageIntegrity: contracts.UsageIntegrityFailover, Credential: contracts.Credential{Kind: "static", AccessToken: "c", Version: 1}, Profile: contracts.UpstreamProfile{BaseURL: upstream.URL}},
+	})
+	_, status, err := server.HandleNonStreaming(context.Background(), "tenant", "default", ChatCompletionRequest{Model: "m", Messages: []map[string]any{{"role": "user", "content": "hi"}}})
+	if status != http.StatusBadGateway || !errors.Is(err, ErrUsageUnavailable) {
+		t.Fatalf("exhausted budget result: status=%d err=%v", status, err)
+	}
+	if calls != 2 {
+		t.Fatalf("budget was not the existing two attempts: upstream called %d times", calls)
+	}
+	for _, release := range releasesByAttempt(t, rdb) {
+		if release.UsageSource != contracts.UsageSourceMissing || release.ErrorClass != contracts.ErrorUsageMissing {
+			t.Fatalf("attempt was not recorded as missing usage: %+v", release)
+		}
+	}
+}
+
+// A provider that explicitly opted out of failover keeps its response. Nothing
+// registered selects `zero` today; this pins the branch so the opt-out cannot
+// be silently lost, and documents that such a row is still `missing` -- A13
+// does not invent a token count for it.
+func TestUsageIntegrityZeroServesTheResponseWithoutFailover(t *testing.T) {
+	mini := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mini.Addr()})
+	calls := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		_, _ = w.Write([]byte(`{"choices":[{"index":0,"message":{"role":"assistant","content":"hi"}}]}`))
+	}))
+	defer upstream.Close()
+	server := NewServer(events.Producer{Redis: rdb, ProducerID: "gateway-test"}, "apikey")
+	server.Chooser.Replace([]contracts.Account{
+		{ID: "a", Provider: "apikey", Platform: "apikey", Group: "default", Status: "active", UsageIntegrity: contracts.UsageIntegrityZero, Credential: contracts.Credential{Kind: "static", AccessToken: "a", Version: 1}, Profile: contracts.UpstreamProfile{BaseURL: upstream.URL}},
+		{ID: "b", Provider: "apikey", Platform: "apikey", Group: "default", Status: "active", UsageIntegrity: contracts.UsageIntegrityZero, Credential: contracts.Credential{Kind: "static", AccessToken: "b", Version: 1}, Profile: contracts.UpstreamProfile{BaseURL: upstream.URL}},
+	})
+	_, status, err := server.HandleNonStreaming(context.Background(), "tenant", "default", ChatCompletionRequest{Model: "m", Messages: []map[string]any{{"role": "user", "content": "hi"}}})
+	if err != nil || status != http.StatusOK {
+		t.Fatalf("zero policy result: status=%d err=%v", status, err)
+	}
+	if calls != 1 {
+		t.Fatalf("zero policy should not retry: upstream called %d times", calls)
+	}
+	release := latestRelease(t, rdb)
+	if release.UsageSource != contracts.UsageSourceMissing || release.ErrorClass != contracts.ErrorOK {
+		t.Fatalf("zero policy release: %+v", release)
+	}
+}
+
+// An unstamped lease must behave like the pre-A13 code: refuse to serve traffic
+// it cannot meter. The snapshot gate should make this unreachable; this asserts
+// the gateway does not fail open if it ever is reached.
+func TestUnstampedLeaseStillRefusesUnmeteredTraffic(t *testing.T) {
+	mini := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mini.Addr()})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"choices":[{"index":0,"message":{"role":"assistant","content":"hi"}}]}`))
+	}))
+	defer upstream.Close()
+	server := NewServer(events.Producer{Redis: rdb, ProducerID: "gateway-test"}, "apikey")
+	server.Chooser.Replace([]contracts.Account{
+		{ID: "a", Provider: "apikey", Platform: "apikey", Group: "default", Status: "active", Credential: contracts.Credential{Kind: "static", AccessToken: "a", Version: 1}, Profile: contracts.UpstreamProfile{BaseURL: upstream.URL}},
+	})
+	_, status, err := server.HandleNonStreaming(context.Background(), "tenant", "default", ChatCompletionRequest{Model: "m", Messages: []map[string]any{{"role": "user", "content": "hi"}}})
+	if status != http.StatusBadGateway || !errors.Is(err, ErrUsageUnavailable) {
+		t.Fatalf("unstamped lease failed open: status=%d err=%v", status, err)
+	}
+}

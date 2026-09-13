@@ -31,6 +31,9 @@ func TestRefreshOAuthRejectsMissingCapabilityOrToken(t *testing.T) {
 type providerStub struct{}
 
 func (providerStub) Kind() string { return "stub" }
+func (providerStub) UsageIntegrity() contracts.UsageIntegrity {
+	return contracts.UsageIntegrityFailover
+}
 func (providerStub) Authorize(context.Context, contracts.ImportRequest) (contracts.TokenBundle, error) {
 	return contracts.TokenBundle{}, nil
 }

@@ -23,6 +23,11 @@ func (p *Provider) Kind() string { return providerapi.KindGemini }
 
 func (p *Provider) AuthMode() string { return p.Config.AuthMode }
 
+// UsageIntegrity: §6.2 的 "Anthropic Messages、Gemini" 行,与 claude 同一行同一取值。
+func (p *Provider) UsageIntegrity() contracts.UsageIntegrity {
+	return contracts.UsageIntegrityFailover
+}
+
 func (p *Provider) Authorize(_ context.Context, req contracts.ImportRequest) (contracts.TokenBundle, error) {
 	if req.Provider != "" && req.Provider != p.Kind() {
 		return contracts.TokenBundle{}, fmt.Errorf("%w: provider mismatch", contracts.ErrInvalidContract)

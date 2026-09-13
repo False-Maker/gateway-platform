@@ -32,6 +32,11 @@ func (p *Provider) Kind() string { return providerapi.KindKiro }
 
 func (p *Provider) AuthMode() string { return p.Config.AuthMode }
 
+// UsageIntegrity: §6.2 的 "Codex、Kiro OAuth(P2)" 行,与 codex 同一行同一取值。
+func (p *Provider) UsageIntegrity() contracts.UsageIntegrity {
+	return contracts.UsageIntegrityFailover
+}
+
 func (p *Provider) Authorize(_ context.Context, req contracts.ImportRequest) (contracts.TokenBundle, error) {
 	if req.Provider != "" && req.Provider != p.Kind() {
 		return contracts.TokenBundle{}, fmt.Errorf("%w: provider mismatch", contracts.ErrInvalidContract)

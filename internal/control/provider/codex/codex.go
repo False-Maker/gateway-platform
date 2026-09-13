@@ -29,6 +29,12 @@ func (p *Provider) Kind() string { return providerapi.KindCodex }
 
 func (p *Provider) AuthMode() string { return p.Config.AuthMode }
 
+// UsageIntegrity: §6.2 的 "Codex、Kiro OAuth(P2)" 行。该行附带一句前置条件——
+// "接入前先用真实响应确认 usage 字段;未确认前禁止标记为 upstream"——属 live-gate(C2)。
+func (p *Provider) UsageIntegrity() contracts.UsageIntegrity {
+	return contracts.UsageIntegrityFailover
+}
+
 func (p *Provider) Authorize(ctx context.Context, req contracts.ImportRequest) (contracts.TokenBundle, error) {
 	if req.Provider != "" && req.Provider != p.Kind() {
 		return contracts.TokenBundle{}, fmt.Errorf("%w: provider mismatch", contracts.ErrInvalidContract)

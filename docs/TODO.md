@@ -47,8 +47,12 @@
 > §4.1 的 7 天 trim 与「`attempt_started` 写入失败即 503」、fluxgate/keyhive 两份交付物清单
 > 已无未勾选项。
 >
-> **下一步：`A13`**（`[no-cred]`）。其余：§C 全部 `[live-gate]`（C6 的 no-cred 部分已完成），
-> §D 为部署边界（D1 已完成）。
+> `A13 每上游 usage_integrity 策略` 2026-09-13 完成（含一处基线更正，见该条目开头的引用块）。
+>
+> **下一步**：§A/§B/§E 的 `[no-cred]` 条目再次全部清空；§C 全部 `[live-gate]`（C6 的 no-cred
+> 部分已完成），§D 为部署边界（D1 已完成）。按 AGENTS.md §0，这**不是**停机结论——
+> 第三次复盘的教训是这类判断应当被复核而不是被继承，下一轮若无新输入，
+> 合适的动作是第四次结构性复盘（口径见 EVIDENCE 同名小节的核对表）。
 > A12/E1/E2 不阻塞 B4，可并行取。P4（B4）在 A11 之前不进入编码——迁移来的用户还停在 staging，没有可扣费主体。
 
 ---
@@ -340,7 +344,18 @@ tenants / principals / tenant_tokens；摘要新增 `tenant_count` / `principal_
 
 ### A13 `[no-cred]` 每上游 `usage_integrity` 策略缺失（总览 §6.2 的 P0 级契约要求）
 
-**状态：未开始。2026-09-13 第三次结构性复盘发现。**
+**状态：已完成（2026-09-13）。** 证据见 `docs/EVIDENCE.md` 同名小节。
+
+> **基线更正（2026-09-13，实现时发现）**：下方「当前实际行为」原写
+> 「上游 200 但无 usage → 直接成功返回客户端，不换号、不重试」，**这对非流式路径是错的**。
+> `server.go` 的非流式循环在 `status >= 400` 分支**之后**另有一段 `if usage == nil`，
+> 已经在做换号与 502（`ErrUsageUnavailable`），行为上就是 §6.2 表第一行。
+> 复盘时只读到 `status >= 400` 那段就下了结论，漏看了后面十行。
+> **真实缺口是另外两条**，A13 的价值也在这两条上：
+> 1. 该 failover 是**硬编码**的，不是 §6.2 要求的「逐 provider 显式配置 + 未配置不得进快照」；
+> 2. 被放弃的那次尝试的 Release 记成 `ErrorClass=ok` / `status=200` / `UsageSource=missing`，
+>    经 B4.3 判为 **`held`**——于是**每一次 failover 都产出一行待人工裁定的账目**，
+>    正是 §6.2 设计 failover 想避免的结果。这条是真正花钱的缺陷。
 
 **基线**
 - 总览 §6.2 写明：「**P0 为每个已注册 provider 必须显式配置 `usage_integrity`（没有配置不得进入可调度快照）**」，
@@ -385,6 +400,36 @@ tenants / principals / tenant_tokens；摘要新增 `tenant_count` / `principal_
   用尽后终态为 `missing`；断言未配置 `usage_integrity` 的账号不出现在快照里。
 - **本任务不改 B4.3 的处置表**——它对 `missing` 的判定仍然正确，
   A13 要减少的是 `missing` 的**产生量**，不是改变它的账务含义。
+
+**实现摘要**
+- **契约**：`contracts.UsageIntegrity`（`failover` / `zero` / `estimated` + `Valid()`）；
+  `Account.UsageIntegrity` 与 `Lease.UsageIntegrity`（热路径零查询即可拿到策略）；
+  新增 `ErrorClass` 值 **`usage_missing`**。
+- **显式性靠编译器**：`provider.Provider` 接口新增**必选**方法 `UsageIntegrity()`，
+  不是可选接口——新 provider 忘了声明是**编译失败**，而不是上线后账号静默消失。
+  八个 provider 各自声明并在注释里引用 §6.2 的对应行；antigravity 与 copilot **不在该表内**，
+  已在各自注释中写明取 `failover` 的推理与其局限。
+- **fail-closed 闸门**：`SnapshotLoop.stampUsageIntegrity` 在发布前按 registry 打标，
+  provider 未注册或取值非法的账号**不进快照**，按 provider 计
+  `control_snapshot_accounts_dropped_total{provider,reason}` 并 log。
+  放在发布路径而非某个 repository 实现里，因此任何 repository（含测试 fake）都被同一道闸门管。
+- **不产生 held 行**：网关在「完整响应 + 无 usage + 策略非 zero/estimated」时把该次尝试记为
+  `ErrorClass=usage_missing`。B4.3 对 `(missing, !partial, 失败)` 判 `not_billable`，
+  于是 failover 与用尽预算两种结局都**不再**落进 `held`。`usage_missing` 不在 health.go
+  的受罚 class 列表里，落到其 `ELSE` 分支（只记 last_error，不罚号）——上游不给 usage
+  是上游的性质，不是被选中那个账号的健康问题。
+- **复用既有预算**：仍是 `attemptNo < 2`，未新增重试计数。
+- 指标：`gateway_usage_integrity_failover_total{provider}`。
+
+**本轮未做**
+- **流式路径未改，仍会产生 `held` 行。** §6.2 要求「首字节后不得重放」，而流式 usage 只在
+  流末才知道，必然已过首字节——所以流式在设计上就无法 failover。这是 §6.2 的取舍，不是遗漏，
+  但意味着 **A13 只减少非流式来源的 held，不能宣称 held 归零**。
+- **`zero` 与 `estimated` 未接入热路径**：无 provider 选它们，且 §6.2 分别设了「评审」与
+  「tokenizer 校准报告」前置。`zero` 目前的行为是「照常返回响应 + `UsageSource=missing`」，
+  **并非真正的「计 0」**；真要启用需按 §6.2 先评审。已有测试钉住该分支不被静默改掉。
+- 未新增告警规则（E1 已闭合，A13 的 DoD 未要求）；新指标目前无消费方。
+- 未起 PG / Redis / ClickHouse，相关集成用例本轮为 skip。
 
 **已知取舍（记录，避免被当成遗漏）**
 - 真实 provider 到底会不会「成功但不给 usage」属 `[live-gate]`（C2/C3）。

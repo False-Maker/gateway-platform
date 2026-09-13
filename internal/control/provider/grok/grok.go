@@ -23,6 +23,12 @@ func (p *Provider) Kind() string { return providerapi.KindGrok }
 
 func (p *Provider) AuthMode() string { return p.Config.AuthMode }
 
+// UsageIntegrity: §6.2 名列 Grok 一行——"成功响应无 usage 视为完整性失败;
+// 按上行边界执行换号或 missing 终态,不得静默计 0"。这是该表最直白的一行。
+func (p *Provider) UsageIntegrity() contracts.UsageIntegrity {
+	return contracts.UsageIntegrityFailover
+}
+
 func (p *Provider) Authorize(_ context.Context, req contracts.ImportRequest) (contracts.TokenBundle, error) {
 	if req.Provider != "" && req.Provider != p.Kind() {
 		return contracts.TokenBundle{}, fmt.Errorf("%w: provider mismatch", contracts.ErrInvalidContract)

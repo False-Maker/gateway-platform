@@ -31,6 +31,12 @@ func (p *Provider) Kind() string { return providerapi.KindClaude }
 
 func (p *Provider) AuthMode() string { return p.Config.AuthMode }
 
+// UsageIntegrity: §6.2 的 "Anthropic Messages、Gemini" 行。该行对流式另有约束
+// ("首字节前缺 usage 可换号;首字节后不得重放"),由 gateway 侧按流式/非流式分别执行。
+func (p *Provider) UsageIntegrity() contracts.UsageIntegrity {
+	return contracts.UsageIntegrityFailover
+}
+
 func (p *Provider) Authorize(ctx context.Context, req contracts.ImportRequest) (contracts.TokenBundle, error) {
 	if req.Provider != "" && req.Provider != p.Kind() {
 		return contracts.TokenBundle{}, fmt.Errorf("%w: provider mismatch", contracts.ErrInvalidContract)

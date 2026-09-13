@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/elucid/gateway-platform/internal/control/credentials"
+	"github.com/elucid/gateway-platform/internal/control/provider"
+	"github.com/elucid/gateway-platform/internal/observability"
 	"github.com/elucid/gateway-platform/internal/snapshot"
 	"github.com/elucid/gateway-platform/pkg/contracts"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -223,6 +225,7 @@ func (l SnapshotLoop) RunOnce(ctx context.Context) error {
 			publishErr = errors.Join(publishErr, fmt.Errorf("load snapshot accounts for %s/%s: %w", bucket.Platform, bucket.Group, err))
 			continue
 		}
+		accounts = l.stampUsageIntegrity(accounts, bucket)
 		expectedEpoch, err := currentSnapshotEpoch(ctx, l.Redis, bucket.Platform, bucket.Group)
 		if err != nil {
 			publishErr = errors.Join(publishErr, fmt.Errorf("read snapshot epoch for %s/%s: %w", bucket.Platform, bucket.Group, err))
@@ -250,6 +253,44 @@ func (l SnapshotLoop) RunOnce(ctx context.Context) error {
 		}
 	}
 	return publishErr
+}
+
+// stampUsageIntegrity enforces overview §6.2's admission rule: "P0 为每个已注册
+// provider 必须显式配置 usage_integrity（没有配置不得进入可调度快照）".
+//
+// The gate lives here rather than in the SQL of ListSnapshotAccounts because the
+// policy is registry knowledge, not a column -- §6.2 makes it a property of the
+// provider, so storing it per account would let two accounts of one provider
+// disagree. Putting it on the publish path instead of inside one repository
+// implementation means every repository, including test fakes, is gated.
+//
+// Dropping accounts is the fail-closed direction and it is deliberate: serving
+// traffic we have no stated way to meter is how unbillable usage is produced in
+// the first place. The drop is logged per provider and counted, because an
+// unregistered provider silently emptying a bucket would look exactly like
+// "no accounts configured".
+func (l SnapshotLoop) stampUsageIntegrity(accounts []contracts.Account, bucket SnapshotBucket) []contracts.Account {
+	if len(accounts) == 0 {
+		return accounts
+	}
+	kept := accounts[:0]
+	dropped := make(map[string]int)
+	for _, account := range accounts {
+		policy, ok := provider.UsageIntegrityFor(account.Provider)
+		if !ok {
+			dropped[account.Provider]++
+			continue
+		}
+		account.UsageIntegrity = policy
+		kept = append(kept, account)
+	}
+	for providerKind, count := range dropped {
+		log.Printf("control excluded %d account(s) of provider %q from snapshot %s/%s: no usage_integrity declared (overview §6.2)",
+			count, providerKind, bucket.Platform, bucket.Group)
+		observability.Default.AddCounter("control_snapshot_accounts_dropped_total", float64(count),
+			"provider", providerKind, "reason", "usage_integrity_unset")
+	}
+	return kept
 }
 
 func currentSnapshotEpoch(ctx context.Context, client redis.UniversalClient, platform, group string) (int64, error) {

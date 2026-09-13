@@ -219,7 +219,7 @@ func (c *Chooser) AcquirePreferring(criteria contracts.Criteria, preferred strin
 			ttl = 0
 		}
 	}
-	return contracts.Lease{AccountID: account.ID, Provider: account.Provider, Credential: account.Credential, Profile: account.Profile, Limits: account.Limits.WithDefaults(), TTL: ttl}, nil
+	return contracts.Lease{AccountID: account.ID, Provider: account.Provider, Credential: account.Credential, Profile: account.Profile, Limits: account.Limits.WithDefaults(), TTL: ttl, UsageIntegrity: account.UsageIntegrity}, nil
 }
 
 func hasQuota(account contracts.Account, model string) bool {

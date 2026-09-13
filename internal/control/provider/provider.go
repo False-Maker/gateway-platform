@@ -20,6 +20,27 @@ type Provider interface {
 	Revoke(context.Context, contracts.Credential) error
 	Profile(contracts.Account) contracts.UpstreamProfile
 	Quota(context.Context, contracts.Credential) (contracts.QuotaInfo, error)
+	// UsageIntegrity is what to do when this upstream answers successfully but
+	// omits usage (overview §6.2). It is a required method rather than an
+	// optional interface on purpose: §6.2 says every registered provider must
+	// state one, and a missing method is then a compile error instead of a
+	// provider whose accounts quietly stop being schedulable.
+	UsageIntegrity() contracts.UsageIntegrity
+}
+
+// UsageIntegrityFor resolves the policy for a provider kind. The second return
+// is false when the kind is not registered or states a value outside the
+// contract -- callers must treat that as "not schedulable", never as a default.
+func UsageIntegrityFor(kind string) (contracts.UsageIntegrity, bool) {
+	p, ok := Get(kind)
+	if !ok {
+		return "", false
+	}
+	policy := p.UsageIntegrity()
+	if !policy.Valid() {
+		return "", false
+	}
+	return policy, true
 }
 
 // OAuthRefresher is an optional control-plane capability. TokenBundle is kept

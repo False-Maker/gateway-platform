@@ -46,13 +46,53 @@ const (
 	ErrorUpstream5xx         ErrorClass = "upstream_5xx"
 	ErrorBlocked             ErrorClass = "blocked"
 	ErrorNetwork             ErrorClass = "network_error"
+	// ErrorUsageMissing is an upstream response that arrived intact but carried
+	// no usage block, on a provider whose usage_integrity is `failover`.
+	// Overview §6.2 calls this out in as many words -- "成功响应无 usage 视为完整性
+	// 失败" -- so it is a failure class even though the HTTP status says 200.
+	//
+	// It carries no account penalty: §6.3.1's penalties are for unhealthy
+	// accounts, and an upstream that omits usage is a trait of the upstream, not
+	// of the account that happened to be picked. health.go's CASE expressions
+	// name the penalised classes explicitly, so this one falls to their ELSE
+	// branches (last_error only) without needing a new branch.
+	ErrorUsageMissing ErrorClass = "usage_missing"
 )
 
 func (e ErrorClass) Valid() bool {
 	switch e {
 	case ErrorOK, ErrorAuthExpired, ErrorAuthInvalid,
 		ErrorForbiddenTransport, ErrorForbiddenCapability, ErrorRateLimitedKnown,
-		ErrorRateLimitedUnknown, ErrorUpstream5xx, ErrorBlocked, ErrorNetwork:
+		ErrorRateLimitedUnknown, ErrorUpstream5xx, ErrorBlocked, ErrorNetwork,
+		ErrorUsageMissing:
+		return true
+	default:
+		return false
+	}
+}
+
+// UsageIntegrity is the per-upstream policy for "the response was fine but it
+// carried no usage" (overview §6.2). It is deliberately not defaulted anywhere:
+// the overview requires every registered provider to state one, and an account
+// whose provider states none does not enter the schedulable snapshot.
+type UsageIntegrity string
+
+const (
+	// UsageIntegrityFailover: discard the response and try another account.
+	// This is the first-batch value for every provider in §6.2's table.
+	UsageIntegrityFailover UsageIntegrity = "failover"
+	// UsageIntegrityZero: treat the response as costing zero. §6.2 allows this
+	// "仅未来 provider 在评审后显式选择" -- no provider selects it today.
+	UsageIntegrityZero UsageIntegrity = "zero"
+	// UsageIntegrityEstimated: count tokens with a local tokenizer. §6.2 gates
+	// this behind "单独的 tokenizer 版本和校准报告"; nothing produces it, and
+	// B4.3 holds `estimated` rows for a human precisely because of that.
+	UsageIntegrityEstimated UsageIntegrity = "estimated"
+)
+
+func (u UsageIntegrity) Valid() bool {
+	switch u {
+	case UsageIntegrityFailover, UsageIntegrityZero, UsageIntegrityEstimated:
 		return true
 	default:
 		return false
@@ -127,6 +167,9 @@ type Lease struct {
 	Profile    UpstreamProfile `json:"profile"`
 	Limits     AccountLimits   `json:"limits"`
 	TTL        int             `json:"ttl"`
+	// UsageIntegrity rides the lease so the hot path can act on it without a
+	// registry lookup or any call to control (overview §3).
+	UsageIntegrity UsageIntegrity `json:"usage_integrity,omitempty"`
 }
 
 type QuotaInfo struct {
@@ -260,6 +303,10 @@ type Account struct {
 	// ExcludedModels lists models control has persistently marked as
 	// forbidden_capability for this account. Gateway never schedules them.
 	ExcludedModels []string `json:"excluded_models,omitempty"`
+	// UsageIntegrity is stamped by control from the provider registry when the
+	// snapshot is built, not stored per account: §6.2 makes it a property of the
+	// provider. An account reaching a published snapshot always has a valid one.
+	UsageIntegrity UsageIntegrity `json:"usage_integrity,omitempty"`
 }
 
 type ImportRequest struct {

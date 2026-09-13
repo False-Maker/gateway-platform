@@ -7,6 +7,75 @@
 > 阅读规则：本文的每一条都是**对已发生事实的描述**。不要从本文推断"项目是否可以继续开发"——
 > 那个问题由 `docs/TODO.md` 和 `AGENTS.md` §0 回答。
 
+## A13 每上游 `usage_integrity` 策略（2026-09-13）
+
+**改动**：`pkg/contracts/contracts.go`（`UsageIntegrity` 类型与三个取值、`Account`/`Lease` 新字段、
+`ErrorClass` 新增 `usage_missing`）、`internal/control/provider/provider.go`（`Provider` 接口新增
+**必选**方法 `UsageIntegrity()` + `UsageIntegrityFor` 解析器）、八个 provider 各加一处显式声明、
+`internal/control/snapshot_loop.go`（`stampUsageIntegrity` 打标与 fail-closed 闸门）、
+`internal/gateway/chooser.go`（策略随 lease 下发）、`internal/gateway/server.go`（非流式按策略执行）。
+**无新增 PG migration**——§6.2 把该策略定为 provider 的性质，不是账号的列。
+
+**先更正上一轮的一处错误基线**
+
+第三次复盘写的「上游 200 但无 usage → 直接成功返回客户端，不换号、不重试」，
+**对非流式路径是错的**。`server.go` 的非流式循环在 `status >= 400` 分支之后另有一段
+`if usage == nil`，本来就在换号并在用尽预算时返回 502（`ErrUsageUnavailable`）。
+复盘时只读到 `status >= 400` 那段就下了结论。A13 的真实内容因此是另外两条：
+**(1)** 该行为是硬编码的，不是 §6.2 要求的「逐 provider 显式配置 + 未配置不得进快照」；
+**(2)** 被放弃的那次尝试记成 `ErrorClass=ok` / `200` / `missing`，经 B4.3 判为 **`held`**——
+**每一次 failover 都产出一行待人工裁定的账目**。第二条是真正花钱的缺陷，也是本轮修掉的主要东西。
+
+**本轮执行（命令与结果）**
+
+```
+$ go build ./... && go vet ./...            # 通过
+$ gofmt -l .                                # 仅 health.go / new-api-migrate/main_test.go（先于本轮，未改）
+$ go test -count=1 ./...                    # 全绿
+$ go test -race -count=1 ./pkg/contracts ./internal/gateway/ ./internal/control/provider/...
+ok  github.com/elucid/gateway-platform/pkg/contracts                  1.030s
+ok  github.com/elucid/gateway-platform/internal/gateway               2.738s
+ok  github.com/elucid/gateway-platform/internal/control/provider      1.377s
+    （另 8 个 provider 子包均 ok）
+```
+
+**跑通的新用例**
+
+- `TestUsageIntegrityFailoverAbandonsTheAttemptWithoutHoldingIt` —— 上游首次返回「200 + 无 usage」：
+  换到第二个账号、两次 Release 的 attempt id 不同、**被放弃那次的 `ErrorClass` 为 `usage_missing`
+  而非 `ok`**（即 B4.3 判 `not_billable` 而不是 `held`）、成功那次带完整 usage。
+- `TestUsageIntegrityFailoverStopsAtTheExistingTwoAttemptBudget` —— 三个账号全部不给 usage 时，
+  上游**只被调用 2 次**（复用 fluxgate §5 既有预算，未新开计数），终态 502，
+  两条 Release 均为 `missing` + `usage_missing`。
+- `TestUsageIntegrityZeroServesTheResponseWithoutFailover` —— 显式 `zero` 的 provider 不重试。
+- `TestUnstampedLeaseStillRefusesUnmeteredTraffic` —— 未打标的 lease **不 fail-open**，
+  仍拒绝无法计量的流量（与 A13 之前行为一致）。
+- `TestSnapshotLoopDropsAccountsWhoseProviderDeclaresNoUsageIntegrity` —— 未注册 provider 的账号
+  不进可调度快照；进入快照的账号带上了 registry 打的 `failover` 标。
+- `TestEveryRegisteredProviderDeclaresUsageIntegrity` —— 八个已注册 provider 逐一断言取值合法
+  且等于 §6.2 首批表的 `failover`。
+- `TestUsageIntegrityForRejectsUnregisteredProviders`。
+- 编译期强制：`Provider` 接口把声明变成必选方法，本轮**实际触发了三处编译失败**
+  （`provider_test.go` 两个 stub、`quota_refresh_test.go` 一个），已各自补齐——
+  这正是该设计要防的失效模式（新 provider 忘记声明时，希望是编译失败而不是账号静默消失）。
+
+**明确未由本轮证实**
+
+1. **流式路径未改，仍会产生 `held` 行。** §6.2 要求「首字节后不得重放」，而流式 usage 只在流末
+   才知道，必然已过首字节——流式在设计上就无法 failover。因此 **A13 只减少非流式来源的 held，
+   不得读作「held 归零」**。
+2. **`zero` 不是真正的「计 0」。** 当前行为是「照常返回响应 + `UsageSource=missing`」，
+   B4.3 仍会 hold 它。无 provider 选择该值，§6.2 要求启用前先评审。`estimated` 同理未启用。
+3. **antigravity / copilot 不在 §6.2 的首批表内**，其 `failover` 取值是按「表内四行全为 failover
+   且 zero/estimated 均有前置条件」推出的，**不是文档明文指定**，已写进各自源码注释。
+4. **真实 provider 是否会「成功但不给 usage」未经核实**（C2/C3 live-gate）。
+   本轮全部由本地 httptest fixture 驱动。
+5. **未起 PG / Redis / ClickHouse**，相关集成用例本轮为 skip 而非通过。
+6. 新指标 `gateway_usage_integrity_failover_total` 与
+   `control_snapshot_accounts_dropped_total` **无告警规则消费**（E1 已闭合，A13 的 DoD 未要求）。
+7. 冷却/惩罚语义：`usage_missing` 未进 health.go 的受罚 class 列表，因此落入其 `ELSE` 分支
+   （只记 last_error）。该判断基于代码阅读与既有测试，**未经真实上游行为验证**。
+
 ## 第三次结构性复盘（2026-09-13）
 
 **改动**：纯文档轮，**零代码改动、零契约改动**。更新 `docs/TODO.md`（新增 A13、改写顶部指针）。
@@ -48,7 +117,11 @@ $ grep -ri "usage_integrity\|UsageIntegrity" --include=*.go --include=*.sql .
   与 `cooldown_until`，无 §6.2 要求的 fail-closed 闸门。
 - `internal/gateway/server.go:1295`（非流式）与 `:1215`（流式）把 `UsageSource` 初始化为
   `missing`，有 usage 才改写为 `upstream`；`:1323` 的 failover 条件是 `status >= 400`。
-  因此"上游 200 但无 usage"直接成功返回，不换号。
+  ~~因此"上游 200 但无 usage"直接成功返回，不换号。~~
+  **2026-09-13 实现 A13 时更正：这句是错的。** 非流式循环在 `status >= 400` 分支之后另有
+  一段 `if usage == nil`，本来就在换号并在用尽预算时返回 502。本轮复盘只读到前一段就下了结论。
+  真实缺口是"策略硬编码、非逐 provider 配置"与"被放弃的尝试记为 `ok` 从而落进 `held`"两条，
+  详见 EVIDENCE 的 `A13` 小节与 TODO A13 条目开头的更正块。
 - 其下游后果可追到 `internal/control/billing_policy.go:69`：
   `(missing, partial=false, 成功)` → `held`，即每一次都变成待人工裁定的账目。
 

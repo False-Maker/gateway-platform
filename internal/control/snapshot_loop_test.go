@@ -6,6 +6,8 @@ import (
 	"testing"
 
 	"github.com/alicebob/miniredis/v2"
+	providerpkg "github.com/elucid/gateway-platform/internal/control/provider"
+	"github.com/elucid/gateway-platform/internal/control/provider/builtin"
 	"github.com/elucid/gateway-platform/internal/snapshot"
 	"github.com/elucid/gateway-platform/pkg/contracts"
 	"github.com/redis/go-redis/v9"
@@ -107,5 +109,39 @@ func TestSnapshotLoopUsesPublisherEpochCAS(t *testing.T) {
 	}
 	if _, err := (snapshot.Publisher{Redis: rdb}).Publish(context.Background(), "apikey", "default", 1, []contracts.Account{account}); !errors.Is(err, snapshot.ErrStaleEpoch) {
 		t.Fatalf("stale epoch error=%v", err)
+	}
+}
+
+// A13 / overview §6.2: "没有配置 usage_integrity 不得进入可调度快照". The gate is
+// fail-closed on purpose -- publishing an account we have no stated way to
+// meter is how unbillable usage gets produced.
+func TestSnapshotLoopDropsAccountsWhoseProviderDeclaresNoUsageIntegrity(t *testing.T) {
+	mini := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mini.Addr()})
+	builtin.RegisterAll(nil)
+	repository := &memorySnapshotRepository{
+		buckets: []SnapshotBucket{{Platform: "codex", Group: "default"}},
+		accounts: map[string][]contracts.Account{
+			"codex\x00default": {
+				{ID: "registered", Provider: providerpkg.KindCodex, Platform: "codex", Group: "default", Status: "active", Credential: contracts.Credential{Kind: "oauth", AccessToken: "a", Version: 1}},
+				{ID: "unregistered", Provider: "provider-that-was-never-registered", Platform: "codex", Group: "default", Status: "active", Credential: contracts.Credential{Kind: "oauth", AccessToken: "b", Version: 1}},
+			},
+		},
+	}
+	loop := SnapshotLoop{Repository: repository, Redis: rdb}
+	if err := loop.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := (snapshot.Loader{Redis: rdb}).Load(context.Background(), "codex", "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(loaded.Accounts) != 1 || loaded.Accounts[0].ID != "registered" {
+		t.Fatalf("unregistered provider reached the schedulable snapshot: %+v", loaded.Accounts)
+	}
+	// Stamped from the registry, not from a column: §6.2 makes the policy a
+	// property of the provider, so two accounts of one provider cannot disagree.
+	if loaded.Accounts[0].UsageIntegrity != contracts.UsageIntegrityFailover {
+		t.Fatalf("account was published without a usage_integrity stamp: %+v", loaded.Accounts[0])
 	}
 }

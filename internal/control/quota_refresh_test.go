@@ -357,6 +357,9 @@ type quotaCountingProvider struct {
 }
 
 func (p *quotaCountingProvider) Kind() string { return providerapi.KindCodex }
+func (p *quotaCountingProvider) UsageIntegrity() contracts.UsageIntegrity {
+	return contracts.UsageIntegrityFailover
+}
 func (p *quotaCountingProvider) Authorize(context.Context, contracts.ImportRequest) (contracts.TokenBundle, error) {
 	return contracts.TokenBundle{}, nil
 }

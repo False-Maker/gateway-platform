@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/elucid/gateway-platform/internal/events"
+	"github.com/elucid/gateway-platform/internal/observability"
 	"github.com/elucid/gateway-platform/pkg/contracts"
 	"github.com/elucid/gateway-platform/pkg/protokit"
 )
@@ -1307,6 +1308,38 @@ func (s *Server) handleNonStreaming(ctx context.Context, tenantID, group string,
 			}
 			lastErr = callErr
 		}
+		// A13 / overview §6.2: an intact response carrying no usage block is an
+		// integrity failure on providers whose usage_integrity is `failover`.
+		// Neither branch above can have fired -- this needs status < 400 and no
+		// network error -- so the class is only ever set here.
+		//
+		// Recording it as a failure rather than as ErrorOK is the point. The
+		// attempt is abandoned, not served, and B4.3 settles
+		// (missing, !partial, failed) as not_billable; the ErrorOK this
+		// previously carried made every single failover deposit a `held` row for
+		// a human to adjudicate, which is the opposite of what §6.2 wanted
+		// failover for. No account penalty follows: usage_missing is absent from
+		// health.go's penalised classes, and a provider that omits usage is not
+		// a sick account.
+		//
+		// The test is "not one of the opt-out policies" rather than
+		// "== failover" on purpose. A lease should always arrive stamped -- the
+		// snapshot gate drops accounts whose provider declares nothing -- but if
+		// one ever arrives unstamped, the conservative action is to refuse to
+		// serve traffic we cannot meter, not to serve it. That is also exactly
+		// the behaviour this path had before A13, so an unstamped lease changes
+		// nothing. This is a defensive fallback on an already-validated value,
+		// not a configuration default: §6.2's "no implicit default" rule is
+		// enforced where configuration happens -- the Provider interface makes
+		// the declaration a compile error to omit, and the snapshot gate refuses
+		// to publish accounts without one.
+		integrityFailover := !networkErr && status < 400 && usage == nil &&
+			lease.UsageIntegrity != contracts.UsageIntegrityZero &&
+			lease.UsageIntegrity != contracts.UsageIntegrityEstimated
+		if integrityFailover {
+			release.ErrorClass = contracts.ErrorUsageMissing
+			observability.Default.AddCounter("gateway_usage_integrity_failover_total", 1, "provider", leaseProvider(s, lease))
+		}
 		releaseCtx, releaseCancel := context.WithTimeout(context.WithoutCancel(ctx), releaseWriteTimeout)
 		_, releaseErr := s.Producer.Add(releaseCtx, mustStreamEvent(contracts.EventTypeRelease, release))
 		releaseCancel()
@@ -1334,10 +1367,24 @@ func (s *Server) handleNonStreaming(ctx context.Context, tenantID, group string,
 		}
 		if usage == nil {
 			lastErr = ErrUsageUnavailable
-			if attemptNo < 2 {
-				continue
+			if integrityFailover {
+				// §6.2: "换号重试;达到预算则返回 502". The exhausted account is
+				// already in attemptedAccounts, so the retry lands elsewhere;
+				// the budget is fluxgate §5's existing two-attempt one, not a
+				// second counter layered on top of it.
+				if attemptNo < 2 {
+					lastStatus = http.StatusBadGateway
+					continue
+				}
+				return nil, http.StatusBadGateway, lastErr
 			}
-			return nil, http.StatusBadGateway, lastErr
+			// Reached only by a provider that explicitly opted out via `zero` or
+			// `estimated`. Neither is wired into the hot path: §6.2 allows
+			// `zero` only for "未来 provider 在评审后显式选择" and gates
+			// `estimated` behind a tokenizer calibration report, and no
+			// registered provider selects either today. Serving the response
+			// with UsageSource=missing leaves the row visible to a human (B4.3
+			// holds it) rather than inventing a token count here.
 		}
 		return body, http.StatusOK, nil
 	}
