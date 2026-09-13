@@ -7,6 +7,67 @@
 > 阅读规则：本文的每一条都是**对已发生事实的描述**。不要从本文推断"项目是否可以继续开发"——
 > 那个问题由 `docs/TODO.md` 和 `AGENTS.md` §0 回答。
 
+## 修复 detail fixture 的 TTL 竞态（2026-09-13）
+
+**改动**：只动测试，**产品代码零改动**。`internal/control/console_integration_test.go`：
+新增 `b5DetailOccurredAt()`（`now-1h`，按毫秒截断以匹配 `DateTime64(3)`）替换明细 fixture 里
+写死的 `2022-03-07`；新增守门用例 `TestDetailFixtureStaysInsideTheRetentionWindow`；
+补写文件头注释，说明「纪元」约定为何**不得**套用到 ClickHouse 明细上。
+
+**为什么不是把 `b5OccurredAt` 整体挪走**
+
+`b5OccurredAt` 同时被 PG 的 ledger 与对账用例使用（`:94/:95/:115/:138/:182/:527`），
+文件头注释写明纪元的用途是「这套测试共用一个数据库，每个按窗口断言的用例需要自己的纪元」。
+那个理由在 PG 上成立（无保留策略），整体挪走会把一个 TTL 竞态换成一个跨用例污染竞态。
+真正有问题的只有第 603 行那个**复制出来的**字面量——它是唯一进 ClickHouse 的。
+明细侧也不需要纪元：它按随机 tenant id 过滤，不按时间窗。
+
+**守门经实测有效，不是靠推理**
+
+把 fixture 临时改回 2022 后守门用例立刻变红，随即还原：
+
+```
+--- FAIL: TestDetailFixtureStaysInsideTheRetentionWindow
+    detail fixture 2022-03-07 09:30:00 +0000 UTC is 39630h19m23s old,
+    at or past the 720h0m0s TTL: the row can be dropped by a merge before it is read
+```
+
+该守门不依赖基础设施（纯算术），因此在默认 `go test ./...` 下也会跑，
+而此时 ClickHouse 用例本身是 skip 的——即「没有环境」也拦得住这次回归。
+
+**本轮执行（命令与结果）**
+
+```
+$ go build ./... && go vet ./...        # 通过
+$ gofmt -l .                            # 本轮文件无输出
+$ source configs/test-infra/test.env && go test -count=1 -p 1 ./...   # 连跑 12 次
+```
+
+**12 次全量的结果（真 PG / 真 Redis / 真 ClickHouse）**
+
+| 用例 | 失败次数 | 状态 |
+|---|---|---|
+| `TestConsoleRequestLogReadsDetail` | **0 / 12** | 本轮修复的目标，未再复现 |
+| `TestBillingJobSettlesLedgerRowsAndWalletInOneTransaction` | 1 / 12 | 先于本轮存在，**未修** |
+| `TestP2RealRedisQueueLifecycleAndGatewayIsolation` | 2 / 12 | 本轮**新发现**，未修 |
+
+**本轮新发现的第三个偶发失败（未修，不属本轮范围）**
+
+`internal/control/wrapper` 的 `TestP2RealRedisQueueLifecycleAndGatewayIsolation`
+在 `queue_integration_test.go:66` 失败，reclaim 返回空 lease 且 `err=redis: nil`，
+而旧 lease 的 `ExpiresAt` 就在当下附近。看起来是租约到期时刻与 reclaim 时刻的时序竞态。
+按 AGENTS.md §6 只陈述一次，不顺手修。
+
+**明确未由本轮证实**
+
+1. **测试套件仍不可靠。** 本轮只修掉三个偶发失败中的一个；剩下两个各自独立、根因未查。
+   在它们被修掉之前，单次 `go test` 全绿**不足以**作为验收依据，需要重复跑。
+2. 之前记录「`TestBillingJob...` 本轮 5 次未复现」的那条**现在有了反证**：
+   本轮 12 次里复现了 1 次，确认它仍然存在。之前那句不是结论，现在也不改写成「一直存在」——
+   只是这次抓到了。
+3. 产品代码未改动，因此本轮**不构成**对任何产品行为的新验证。
+4. 仍是单机单实例、无真实上游请求。
+
 ## 真实基础设施集成测试复跑（2026-09-13）
 
 **改动**：**零代码改动。**本轮只跑测试并记录结果。

@@ -26,9 +26,29 @@ import (
 // this suite shares one database, and every test that asserts over a whole
 // window needs its own era so another test's rows cannot wander into the
 // assertion.
+// The era trick works because those rows live in PostgreSQL, which has no
+// retention policy. It must NOT be extended to the ClickHouse detail store:
+// internal/detail's table is created with `TTL occurred_at + 30 DAY`, so a row
+// dated 2022 is already expired when it is written and any background merge may
+// drop it between the write and the read. That is a race, not a failure, which
+// is why it survived a full B5 round and only showed up on the 5th full run
+// (see docs/EVIDENCE.md, "真实基础设施集成测试复跑").
+//
+// Detail fixtures therefore use b5DetailOccurredAt below. They do not need an
+// era of their own: the detail assertions filter by a random tenant id rather
+// than by a time window, so no other test's rows can reach them.
 var (
 	b5OccurredAt = time.Date(2022, 3, 7, 9, 30, 0, 0, time.UTC)
 )
+
+// b5DetailOccurredAt is a detail-store timestamp that is inside the table's TTL
+// window. It is computed per call rather than fixed, because any hard-coded
+// date eventually falls out of a 30-day window and would reintroduce exactly
+// the race it exists to avoid. Truncated to milliseconds to match the column's
+// DateTime64(3) so the value round-trips exactly.
+func b5DetailOccurredAt() time.Time {
+	return time.Now().UTC().Add(-time.Hour).Truncate(time.Millisecond)
+}
 
 // newConsoleTestConsole opens the gated database and returns a console wired to
 // it. It skips rather than fails when the environment is absent, the way every
@@ -600,7 +620,7 @@ func b5DetailRelease(tenantID string) contracts.Release {
 	return contracts.Release{
 		SchemaVersion: contracts.SchemaVersion, EventID: contracts.TerminalEventID(attemptID),
 		RequestID: "b5-console-req", AttemptID: attemptID, AttemptNo: 2,
-		ProducerID: "gw-node-b5", OccurredAt: time.Date(2022, 3, 7, 9, 30, 0, 0, time.UTC),
+		ProducerID: "gw-node-b5", OccurredAt: b5DetailOccurredAt(),
 		AccountID: "acct-b5", Provider: "b5-detail-provider", Model: "b5-model", TenantID: tenantID,
 		StatusCode: 200, LatencyMS: 1234, ErrorClass: contracts.ErrorOK,
 		UsageSource: contracts.UsageSourceUpstream, Partial: false,
@@ -734,5 +754,27 @@ func TestConsoleAccountsBoardScansRealRows(t *testing.T) {
 	}
 	if len(account.ExcludedModels) != 1 || account.ExcludedModels[0] != "b5-model" {
 		t.Errorf("excluded_models = %v", account.ExcludedModels)
+	}
+}
+
+// TestDetailFixtureStaysInsideTheRetentionWindow guards the fix for a race that
+// hid in this suite through an entire B5 round: the detail fixture used to be
+// dated 2022, which is outside internal/detail's 30-day TTL, so the row was
+// already expired when written and any background merge could drop it before
+// the assertion read it. The test then passed or failed depending on merge
+// timing -- it failed on 1 of 5 full runs and never in isolation.
+//
+// Needs no infrastructure: it is arithmetic on the fixture, so it also runs in
+// the default `go test ./...` where the ClickHouse suites skip. Keeping it
+// close to the era convention above is deliberate -- the convention reads like
+// it should apply to the detail fixture too, and this is what says it must not.
+func TestDetailFixtureStaysInsideTheRetentionWindow(t *testing.T) {
+	occurred := b5DetailRelease("any-tenant").OccurredAt
+	age := time.Since(occurred)
+	if age < 0 {
+		t.Fatalf("detail fixture %s is in the future", occurred)
+	}
+	if ttl := time.Duration(detail.DefaultTTLDays) * 24 * time.Hour; age >= ttl {
+		t.Fatalf("detail fixture %s is %s old, at or past the %s TTL: the row can be dropped by a merge before it is read", occurred, age, ttl)
 	}
 }
