@@ -98,6 +98,13 @@ gateway 无 DB,但 Redis 在热路径上承担三件事:**消费快照(唯一数
 `UpstreamProfile` 是**静态**配方,gateway 盲注 header。但 chatgpt2api 的 PoW/Turnstile 调用点在 **`chat-requirements`(每条消息)**,不只是登录。若 **codex provider 走这种 web-backend 路径**,则"每请求现场生成 challenge token"属于 provider(control 慢路径)却必须在 gateway **每请求**执行,静态 Profile 覆盖不了。
 **P2 打通 codex 前必须核实**:codex CLI 的 API 端点是否需要每请求 PoW/turnstile。若需要,要么把该 provider 的 per-request minter 作为 gateway 可调用的旁路(热路径可承受的本地计算),要么承认该渠道不适用无状态热路径模型。
 
+> **2026-09-11 更新(C6 的 no-cred 部分):结论是"不需要"。** 本平台用的端点
+> `https://chatgpt.com/backend-api/codex/responses` 是**纯 Bearer** 调用,不带 sentinel 头、
+> 不调 `chat-requirements`。故静态 `UpstreamProfile` 够用,**不开** per-request minter 旁路,
+> 热/慢拆分不破。详见 `docs/C6-CODEX-PER-REQUEST-CHALLENGE.md`。
+> **剩余**:拿真实 codex 账号对该端点发一次只带 Bearer 的通用文本推理请求确认(live-gate)。
+> 需要每请求 PoW/turnstile 的是 **ChatGPT web 渠道**,本平台未把它建模为 provider。
+
 ## 8. 技术栈
 
 Go 1.23 + Gin;utls(github.com/refraction-networking/utls v1.6.7)做 JA3 伪装;Redis 客户端(消费快照 + token 哈希 + 原子限流(账号级 + tenant 级) + 粘滞映射 `gateway:sticky:<tenant>:<hash>` + 事件产出)。无 DB —— gateway 无持久状态。

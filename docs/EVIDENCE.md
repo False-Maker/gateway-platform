@@ -7,6 +7,92 @@
 > 阅读规则：本文的每一条都是**对已发生事实的描述**。不要从本文推断"项目是否可以继续开发"——
 > 那个问题由 `docs/TODO.md` 和 `AGENTS.md` §0 回答。
 
+## 第四次结构性复盘（2026-09-14）
+
+**改动**：**零代码改动、零契约改动。**更新 `docs/TODO.md`（新增 A14、改写顶部指针）；
+修正 `keyhive/docs/architecture.md` 五处、`fluxgate/docs/architecture.md` 一处文档漂移。
+
+**方法上的两点调整**（针对第三次复盘暴露的问题）
+1. **换扫描重点**：第三次主扫总览，两份**角色文档**只查了 checkbox，
+   `P2-ADMISSION.md` / `AUDIT-CONTEXT.md` 基本没碰。本轮主扫这三份。
+2. **读完整函数，不读 grep 片段**。第三次就是只读到 `status >= 400` 那段就下结论，
+   漏掉了后面十行的 `if usage == nil`，导致基线写错。
+
+**本轮执行（命令与结果）**
+
+```
+$ grep -n "CREATE UNIQUE INDEX|CREATE INDEX|PRIMARY KEY|UNIQUE" migrations/001_initial.sql
+$ grep -rn "TryAcquireSingleton|SKIP LOCKED|STALE_EPOCH|Rename" --include=*.go .
+$ 读完整函数：Chooser.MarkFailure / BillingJob.settleTenant / selectBillableRows /
+             Queue.Claim / Queue.nextMessage / SnapshotLoop.RunOnce
+```
+
+### 发现一（唯一的代码缺口）：`forbidden_transport` 的处置只做了一半 → A14
+
+总览 §6.3.1 表与 `fluxgate/docs/architecture.md` §2.1 都要求
+**「不罚账号；改为出口路径 5–10s 短路」**——两个要求。
+`internal/gateway/chooser.go:287` 直接早退，只实现了「不罚账号」；
+全仓库 `egress` / `circuit` / 代理级冷却**零命中**。
+
+后果：出口 IP 或 TLS 指纹被标记时，每个请求烧掉两个账号的尝试、两次上游往返，
+且对已经在拦截的 WAF **无任何退避**。A9 的 `PlatformSignals` + E1 让它可见，
+但 §6.3.1 规则 2 要的是「不要一个号一个号烧着去发现」——**检测有了，处置没有**。
+DoD 见 `docs/TODO.md` A14。
+
+### 发现二：六处文档漂移（已在本轮修正）
+
+| 文档 | 原文 | 实际 |
+|---|---|---|
+| keyhive §4 | `request_logs`「**当前未实现**：仓库内没有该存储」 | A12 已实现（`internal/detail` + ClickHouse `request_detail`） |
+| keyhive §5 | 「**未建**：import_templates、request_logs」 | request_logs 部分已过时，`import_templates` 仍未建（属实） |
+| keyhive §5 | 「**未做**：合成终态和 `UsageSource=missing` 的超阈值告警规则」 | E1 已交付 `UsageSourceMissingRatioHigh` / `SyntheticTerminalStateSpike` |
+| keyhive §5 | 「告警投递规则（Prometheus rule / 通知）属部署侧，**未做**」 | Prometheus 规则已交付；通知通道仍属部署侧 |
+| keyhive §2 | 隔离硬边界第 1 条「上游魔数只出现在各自 `const.go`」 | 与其上方布局块自相矛盾（实际集中在 `provider/profile.go`） |
+| fluxgate §7 | 「**P2 打通 codex 前必须核实**」无结论 | C6 的 no-cred 部分已核实为「不需要」（总览附录已更新，此处漏更） |
+
+### 发现三：`TryAcquireSingleton` 未用于周期任务（记录，不列为任务）
+
+keyhive §3.4 要求「1 主 1 备……只承担『谁跑周期性全量任务』这类 singleton 语义，
+用**每周期重竞争的 singleton 锁**」。`Fencer.TryAcquireSingleton` 已实现，但**只**被
+`import.go:34` / `refresh.go:50` 用于 **per-account** 锁；`run.go` 主循环的**七个 ticker**
+（trim / refresh / snapshot / token / quota / quota-reconcile / billing）**一个都没用它**。
+
+**但本轮核实后判定这不是正确性缺口**，因此不开任务——每个周期任务各自已有并发保护：
+
+| 周期任务 | 并发保护 | 核实位置 |
+|---|---|---|
+| billing | `FOR UPDATE` + `billing_state='pending'` 过滤（READ COMMITTED 下解锁后重估 WHERE） | `billing_job.go:296-304` |
+| snapshot | Lua 原子 CAS，`expected_epoch` 不符返回 `STALE_EPOCH` | `snapshot/redis.go:55` |
+| token 发布 | 原子 `RENAME` | `snapshot/auth.go:91` |
+| 尝试回收器 | `FOR UPDATE SKIP LOCKED` + 确定性 `terminal_event_id` | `ledger.go:95`、`contracts.go:425` |
+| quota outbox | `FOR UPDATE SKIP LOCKED` | `quota_refresh.go:238` |
+| refresh | per-account advisory lock | `refresh.go:50` |
+
+所以 1 主 1 备并发跑周期任务是**浪费**（重复计算、STALE_EPOCH 空转），不会算错账。
+记录于此，不列为任务。
+
+### 核对通过、不再重复列为缺口的项
+
+- keyhive §4 的 **P0 索引与回收约束全部成立**：`usage_ledger` 唯一 `event_id`/`attempt_id` +
+  `(tenant_id,occurred_at)`/`(account_id,occurred_at)` 索引；`request_attempts` 唯一
+  `terminal_event_id` + `(state,deadline_at)`/`(request_id)`；`accounts` 唯一
+  `(source_system,source_id)` + `(provider,group,status)`；`migration_records` 唯一
+  `(source_system,source_id,record_kind)`。
+- 回收器确为 `FOR UPDATE SKIP LOCKED`，`terminal_event_id` 确为 `sha256(attempt_id+":terminal")`。
+- `Chooser.MarkFailure` 与 fluxgate §2.1 逐条吻合：per-(账号,模型) 键、±20% 抖动、
+  `rate_limited_unknown` 的 5s→15s→60s 阶梯（≤ 文档的 5min 上限）、
+  `auth_invalid` 本地永久停选、`forbidden_transport` 不进账号冷却表。
+- `AccountLimits.DegradePolicy` 的 fail_open 分支（`limiter.go:55`）。
+- `P2-ADMISSION.md` 所列各项与代码一致，无新要求。
+
+**明确未由本轮证实**
+
+1. **本轮零代码改动**，因此不构成对任何产品行为的新验证；未跑测试（无代码变更）。
+2. **A14 的 5–10s 来自设计文档，未经真实流量校准**；真实 WAF 的拦截与恢复特征属 C3 live-gate。
+3. 本轮以设计文档的**明文要求**为基准，覆盖不到「文档未写而实现可能欠缺」的部分；
+   「核对通过」只表示该要求有对应实现，**不表示**该实现已在真实流量下验证。
+4. `docs/AUDIT-CONTEXT.md` 本轮只做了针对性查证（usage-integrity 相关），未逐行重扫。
+
 ## 计费测试两个偶发失败的根因（2026-09-14）
 
 **改动**：只动测试，**产品代码零改动**。`billing_job_integration_test.go` 新增 `isolateBillingRun`

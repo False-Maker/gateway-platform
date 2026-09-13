@@ -47,7 +47,8 @@ type Provider interface {
 ```
 
 隔离硬边界:
-1. 上游魔数只出现在各自 `const.go`,上游改版只改一个文件。
+1. 上游魔数集中在 `provider/profile.go` 的 EndpointProfile(见上方布局),上游改版只改一个文件。
+   (v1 写的是"各自 `const.go`";实际实现选择了集中式,2026-09-14 对齐。)
 2. 单渠道 refresh 失败 / 被封 JA3,隔离在自己包 fail,不拖累其他渠道保鲜循环。
 3. **apikey 静态账号是退化 provider**:`Refresh` 原样返回 token、`Profile` 只给 base_url,不搞两套接口。
 
@@ -118,7 +119,7 @@ v2 用**每账号 fencing token** 替代 v1 的全局单 leader:
 - **request_attempts** —— `attempt_id` 主键、`request_id`、`started_at`、`deadline_at`、`terminal_event_id`、`state`、`reconciled_at`。消费 `attempt_started` 后落库;超出 `attempt_lease` 且没有终态 Release 时,回收器写入唯一的 `missing/partial` 终态并关闭尝试。
 
 **请求明细(独立、可丢/可抽样存储,不进控制 PG)**
-- **request_logs** —— 请求明细,消费 Release 落明细(实时请求日志用);走 ClickHouse 风格独立存储或抽样,**不经过单写者、不与控制状态共库**。**当前未实现**:仓库内没有该存储,属 P6 控制台前置。
+- **request_logs** —— 请求明细,消费 Release 落明细(实时请求日志用);走 ClickHouse 风格独立存储或抽样,**不经过单写者、不与控制状态共库**。**已实现(A12,2026-09-11)**:`internal/detail` 走 ClickHouse HTTP + JSONEachRow,表名 `request_detail`(`ReplacingMergeTree` / 按 `occurred_at` 分区 / 30 天 TTL),**无对应 PG migration**——明细刻意不进控制状态库。形态决策见 `docs/A12-REQUEST-DETAIL.md`。
 
 **迁移 staging(新系统首次设计,不复用线上旧 migration map)**
 - `migration_runs` —— 源库快照时间、批次状态、校验摘要、dry-run/正式导入标记。
@@ -144,10 +145,10 @@ P0 索引与回收约束固定为:
 - [x] **每账号 fencing** 写者骨架 + 周期任务 singleton 锁(PG advisory 优先);PG 是 `fence_epoch` 唯一权威,Redis 不承担账号写者权威
 - [x] 快照写入 + Redis Stream consumer 的空跑通道(无真实 provider),含 pending reclaim(60s)、最多 5 次重试、死信和坏版本处理。本地/miniredis 已覆盖，真实 Redis 验收 pending。
 - [x] P1:PG `usage_ledger` 幂等写入,事务提交后 ACK,并通过重复投递与 control 崩溃恢复测试(`TestPostgresLedgerIdempotencyAndRecovery`、`TestAcceptanceControlCrashAfterCommitBeforeAck`、`TestAcceptanceGatewayCrashAfterAttemptStartedRecovery`,2026-09-10 在 Docker PG/Redis 真实通过)
-- [x] P1:事件消费指标 `control_stream_pending` / `control_stream_reclaim_total` / `control_stream_dlq_total{reason}` / `usage_ledger_duplicate_total` / `request_attempt_recovered_total{source}` / `request_attempt_open_age_seconds` / `release_xadd_total{result}` 已在 `internal/events`、`internal/control` 暴露(`/metrics` :9091)。**未做**:合成终态和 `UsageSource=missing` 的超阈值告警规则(部署侧 alerting)。
-- [x] **平台级速率告警**:`PlatformSignals` 按平台 60s 窗口聚合 `forbidden_transport` / `blocked` 的不同账号数,≥2 即置 `control_platform_alert{provider}` 网关指标——这是 R4(TLS 指纹时效)与出口 IP 被标记的**唯一探测机制**(总览 §6.3.1 规则 2)。告警投递规则(Prometheus rule / 通知)属部署侧,未做
+- [x] P1:事件消费指标 `control_stream_pending` / `control_stream_reclaim_total` / `control_stream_dlq_total{reason}` / `usage_ledger_duplicate_total` / `request_attempt_recovered_total{source}` / `request_attempt_open_age_seconds` / `release_xadd_total{result}` 已在 `internal/events`、`internal/control` 暴露(`/metrics` :9091)。合成终态与 `UsageSource=missing` 的超阈值告警规则**已由 E1 交付**(`configs/alerts/gateway-platform.rules.yml` 的 `UsageSourceMissingRatioHigh` / `SyntheticTerminalStateSpike`,2026-09-11);阈值未经真实流量校准。
+- [x] **平台级速率告警**:`PlatformSignals` 按平台 60s 窗口聚合 `forbidden_transport` / `blocked` 的不同账号数,≥2 即置 `control_platform_alert{provider}` 网关指标——这是 R4(TLS 指纹时效)与出口 IP 被标记的**唯一探测机制**(总览 §6.3.1 规则 2)。Prometheus 告警规则**已由 E1 交付**;通知通道(谁收、怎么收)仍属部署侧。**注意**:探测有了,但 §6.3.1 要求的**处置**(出口路径 5–10s 短路)仍未实现,见 `docs/TODO.md` A14
 - [x] `gwd --role=wrapper` 进程 + **语言无关** claim/complete/fail lease 契约(Go 与 Python worker 都能领)。本地进程与 Python fixture 已覆盖；Redis 7.0.15 与 7.4.11 ACL/进程验收 2026-09-10 在 Docker 上通过。
-- [x] 建表(部分):accounts / credentials / quota_snapshot_outbox / tenants / principals / tenant_tokens(控制 PG)+ usage_ledger / request_attempts(计量与尝试)+ migration_runs / migration_records(staging)。**未建**:import_templates、request_logs(独立存储)。
+- [x] 建表(部分):accounts / credentials / quota_snapshot_outbox / tenants / principals / tenant_tokens(控制 PG)+ usage_ledger / request_attempts(计量与尝试)+ migration_runs / migration_records(staging)。请求明细不在 PG,见 §4 的 request_logs(A12 已由 ClickHouse 实现)。**未建**:import_templates。
 
 ## 6. 技术栈
 
