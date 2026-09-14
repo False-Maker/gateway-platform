@@ -97,42 +97,75 @@ func (c Console) handleHeld(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	cursor, err := parseCursor(r.URL.Query().Get("cursor"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, cursorError(err))
+		return
+	}
 	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 	defer cancel()
 
+	// The keyset predicate mirrors the ORDER BY exactly: (occurred_at, id)
+	// strictly after the last row of the previous page. Oldest first, because
+	// the oldest held row is the one that has been waiting on a human longest
+	// -- which is also why offset paging would be wrong here, since it is
+	// precisely those rows that a shifting offset drops.
 	rows, err := c.DB.Query(ctx, `
 		SELECT event_id,tenant_id,provider,model,account_id,status_code,error_class,
 		       usage_source,partial,tokens_in,tokens_out,cache_read_tokens,cache_write_tokens,
-		       occurred_at,COALESCE(billing_run_id,'')
+		       occurred_at,COALESCE(billing_run_id,''),id
 		FROM usage_ledger
 		WHERE billing_state='held' AND ($1::text = '' OR tenant_id = $1::text)
+		  AND ($3::text = '' OR (occurred_at, id) > ($3::timestamptz, $4::bigint))
 		ORDER BY occurred_at, id
-		LIMIT $2`, tenantID, limit)
+		LIMIT $2`, tenantID, fetchLimit(limit), cursor.Sort, cursor.ID)
 	if err != nil {
 		c.fail(w, "query held rows", err)
 		return
 	}
 	defer rows.Close()
 	held := []heldRow{}
+	// lastSort/lastID track the final row actually returned, which is what the
+	// next cursor must name -- not the extra probe row, which the caller has
+	// not seen.
+	var lastSort string
+	var lastID int64
+	// hasMore is set only by actually seeing the probe row. Inferring it from
+	// len(held) == limit instead would hand out a cursor to an empty page
+	// whenever the backlog happens to be an exact multiple of the page size,
+	// and "one last empty page" is indistinguishable from "the tray drained"
+	// to whoever is working it.
+	hasMore := false
 	for rows.Next() {
 		var row heldRow
 		var occurredAt time.Time
+		var id int64
 		if err := rows.Scan(&row.EventID, &row.TenantID, &row.Provider, &row.Model, &row.AccountID,
 			&row.StatusCode, &row.ErrorClass, &row.UsageSource, &row.Partial,
 			&row.TokensIn, &row.TokensOut, &row.CacheReadTokens, &row.CacheWriteTokens,
-			&occurredAt, &row.BillingRunID); err != nil {
+			&occurredAt, &row.BillingRunID, &id); err != nil {
 			c.fail(w, "scan held row", err)
 			return
+		}
+		if len(held) == limit {
+			// The probe row proves there is more; it is not part of this page.
+			hasMore = true
+			break
 		}
 		row.OccurredAt = occurredAt.UTC().Format(time.RFC3339)
 		row.HeldBecause = heldReason(row.UsageSource, row.Partial, row.StatusCode, row.ErrorClass)
 		held = append(held, row)
+		lastSort, lastID = occurredAt.UTC().Format(time.RFC3339Nano), id
 	}
 	if err := rows.Err(); err != nil {
 		c.fail(w, "read held rows", err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"held": held, "count": len(held)})
+	next := ""
+	if hasMore {
+		next = encodeCursor(lastSort, lastID)
+	}
+	writeJSON(w, http.StatusOK, pageResponse("held", held, len(held), next))
 }
 
 // heldReason restates the policy table's verdict for one row. An unknown class

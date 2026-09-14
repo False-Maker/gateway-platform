@@ -50,6 +50,8 @@ type Console struct {
 	Detail detail.ClickHouseWriter
 	// Now is injectable for tests.
 	Now func() time.Time
+	// Limiter is injectable for tests. Nil builds the default token bucket.
+	Limiter *consoleLimiter
 }
 
 func (c Console) now() time.Time {
@@ -75,6 +77,9 @@ func (c Console) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/health", c.handleHealth)
 	mux.HandleFunc("GET /v1/accounts", c.handleAccounts)
+	mux.HandleFunc("POST /v1/accounts/{accountID}/status", c.handleAccountStatus)
+	mux.HandleFunc("POST /v1/accounts/{accountID}/cooldown/clear", c.handleClearCooldown)
+	mux.HandleFunc("POST /v1/accounts/{accountID}/excluded-models/clear", c.handleClearExcludedModels)
 
 	mux.HandleFunc("GET /v1/billing/wallets/{tenantID}", c.handleWallet)
 	mux.HandleFunc("POST /v1/billing/wallets/{tenantID}/topup", c.handleTopup)
@@ -86,23 +91,36 @@ func (c Console) Handler() http.Handler {
 
 	mux.HandleFunc("GET /v1/requests", c.handleRequests)
 
-	return c.authorize(mux)
+	return c.authorize(c.rateLimit(mux))
 }
 
-// authorize wraps the mux: nothing inside is reachable without the operator
+// authorize wraps the mux: nothing inside is reachable without an operator
 // token, including routes added later, because the check is on the way in and
 // not repeated per handler.
+//
+// Write capability is decided here too, by method rather than by path. Every
+// mutating route in this package is a POST and every read is a GET, so "POST
+// requires the read-write token" needs no list that a later handler could be
+// forgotten from -- a new endpoint is read-only until it is a POST, and the
+// moment it is a POST it is already protected.
 func (c Console) authorize(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// The health probe is authenticated too. It reveals nothing an
 		// unauthenticated caller needs, and an unauthenticated route is one
 		// more thing to reason about; keep the surface uniform instead.
-		if !c.Auth.authorize(r) {
+		access := c.Auth.access(r)
+		if access == consoleDenied {
 			if !c.Auth.Enabled() {
 				log.Printf("console request rejected: %s is not set, the console is disabled", ConsoleTokenEnv)
 			}
 			c.metrics().AddCounter("control_console_rejected_total", 1, "path", r.URL.Path)
 			writeError(w, http.StatusUnauthorized, "operator token required")
+			return
+		}
+		if r.Method != http.MethodGet && access != consoleReadWrite {
+			c.metrics().AddCounter("control_console_rejected_total", 1, "path", r.URL.Path)
+			log.Printf("console write to %s refused: caller holds the read-only token (claimed operator %q)", r.URL.Path, operator(r))
+			writeError(w, http.StatusForbidden, "this token may read but not write")
 			return
 		}
 		next.ServeHTTP(w, r)
@@ -152,9 +170,18 @@ func (c Console) handleAccounts(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	cursor, err := parseCursor(r.URL.Query().Get("cursor"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, cursorError(err))
+		return
+	}
 
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
+	// Sorted and paged by id alone. accounts.id is unique, so it needs no
+	// tie-breaker, and the previous (provider, platform, id) ordering cannot
+	// be a keyset key without carrying all three through the cursor for no
+	// benefit -- the board is grouped by the caller, not by the query.
 	rows, err := c.DB.Query(ctx, `
 		SELECT id,provider,platform,"group",status,
 		       COALESCE(last_error_class,''),
@@ -163,14 +190,16 @@ func (c Console) handleAccounts(w http.ResponseWriter, r *http.Request) {
 		FROM accounts
 		WHERE ($1::text = '' OR provider = $1::text)
 		  AND ($2::text = '' OR status = $2::text)
-		ORDER BY provider, platform, id
-		LIMIT $3`, provider, status, limit)
+		  AND ($4::text = '' OR id > $4::text)
+		ORDER BY id
+		LIMIT $3`, provider, status, fetchLimit(limit), cursor.Sort)
 	if err != nil {
 		c.fail(w, "query accounts", err)
 		return
 	}
 	defer rows.Close()
 	accounts := []accountView{}
+	hasMore := false
 	for rows.Next() {
 		var account accountView
 		var lastErrorAt, cooldownUntil *time.Time
@@ -181,6 +210,10 @@ func (c Console) handleAccounts(w http.ResponseWriter, r *http.Request) {
 			&excluded, &updatedAt); err != nil {
 			c.fail(w, "scan account", err)
 			return
+		}
+		if len(accounts) == limit {
+			hasMore = true
+			break
 		}
 		// Timestamps are rendered as strings so callers do not have to guess
 		// a layout, matching the detail store's own UTC formatting.
@@ -198,7 +231,11 @@ func (c Console) handleAccounts(w http.ResponseWriter, r *http.Request) {
 		c.fail(w, "read accounts", err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"accounts": accounts, "count": len(accounts)})
+	next := ""
+	if hasMore {
+		next = encodeCursor(accounts[len(accounts)-1].ID, 0)
+	}
+	writeJSON(w, http.StatusOK, pageResponse("accounts", accounts, len(accounts), next))
 }
 
 // handleRequests is §6.5's live request log, read from A12's detail store. It

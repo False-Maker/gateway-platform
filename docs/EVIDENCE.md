@@ -7,6 +7,88 @@
 > 阅读规则：本文的每一条都是**对已发生事实的描述**。不要从本文推断"项目是否可以继续开发"——
 > 那个问题由 `docs/TODO.md` 和 `AGENTS.md` §0 回答。
 
+## B5.1 控制台硬化（2026-09-14）
+
+**改动**：`internal/control/console_auth.go`（两级）、`console.go`（路由 + 按方法授权 + accounts 分页）、
+`console_held.go`（held 分页）、新增 `console_accounts.go` / `console_limit.go` / `console_cursor.go`、
+`migrations/009_account_actions.sql`、`run.go` 接线。
+**未改计费逻辑、未改快照发布、未改 `ErrorClass` 表。**
+
+**这一条关掉的是 B5 自己的欠账**
+
+B5「本轮未做」里六条，四条是控制台自身的欠账，且**同样从未编号**。
+这是本 session 第四次遇到同一种漏网机制（B4.6、B4.7、E3、B5.1）：
+写进了"本轮未做"段落 ⇒ 扫编号清单的人看不见 ⇒ 复盘时又只扫设计文档与代码，也看不见。
+
+**四个决定，每个都对应一种具体的出错方式**
+
+1. **授权按方法，不按路径清单。** 本包所有写都是 `POST`、所有读都是 `GET`，
+   所以"POST 需要读写 token"不需要一份新 handler 可能被漏登记的清单。
+   写死一份路径白名单是更直觉的做法，但它的失效模式是**静默的**：漏登记的写端点看起来工作正常。
+2. **两 token 相同则拒绝启动。** 当读写用 ⇒ 把写权交给每个"只读"持有者；
+   当只读用 ⇒ 所有写路径莫名 403。两种读法都会误导人，所以不选，改为不启动。
+3. **限流在鉴权之后。** 反过来的话，任何能碰到端口的人都能用失败请求耗光桶，
+   把控制台从持有真凭据的运营手里拒绝掉——限流本身变成攻击面。
+   读/写还分桶：一个不停刷新的看板不得饿死要裁定 held 的人。
+4. **keyset 分页，且用探测行而非"满页"推断。** 详见下面的反向验证。
+
+**账号操作的三条贯穿规则**（每条都防一个具体后果）
+
+- **不直接触达 gateway**：§3 的 P0 决策是只共享快照与 Release 流。动作只写 PG，
+  响应 `effective_within_seconds` 明说延迟——否则"我禁用了它，它还服务了三个请求"
+  会被当 bug 报上来，而那是文档化的设计。
+- **都递增 `fence_epoch`**：在途的凭据刷新持有旧 epoch，不递增就会把结果**盖在运营决定之上**。
+- **审计行与账号更新同事务**：与 `billing_resolutions` 对金钱的论证同构。
+- **无变化即不算数**：重复禁用**不**递增 epoch、**不**写审计行——
+  一次无意义的重试不该白白作废一个正在进行的刷新。
+
+**本轮执行（命令与结果）**
+
+```
+$ go build ./... && go vet ./...                       # 通过
+$ gofmt -l cmd internal pkg                            # 无输出
+$ source configs/test-infra/test.env
+$ go test -count=1 -p 1 ./...                          # 全绿（真实 PG/Redis/ClickHouse）
+$ go test -race -count=1 -p 1 ./pkg/contracts ./internal/control/...   # 全绿
+```
+
+**跑通的新用例**（`console_hardening_test.go` 纯逻辑 + `console_integration_test.go` 需 PG）
+
+- 只读 token：可 GET；对**全部六个**写路径均 403（按方法判定，所以逐个覆盖而非抽样）。
+- 读写 token 仍可写；**未配只读 token 时 B5 的单 token 行为不变**
+  （硬化若悄悄破坏既有部署就不是硬化）。
+- 只配只读 token **不启用**控制台；两 token 相同（含仅空白之差）被 `Validate` 拒绝。
+- 限流：超 burst 后 429 带 `Retry-After`；桶按时间回填；读桶耗尽**不影响**写桶；
+  **20 次鉴权失败不消耗任何配额**，随后真运营仍得到 200。
+- 账号动作：禁用后 `fence_epoch` 递增、审计行的 epoch 与响应一致、账号退出
+  `status='active'` 的可调度集合；无 `reason` 的禁用 400 且**状态未变**；
+  非法 status（含 `ACTIVE; DROP TABLE accounts`）400 且表仍在；
+  清冷却连带清 `consecutive_failures` 且响应带 gateway 本地冷却的告知；
+  未知账号 404（不是"已经是该状态"的 200）；`account_actions` 的 `UPDATE`/`DELETE` 均被拒。
+- 分页：5 行 / 页长 2，且**五行共用同一 `occurred_at`**（专门压 id tie-breaker），
+  翻完**不重不漏**；4 行 / 页长 2 的整数倍场景**不发出指向空页的游标**。
+
+**测试经反向验证（两处）**
+
+1. 把 `next` 的条件从 `hasMore` 改回 `len(held) == limit`（即用"满页"推断），
+   `TestConsoleHeldTrayDoesNotOfferACursorToAnEmptyPage` 立即报
+   `the last full page offered another: has_more=true cursor="..."`。
+   **这正是我第一版写出的 bug**，写完自己发现并改掉，这次用测试把它钉住。
+2. 去掉 `AND status <> $2` 这个无变化守卫，`TestConsoleRepeatedDisableIsANoOpThatDoesNotFence`
+   同时报两条：`a no-op moved fence_epoch from 1 to 2` 与 `got 2 audit rows, want 1`。
+   两处均已还原，还原后测试全绿。
+
+**明确未由本轮证实**
+
+1. **burst=30 / 5 rps 未经真实流量校准**（与 E1、A14、B4.7 同一处理）。
+2. **限流是进程内的**：多实例各自计数。控制台本就是单实例运维面，但不宣称它是全局限流。
+3. **仍不是运营者目录**：`X-Operator` 依旧是**声称**而非认证。两级能力是爆炸半径控制，
+   不是认证系统。任何把 `account_actions.operator` 当作"谁做的"证据的读法都超出了鉴权模型的承诺
+   ——该列的注释里写明了这一点。
+4. `GET /v1/billing/prices` 与 `GET /v1/requests` **未加分页**（前者过滤后有界，
+   后者由 A12 自己管窗口），**有意未做**。
+5. 前端界面、支付渠道、`estimated` 生产者仍未覆盖。
+
 ## E3 CI（2026-09-14）
 
 **改动**：新增 `.github/workflows/ci.yml`。

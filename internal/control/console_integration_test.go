@@ -778,3 +778,389 @@ func TestDetailFixtureStaysInsideTheRetentionWindow(t *testing.T) {
 		t.Fatalf("detail fixture %s is %s old, at or past the %s TTL: the row can be dropped by a merge before it is read", occurred, age, ttl)
 	}
 }
+
+// b5Account seeds one account and returns its id. B5.1's three manual actions
+// all target this row.
+func b5Account(t *testing.T, ctx context.Context, db *pgxpool.Pool, label string) string {
+	t.Helper()
+	accountID := fmt.Sprintf("b51-%s-%d", label, rand.Int63())
+	cleanup := func() {
+		background := context.Background()
+		db.Exec(background, `DELETE FROM account_actions WHERE account_id=$1`, accountID)
+		db.Exec(background, `DELETE FROM accounts WHERE id=$1`, accountID)
+	}
+	cleanup()
+	t.Cleanup(cleanup)
+	if _, err := db.Exec(ctx, `
+		INSERT INTO accounts (id,provider,platform,"group",source_system,source_id,status,
+			consecutive_failures,cooldown_until,excluded_models)
+		VALUES ($1,'b51-prov','b51-plat','default','b51',$1,'active',
+			4, now() + interval '5 minutes', '["b51-model"]'::jsonb)`, accountID); err != nil {
+		t.Fatal(err)
+	}
+	return accountID
+}
+
+func b51Epoch(t *testing.T, ctx context.Context, db *pgxpool.Pool, accountID string) int64 {
+	t.Helper()
+	var epoch int64
+	if err := db.QueryRow(ctx, `SELECT fence_epoch FROM accounts WHERE id=$1`, accountID).Scan(&epoch); err != nil {
+		t.Fatal(err)
+	}
+	return epoch
+}
+
+// B5.1: disabling an account must take it out of the snapshot query, bump the
+// epoch so an in-flight credential refresh loses its CAS, and leave an audit
+// row. The epoch bump is the part worth asserting: without it a refresh already
+// in flight would land on top of the operator's decision.
+func TestConsoleDisableAccountFencesAndAudits(t *testing.T) {
+	ctx, db, console := newConsoleTestConsole(t)
+	accountID := b5Account(t, ctx, db, "disable")
+	before := b51Epoch(t, ctx, db, accountID)
+
+	response := b5Request(t, console, http.MethodPost, "/v1/accounts/"+accountID+"/status",
+		`{"status":"disabled","reason":"suspected leak"}`)
+	if response.Code != http.StatusOK {
+		t.Fatalf("disable: got %d (%s)", response.Code, response.Body.String())
+	}
+	var result accountActionResult
+	if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	if !result.Applied {
+		t.Errorf("disable reported no change: %+v", result)
+	}
+	if result.FenceEpoch <= before {
+		t.Errorf("fence_epoch %d did not advance past %d; an in-flight refresh could overwrite this", result.FenceEpoch, before)
+	}
+	// The response must not imply the change is already live on gateway.
+	if result.EffectiveWithin <= 0 {
+		t.Error("the response does not tell the operator the change arrives via the snapshot")
+	}
+
+	var status string
+	if err := db.QueryRow(ctx, `SELECT status FROM accounts WHERE id=$1`, accountID).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != "disabled" {
+		t.Errorf("status = %q, want disabled", status)
+	}
+	// The snapshot query selects status='active', so a disabled account is out
+	// of rotation on the next publish. Assert that rather than trusting it.
+	var schedulable int
+	if err := db.QueryRow(ctx, `SELECT count(*) FROM accounts WHERE id=$1 AND status='active'`, accountID).Scan(&schedulable); err != nil {
+		t.Fatal(err)
+	}
+	if schedulable != 0 {
+		t.Error("a disabled account is still selectable by the snapshot query")
+	}
+
+	var action, reason, who string
+	var auditEpoch int64
+	if err := db.QueryRow(ctx, `SELECT action,reason,operator,fence_epoch FROM account_actions WHERE account_id=$1`,
+		accountID).Scan(&action, &reason, &who, &auditEpoch); err != nil {
+		t.Fatalf("no audit row was written: %v", err)
+	}
+	if action != "set_status:disabled" || reason != "suspected leak" || who != "b5-test-operator" {
+		t.Errorf("audit row = %q/%q/%q", action, reason, who)
+	}
+	if auditEpoch != result.FenceEpoch {
+		t.Errorf("audit epoch %d does not match the action's %d, so the row cannot be lined up with what it fenced", auditEpoch, result.FenceEpoch)
+	}
+}
+
+// Re-disabling an already disabled account must not bump the epoch and must not
+// write an audit row claiming a change that did not happen. A no-op that
+// invalidated an in-flight refresh would make retries actively harmful.
+func TestConsoleRepeatedDisableIsANoOpThatDoesNotFence(t *testing.T) {
+	ctx, db, console := newConsoleTestConsole(t)
+	accountID := b5Account(t, ctx, db, "noop")
+	if response := b5Request(t, console, http.MethodPost, "/v1/accounts/"+accountID+"/status",
+		`{"status":"disabled","reason":"first"}`); response.Code != http.StatusOK {
+		t.Fatalf("first disable: %d (%s)", response.Code, response.Body.String())
+	}
+	afterFirst := b51Epoch(t, ctx, db, accountID)
+
+	response := b5Request(t, console, http.MethodPost, "/v1/accounts/"+accountID+"/status",
+		`{"status":"disabled","reason":"second"}`)
+	if response.Code != http.StatusOK {
+		t.Fatalf("second disable: %d (%s)", response.Code, response.Body.String())
+	}
+	var result accountActionResult
+	if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Applied {
+		t.Error("a repeated disable reported itself as a change")
+	}
+	if result.Detail == "" {
+		t.Error("a no-op did not say why nothing happened")
+	}
+	if got := b51Epoch(t, ctx, db, accountID); got != afterFirst {
+		t.Errorf("a no-op moved fence_epoch from %d to %d, invalidating in-flight work for nothing", afterFirst, got)
+	}
+	var audits int
+	if err := db.QueryRow(ctx, `SELECT count(*) FROM account_actions WHERE account_id=$1`, accountID).Scan(&audits); err != nil {
+		t.Fatal(err)
+	}
+	if audits != 1 {
+		t.Errorf("got %d audit rows, want 1: a no-op must not claim a change", audits)
+	}
+}
+
+// A reason is mandatory for a status change. An outage nobody can explain later
+// is the failure this guards.
+func TestConsoleDisableRequiresAReason(t *testing.T) {
+	ctx, db, console := newConsoleTestConsole(t)
+	accountID := b5Account(t, ctx, db, "reason")
+	response := b5Request(t, console, http.MethodPost, "/v1/accounts/"+accountID+"/status", `{"status":"disabled"}`)
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("a reasonless disable got %d, want 400 (%s)", response.Code, response.Body.String())
+	}
+	// And it must not have happened anyway.
+	var status string
+	if err := db.QueryRow(ctx, `SELECT status FROM accounts WHERE id=$1`, accountID).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != "active" {
+		t.Errorf("the rejected request changed status to %q anyway", status)
+	}
+}
+
+// Only the two states the rest of the system understands are accepted. An
+// arbitrary string would make the account neither schedulable nor visibly
+// broken.
+func TestConsoleAccountStatusRejectsUnknownStates(t *testing.T) {
+	ctx, db, console := newConsoleTestConsole(t)
+	accountID := b5Account(t, ctx, db, "badstate")
+	for _, bad := range []string{"quarantined", "", "ACTIVE; DROP TABLE accounts"} {
+		body, _ := json.Marshal(map[string]string{"status": bad, "reason": "test"})
+		response := b5Request(t, console, http.MethodPost, "/v1/accounts/"+accountID+"/status", string(body))
+		if response.Code != http.StatusBadRequest {
+			t.Errorf("status %q got %d, want 400", bad, response.Code)
+		}
+	}
+	// The table survives, which it would not if the value reached SQL.
+	if _, err := db.Exec(ctx, `SELECT 1 FROM accounts LIMIT 1`); err != nil {
+		t.Fatalf("accounts is unusable after a hostile status: %v", err)
+	}
+}
+
+// Clearing a cooldown must clear the failure streak with it -- otherwise the
+// next failure re-escalates straight back into a cooldown, which is not what
+// "clear it" means -- and must tell the operator that gateway's own local
+// cooldown is not cleared by this.
+func TestConsoleClearCooldownAlsoClearsTheStreakAndSaysWhatItCannotClear(t *testing.T) {
+	ctx, db, console := newConsoleTestConsole(t)
+	accountID := b5Account(t, ctx, db, "cooldown")
+
+	response := b5Request(t, console, http.MethodPost, "/v1/accounts/"+accountID+"/cooldown/clear", `{"reason":"upstream recovered"}`)
+	if response.Code != http.StatusOK {
+		t.Fatalf("clear cooldown: %d (%s)", response.Code, response.Body.String())
+	}
+	var result accountActionResult
+	if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	if !result.Applied {
+		t.Error("clearing a live cooldown reported no change")
+	}
+	if result.GatewayLocalCooldownNote == "" {
+		t.Error("the response does not warn that gateway's in-process cooldown is untouched; an operator would hunt a bug that is the design")
+	}
+
+	var cooldown *time.Time
+	var failures int
+	if err := db.QueryRow(ctx, `SELECT cooldown_until,consecutive_failures FROM accounts WHERE id=$1`,
+		accountID).Scan(&cooldown, &failures); err != nil {
+		t.Fatal(err)
+	}
+	if cooldown != nil {
+		t.Errorf("cooldown_until = %v, want NULL", cooldown)
+	}
+	if failures != 0 {
+		t.Errorf("consecutive_failures = %d, want 0 so the next failure does not re-escalate immediately", failures)
+	}
+}
+
+func TestConsoleClearExcludedModelsEmptiesTheList(t *testing.T) {
+	ctx, db, console := newConsoleTestConsole(t)
+	accountID := b5Account(t, ctx, db, "excluded")
+
+	response := b5Request(t, console, http.MethodPost, "/v1/accounts/"+accountID+"/excluded-models/clear", "")
+	if response.Code != http.StatusOK {
+		t.Fatalf("clear excluded models: %d (%s)", response.Code, response.Body.String())
+	}
+	var excluded []byte
+	if err := db.QueryRow(ctx, `SELECT excluded_models FROM accounts WHERE id=$1`, accountID).Scan(&excluded); err != nil {
+		t.Fatal(err)
+	}
+	if got := decodeStringArray(excluded); len(got) != 0 {
+		t.Errorf("excluded_models = %v, want empty", got)
+	}
+	// An empty body must be accepted here: these actions take no required
+	// input, so curl without -d should work.
+	var audits int
+	if err := db.QueryRow(ctx, `SELECT count(*) FROM account_actions WHERE account_id=$1`, accountID).Scan(&audits); err != nil {
+		t.Fatal(err)
+	}
+	if audits != 1 {
+		t.Errorf("got %d audit rows, want 1", audits)
+	}
+}
+
+// A typo'd account id must be a 404, not a cheerful 200 saying it was already
+// in the requested state.
+func TestConsoleAccountActionOnUnknownAccountIsNotFound(t *testing.T) {
+	_, _, console := newConsoleTestConsole(t)
+	for _, path := range []string{"/status", "/cooldown/clear", "/excluded-models/clear"} {
+		response := b5Request(t, console, http.MethodPost, "/v1/accounts/b51-does-not-exist"+path,
+			`{"status":"disabled","reason":"test"}`)
+		if response.Code != http.StatusNotFound {
+			t.Errorf("%s on a missing account = %d, want 404 (%s)", path, response.Code, response.Body.String())
+		}
+	}
+}
+
+// The audit trail must be immutable in the database, the same way
+// billing_resolutions and model_prices are. An audit trail that can be edited
+// is not one.
+func TestConsoleAccountActionsAreImmutable(t *testing.T) {
+	ctx, db, console := newConsoleTestConsole(t)
+	accountID := b5Account(t, ctx, db, "immutable")
+	if response := b5Request(t, console, http.MethodPost, "/v1/accounts/"+accountID+"/status",
+		`{"status":"disabled","reason":"original"}`); response.Code != http.StatusOK {
+		t.Fatalf("disable: %s", response.Body.String())
+	}
+	if _, err := db.Exec(ctx, `UPDATE account_actions SET reason='rewritten' WHERE account_id=$1`, accountID); err == nil {
+		t.Error("an account_actions row was updated; the audit trail is editable")
+	}
+	if _, err := db.Exec(ctx, `DELETE FROM account_actions WHERE account_id=$1`, accountID); err == nil {
+		t.Error("an account_actions row was deleted; the audit trail is editable")
+	}
+}
+
+// B5.1 pagination: a full page must be distinguishable from the end of the
+// data, and following the cursor must return the rest without repeating or
+// skipping a row. Skipping is the real risk -- a held row stepped over is
+// revenue nobody ever rules on.
+func TestConsoleHeldTrayPagesWithoutSkippingOrRepeating(t *testing.T) {
+	ctx, db, console := newConsoleTestConsole(t)
+	tenantID := fmt.Sprintf("b51-page-%d", rand.Int63())
+	t.Cleanup(func() {
+		background := context.Background()
+		db.Exec(background, `DELETE FROM usage_ledger WHERE tenant_id=$1`, tenantID)
+		db.Exec(background, `DELETE FROM tenants WHERE id=$1`, tenantID)
+	})
+	if _, err := db.Exec(ctx, `INSERT INTO tenants (id,name) VALUES ($1,'B5.1 paging')`, tenantID); err != nil {
+		t.Fatal(err)
+	}
+	// Five rows sharing one occurred_at, so the id tie-breaker is exercised:
+	// a cursor on the timestamp alone would loop or skip here.
+	occurredAt := time.Date(2021, 6, 1, 0, 0, 0, 0, time.UTC)
+	const total = 5
+	for i := 0; i < total; i++ {
+		insertTestUsage(ctx, t, db, tenantID, fmt.Sprintf("%s-event-%d", tenantID, i), "b51-model", "missing", false, occurredAt, [4]int64{0, 0, 0, 0})
+	}
+	if _, err := db.Exec(ctx, `UPDATE usage_ledger SET billing_state='held' WHERE tenant_id=$1`, tenantID); err != nil {
+		t.Fatal(err)
+	}
+
+	seen := map[string]int{}
+	cursor, pages := "", 0
+	for {
+		target := fmt.Sprintf("/v1/billing/held?tenant=%s&limit=2", tenantID)
+		if cursor != "" {
+			target += "&cursor=" + cursor
+		}
+		response := b5Request(t, console, http.MethodGet, target, "")
+		if response.Code != http.StatusOK {
+			t.Fatalf("held page %d: %d (%s)", pages, response.Code, response.Body.String())
+		}
+		var body struct {
+			Held       []heldRow `json:"held"`
+			NextCursor string    `json:"next_cursor"`
+			HasMore    bool      `json:"has_more"`
+		}
+		if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+			t.Fatal(err)
+		}
+		for _, row := range body.Held {
+			seen[row.EventID]++
+		}
+		pages++
+		if pages > total+2 {
+			t.Fatal("paging did not terminate; the cursor is not advancing")
+		}
+		if !body.HasMore {
+			if body.NextCursor != "" {
+				t.Error("has_more is false but a next_cursor was still handed out")
+			}
+			break
+		}
+		if body.NextCursor == "" {
+			t.Fatal("has_more is true but no cursor was given, so the rest is unreachable")
+		}
+		cursor = body.NextCursor
+	}
+	if len(seen) != total {
+		t.Errorf("paged over %d distinct rows, want %d: %v", len(seen), total, seen)
+	}
+	for eventID, count := range seen {
+		if count != 1 {
+			t.Errorf("row %s was returned %d times", eventID, count)
+		}
+	}
+}
+
+// The exact-multiple case: with 4 rows and a page size of 2, the second page is
+// full but there is nothing after it. Inferring has_more from a full page would
+// hand out a cursor to an empty third page, and "one last empty page" reads
+// exactly like "the tray drained" to whoever is working it.
+func TestConsoleHeldTrayDoesNotOfferACursorToAnEmptyPage(t *testing.T) {
+	ctx, db, console := newConsoleTestConsole(t)
+	tenantID := fmt.Sprintf("b51-exact-%d", rand.Int63())
+	t.Cleanup(func() {
+		background := context.Background()
+		db.Exec(background, `DELETE FROM usage_ledger WHERE tenant_id=$1`, tenantID)
+		db.Exec(background, `DELETE FROM tenants WHERE id=$1`, tenantID)
+	})
+	if _, err := db.Exec(ctx, `INSERT INTO tenants (id,name) VALUES ($1,'B5.1 exact multiple')`, tenantID); err != nil {
+		t.Fatal(err)
+	}
+	occurredAt := time.Date(2021, 6, 2, 0, 0, 0, 0, time.UTC)
+	for i := 0; i < 4; i++ {
+		insertTestUsage(ctx, t, db, tenantID, fmt.Sprintf("%s-event-%d", tenantID, i), "b51-model", "missing", false, occurredAt, [4]int64{0, 0, 0, 0})
+	}
+	if _, err := db.Exec(ctx, `UPDATE usage_ledger SET billing_state='held' WHERE tenant_id=$1`, tenantID); err != nil {
+		t.Fatal(err)
+	}
+
+	cursor := ""
+	for page := 0; page < 2; page++ {
+		target := fmt.Sprintf("/v1/billing/held?tenant=%s&limit=2", tenantID)
+		if cursor != "" {
+			target += "&cursor=" + cursor
+		}
+		response := b5Request(t, console, http.MethodGet, target, "")
+		var body struct {
+			Held       []heldRow `json:"held"`
+			NextCursor string    `json:"next_cursor"`
+			HasMore    bool      `json:"has_more"`
+		}
+		if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+			t.Fatal(err)
+		}
+		if len(body.Held) != 2 {
+			t.Fatalf("page %d returned %d rows, want 2", page, len(body.Held))
+		}
+		if page == 1 {
+			if body.HasMore || body.NextCursor != "" {
+				t.Errorf("the last full page offered another: has_more=%v cursor=%q", body.HasMore, body.NextCursor)
+			}
+			return
+		}
+		cursor = body.NextCursor
+	}
+}

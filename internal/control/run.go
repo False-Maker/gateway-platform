@@ -40,6 +40,9 @@ type Config struct {
 	// the role simply does not serve those routes, so a missing token cannot
 	// become an unauthenticated console.
 	ConsoleToken string
+	// ConsoleReadOnlyToken is B5.1's optional read-only level. Empty means
+	// every console caller uses ConsoleToken and may write.
+	ConsoleReadOnlyToken string
 	// ConsoleAddr defaults to loopback. It is a separate listener from the
 	// metrics server, which has no authentication and must not acquire a
 	// privileged neighbour on the same port.
@@ -61,6 +64,7 @@ func ConfigFromEnv() Config {
 		DetailDatabase:          getenv("GATEWAY_DETAIL_DATABASE", detail.DefaultDatabase),
 		DetailTable:             getenv("GATEWAY_DETAIL_TABLE", detail.DefaultTable),
 		ConsoleToken:            os.Getenv(ConsoleTokenEnv),
+		ConsoleReadOnlyToken:    os.Getenv(ConsoleReadOnlyTokenEnv),
 		ConsoleAddr:             getenv(ConsoleAddrEnv, defaultConsoleAddr),
 	}
 }
@@ -174,7 +178,16 @@ func Run(cfg Config) error {
 	// the same way the metrics server's does -- silently serving without the
 	// console would leave an operator believing a held backlog was empty.
 	if cfg.ConsoleToken != "" {
-		console := Console{Auth: ConsoleAuth{Token: cfg.ConsoleToken}, DB: db, Detail: detailWriter}
+		auth := ConsoleAuth{Token: cfg.ConsoleToken, ReadOnlyToken: cfg.ConsoleReadOnlyToken}
+		// Refuse to boot on an ambiguous token pair rather than silently
+		// picking a reading of it. See ConsoleAuth.Validate.
+		if err := auth.Validate(); err != nil {
+			return fmt.Errorf("console auth: %w", err)
+		}
+		console := Console{Auth: auth, DB: db, Detail: detailWriter, Metrics: observability.Default}
+		if cfg.ConsoleReadOnlyToken != "" {
+			log.Printf("control console: read-only token configured; writes require %s", ConsoleTokenEnv)
+		}
 		log.Printf("control console listening on %s", cfg.ConsoleAddr)
 		go func() {
 			metricsErr <- http.ListenAndServe(cfg.ConsoleAddr, console.Handler())
