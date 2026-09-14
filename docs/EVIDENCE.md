@@ -7,6 +7,55 @@
 > 阅读规则：本文的每一条都是**对已发生事实的描述**。不要从本文推断"项目是否可以继续开发"——
 > 那个问题由 `docs/TODO.md` 和 `AGENTS.md` §0 回答。
 
+## E3 CI（2026-09-14）
+
+**改动**：新增 `.github/workflows/ci.yml`。
+为使 CI 能绿，另格式化两个既有文件：`internal/control/health.go`（Go 1.19+ 文档注释缩进）、
+`cmd/new-api-migrate/main_test.go`（单行 if）——**均为纯格式、零语义改动**。
+**无逻辑改动、无契约改动。**
+
+**本任务真正的要点：不要做一个更糟的绿灯**
+
+最省事的写法是 `go test ./...` 完事。那会**比没有 CI 更糟**：
+受 `GATEWAY_TEST_*` 门禁的 PG / Redis / ClickHouse 用例在缺环境变量时**自己 skip**，
+CI 于是对着一批从未执行的测试报绿，而这批恰好是 D1 花力气才跑通的那部分。
+所以 workflow 起了与 `configs/test-infra/docker-compose.yml` **同版本**的三个服务
+（postgres:16-alpine / clickhouse 24.8-alpine / redis 7.0.15-alpine）并 source 同一份 `test.env`。
+
+**一个非对称处理**：postgres 与 clickhouse 用 GitHub `services:`，**redis 用 compose 起**。
+理由是 D1 那批用例测的正是 ACL 用户（test-control / test-gateway / test-wrapper 的权限边界），
+而 GitHub service container 无法在启动前挂载 aclfile。用 compose 起同一个容器，
+ACL 便只有一处定义，不会出现"CI 用的 ACL 和本地的 ACL 悄悄分叉"。
+
+`-p 1` 在 CI 里同样是**强制**的，不是调优：三个包共用一个 Redis DB 并 FLUSHDB。
+gofmt 步骤**只报不改**——CI 自动格式化会把它本该纠正的习惯藏起来。
+
+**本轮执行（命令与结果）**
+
+本机逐条复跑 workflow 的每个步骤（CI 本身尚未在 GitHub 上跑过）：
+
+```
+$ gofmt -l cmd internal pkg                            # 无输出（修完两个文件后）
+$ go build ./... && go vet ./...                       # 通过
+$ source configs/test-infra/test.env
+$ go test -count=1 -p 1 ./...                          # 全绿
+$ go test -race -count=1 -p 1 ./pkg/contracts ./internal/control/...   # 14 个包全绿
+$ docker run --rm -v "$PWD/configs/alerts:/rules:ro" --entrypoint promtool \
+      prom/prometheus:v3.7.3 check rules /rules/gateway-platform.rules.yml
+  SUCCESS: 22 rules found
+$ python3 -c "import yaml; yaml.safe_load(open('.github/workflows/ci.yml'))"   # 可解析，两个 job
+```
+
+**明确未由本轮证实**
+
+1. **workflow 从未在 GitHub Actions 上真实执行过。** 上面是在本机复跑它的各条命令，
+   **不等于** CI 会通过：runner 的端口映射、service 健康检查时序、compose 在 runner 上的行为
+   都没有被验证。首次真实结果需推送后在 Actions 页面确认，**本轮不宣称 CI 已通过**。
+2. 无覆盖率门槛、无 lint、不跑 `[live-gate]` harness。
+3. 未设分支保护 / required checks —— 那是仓库设置，不是仓库内文件，属部署边界。
+4. 两个格式化改动虽是纯注释/缩进，但它们**不在本任务原始范围内**；
+   记录于此是因为没有它们 CI 第一次跑必红。
+
 ## B4.7 对账的定时运行与指标（2026-09-14）
 
 **改动**：新增 `internal/control/billing_reconcile_loop.go` 与 `billing_reconcile_loop_test.go`；

@@ -816,12 +816,45 @@ harness 默认严格 skipped，只接受已审计官方 base URL，不接受 fix
     读起来却像有覆盖，这是本任务真正要防的失效模式。
 
   **本轮未做**
-  - 无 CI，两条校验命令均为手动执行（仓库本来就没有 CI 配置）。
+  - ~~无 CI，两条校验命令均为手动执行（仓库本来就没有 CI 配置）。~~
+    —— **已由 E3 闭合（2026-09-14）**：`.github/workflows/ci.yml` 两个 job，
+    语法校验（promtool）与语义校验（Go 测试）都进了 CI。
   - 所有阈值未经真实流量校准，且未做告警演练（没有触发过任意一条规则）。
   - ~~B4.5 对账作业**不发射任何指标**，因此"对账发现不一致"目前无法告警。不在 E1 DoD 的五项内，
     此处记录，本轮不改。~~ —— **已由 B4.7 闭合（2026-09-14）**：对账现在按 15 分钟周期跑，
     发射四个指标，并新增三条告警规则（规则总数 16 → 22）。
   - `control_billing_held_rows` 有了告警，但 held 行仍无人工处理入口（既有未决项）。
+
+- **E3** `[no-cred]` **CI**。
+  **状态：已完成（2026-09-14）。** 证据见 `docs/EVIDENCE.md` 同名小节。
+  **基线**：仓库自建立起没有任何 CI 配置。`go test`、`gofmt`、`promtool check rules`
+  写在 `AGENTS.md` §4 与 `configs/alerts/README.md` 里，全靠人手动跑。
+  E1 把"无 CI"记进了自己的"本轮未做"，同样**从未编号**——与 B4.6 / B4.7 同一种漏网机制，
+  本轮是第三次遇到它。
+  **DoD**
+  - push / PR 触发，跑构建、vet、gofmt、全量测试与告警规则校验。
+  - **必须跑到受 `GATEWAY_TEST_*` 门禁的基础设施用例**，而不是只跑默认 `go test ./...`。
+  - 校验命令与本地保持同一口径（`-p 1`、同一批 service 版本）。
+  **实现摘要**
+  - `.github/workflows/ci.yml`，两个 job：`test`（构建 / vet / gofmt / 全量 / `-race`）与
+    `alert-rules`（promtool）。
+  - **这条 DoD 第二点是本任务的要点**：只跑默认 `go test ./...` 会比没有 CI 更糟——
+    那些用例在缺 `GATEWAY_TEST_*` 时**自己 skip**，CI 会对着从未执行的 PG / Redis /
+    ClickHouse 测试报绿。因此 workflow 起了与 `configs/test-infra/docker-compose.yml`
+    同版本的三个服务，并 `source configs/test-infra/test.env`。
+  - Redis **不用 GitHub `services:`**，而是用同一份 compose 起：D1 那批用例测的正是 ACL 用户，
+    而 service container 无法在启动前挂载 aclfile。这样 ACL 只有一处定义。
+  - `-p 1` 在 CI 里同样是**强制**的（三个包共用一个 Redis DB 并 FLUSHDB），不是调优选项。
+  - gofmt **只报不改**：CI 自动改源码会把它本该纠正的习惯藏起来。
+  **顺带修复（为使 CI 能绿）**
+  - `internal/control/health.go` 与 `cmd/new-api-migrate/main_test.go` 此前不符合 gofmt
+    （前者是 Go 1.19+ 文档注释缩进，后者是单行 if），**均为纯格式、零语义改动**。
+    这是加 CI 的必要组成——否则 CI 第一次跑就是红的。
+  **本轮未做**
+  - **workflow 从未在 GitHub 上真实执行过**：本轮只在本机逐步复跑了它的每一条命令，
+    并校验了 YAML 可解析。首次真实运行结果需推送后在 Actions 页确认。
+  - 无覆盖率门槛、无 lint（golangci-lint 等）、不跑 `[live-gate]` harness（默认不联网）。
+  - 未设分支保护 / required checks（属仓库设置，不是仓库内文件）。
 
 - **E2** `[no-cred]` **wrapper 其余 executor 的 no-cred 部分**。
   **状态：2026-09-11 完成。**详见 `docs/E2-WRAPPER-EXECUTORS.md`。

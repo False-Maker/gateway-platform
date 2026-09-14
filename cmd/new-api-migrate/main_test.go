@@ -15,7 +15,9 @@ func TestRunRequiresSourceDatabaseURL(t *testing.T) {
 
 func TestRunApplyRequiresTargetAndKeyBeforeConnecting(t *testing.T) {
 	getenv := func(name string) string {
-		if name == "GATEWAY_NEW_API_DATABASE_URL" { return "postgres://source.invalid/db" }
+		if name == "GATEWAY_NEW_API_DATABASE_URL" {
+			return "postgres://source.invalid/db"
+		}
 		return ""
 	}
 	err := run(context.Background(), []string{"--apply"}, getenv)

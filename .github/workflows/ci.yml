@@ -1,0 +1,145 @@
+# CI for docs/TODO.md E3.
+#
+# The repository had no CI at all: `go test`, `gofmt` and `promtool check rules`
+# were documented in AGENTS.md and configs/alerts/README.md and run by hand.
+# That is exactly the arrangement where a green suite slowly stops being true.
+#
+# The gated infra suites are the point of this workflow. Running only the
+# default `go test ./...` would be worse than nothing: those suites *skip*
+# without GATEWAY_TEST_* set, so CI would report success over the PostgreSQL,
+# Redis and ClickHouse tests without ever running them -- a green tick that
+# means less than it looks like. Services below mirror
+# configs/test-infra/docker-compose.yml so CI runs what D1 runs locally.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: build, vet, test
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: gateway
+          POSTGRES_PASSWORD: gateway-test
+          POSTGRES_DB: gateway_test
+        ports:
+          - 15432:5432
+        options: >-
+          --health-cmd "pg_isready -U gateway -d gateway_test"
+          --health-interval 2s
+          --health-timeout 2s
+          --health-retries 30
+
+      clickhouse:
+        image: clickhouse/clickhouse-server:24.8-alpine
+        env:
+          CLICKHOUSE_DB: gateway_detail_test
+          CLICKHOUSE_USER: detail
+          CLICKHOUSE_PASSWORD: detail-test
+          CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "0"
+        ports:
+          - 18123:8123
+        options: >-
+          --health-cmd "wget -qO- http://127.0.0.1:8123/ping | grep -q Ok"
+          --health-interval 2s
+          --health-timeout 2s
+          --health-retries 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Redis is not a `services:` entry because the ACL users are the point of
+      # the D1 suites, and GitHub service containers cannot mount the aclfile
+      # before startup. Compose gives the same container the same way the local
+      # workflow does, and keeps one source of truth for the ACL.
+      - name: Start Redis with the test ACL
+        run: docker compose -f configs/test-infra/docker-compose.yml up -d redis
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: gofmt
+        run: |
+          # Scoped to the packages this repository owns. Reported, not
+          # auto-fixed: CI that rewrites source hides the habit it is meant
+          # to correct.
+          unformatted="$(gofmt -l cmd internal pkg)"
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt needed for:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go build
+        run: go build ./...
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: Wait for Redis
+        run: |
+          for _ in $(seq 1 60); do
+            if docker exec gateway-test-redis redis-cli --user test-admin --pass test-admin-secret ping 2>/dev/null | grep -q PONG; then
+              echo "redis ready"; exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::redis did not become ready"; exit 1
+
+      # -p 1 is mandatory, not a tuning choice: three packages share one Redis
+      # DB and FLUSHDB it, so parallel packages delete each other's fixtures.
+      - name: go test (with PostgreSQL, Redis and ClickHouse)
+        run: |
+          source configs/test-infra/test.env
+          go test -count=1 -p 1 ./...
+
+      # Narrower than the full suite on purpose: -race over every package is
+      # slow, and these are the packages where concurrency bugs actually live.
+      # Matches the command in AGENTS.md section 4.
+      - name: go test -race (contracts and control)
+        run: |
+          source configs/test-infra/test.env
+          go test -race -count=1 -p 1 ./pkg/contracts ./internal/control/...
+
+      - name: Dump Redis logs on failure
+        if: failure()
+        run: docker logs gateway-test-redis || true
+
+      - name: Stop Redis
+        if: always()
+        run: docker compose -f configs/test-infra/docker-compose.yml down -v || true
+
+  alert-rules:
+    name: promtool check rules
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      # E1 delivered two complementary checks and left both manual. This job
+      # runs the PromQL-syntax half; the semantic half (do the rules reference
+      # metrics this repository actually emits?) is a Go test and therefore
+      # already covered by the test job above.
+      - name: promtool check rules
+        run: |
+          docker run --rm -v "$PWD/configs/alerts:/rules:ro" \
+            --entrypoint promtool prom/prometheus:v3.7.3 \
+            check rules /rules/gateway-platform.rules.yml

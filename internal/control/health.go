@@ -38,13 +38,13 @@ const (
 // Release into the account's persistent state. It runs inside the ledger
 // transaction and only for the first delivery of an event.
 //
-//   ok                    -> clear last_error, consecutive_failures, cooldown
-//   auth_invalid          -> status='disabled' (permanent, needs re-auth)
-//   forbidden_capability  -> excluded_models += model (per-model, no cooldown)
-//   rate_limited_unknown  -> consecutive_failures+1; at threshold -> 5min cooldown
-//   blocked               -> consecutive_failures+1, 60s cooldown
-//   forbidden_transport, upstream_5xx, network_error, auth_expired,
-//   rate_limited_known    -> last_error only; no account penalty
+//	ok                    -> clear last_error, consecutive_failures, cooldown
+//	auth_invalid          -> status='disabled' (permanent, needs re-auth)
+//	forbidden_capability  -> excluded_models += model (per-model, no cooldown)
+//	rate_limited_unknown  -> consecutive_failures+1; at threshold -> 5min cooldown
+//	blocked               -> consecutive_failures+1, 60s cooldown
+//	forbidden_transport, upstream_5xx, network_error, auth_expired,
+//	rate_limited_known    -> last_error only; no account penalty
 const applyReleaseAuthoritySQL = `
 UPDATE accounts SET
   status = CASE WHEN $1::text = 'auth_invalid' THEN 'disabled' ELSE status END,
