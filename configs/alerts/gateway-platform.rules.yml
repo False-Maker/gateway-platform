@@ -253,6 +253,58 @@ groups:
             uncalibrated。取 >0 + 30m 只为可见性；若正常业务下常态非零，
             这条应当直接关掉而不是调高阈值。
 
+      - alert: BillingReconciliationUnbalanced
+        expr: control_billing_reconcile_balanced == 0
+        for: 30m
+        labels:
+          severity: critical
+          scope: billing
+        annotations:
+          summary: "计费对账不平衡"
+          description: >-
+            B4.5 的三方对账（usage_ledger / wallet_transactions / tenant_wallets）
+            发现分歧。具体类别见 control_billing_reconcile_discrepancies{kind}，
+            能归因到请求的差额带 event_id——用控制台
+            `GET /v1/billing/reconcile` 取同一窗口的完整报告。
+            **对账只读**，它不会自行修复，所以这条不会自己消失。
+          runbook: "docs/B5-CONSOLE.md；docs/B4-BILLING-MODEL.md B4.5"
+          threshold_source: >-
+            由后果推出：账目对不平本身不可容忍，阈值为 0。
+            for=30m 是为了跨过扣费作业的一个周期（billingRunInterval=5m），
+            避免把"还没扣到"读成"对不平"；该 30m 未经真实流量校准。
+
+      - alert: BillingReconciliationDiscrepancyKind
+        expr: control_billing_reconcile_discrepancies > 0
+        for: 30m
+        labels:
+          severity: warning
+          scope: billing
+        annotations:
+          summary: "对账差额类别 {{ $labels.kind }}：{{ $value }} 处"
+          description: >-
+            按类别拆分的对账差额，与 BillingReconciliationUnbalanced 同源，
+            存在的意义是让值班的人不必先去翻报告才知道是哪一类。
+            wallet_balance_drift 尤其值得优先看——它意味着有人绕过流水改了余额。
+          threshold_source: >-
+            由后果推出：阈值为 0，与上一条同理。
+
+      - alert: BillingReconciliationNotRunning
+        expr: >-
+          time() - control_billing_reconcile_last_success_seconds > 3600
+        for: 15m
+        labels:
+          severity: warning
+          scope: billing
+        annotations:
+          summary: "计费对账已 {{ $value | humanizeDuration }} 没有成功跑过"
+          description: >-
+            **这条的存在本身就是要点**：对账停摆与对账一直没发现问题，
+            在所有差额 gauge 上长得一模一样（都是 0）。
+            没有这条，一个死掉的对账循环会被读成"账目很健康"。
+          threshold_source: >-
+            由 reconcileRunInterval=15m 推出：3600s 给了四个周期的余量。
+            未经真实流量校准。
+
   # =========================================================================
   # 请求明细（A12）—— 明细可丢是设计，但丢弃必须可见：
   # 静默丢明细和静默丢流量长得一模一样。

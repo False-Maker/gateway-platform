@@ -642,8 +642,8 @@ E1 也接上了规则。但 §6.3.1 规则 2 的价值是「不要一个号一�
     `missing_wallet`），能归因到请求的都带 `EventIDs`。
     **DoD**：给定一段时间窗，能对齐 ledger 行数、扣费总额、钱包变动三者；差额可解释到具体
     `event_id`；对账本身只读，不修数据。
-    **本轮未做**：没有定时运行与指标（告警仍属 E1）；按需查询的入口**已由 B5 闭合**
-    （`GET /v1/billing/reconcile`，2026-09-11）；
+    **本轮未做**：~~没有定时运行与指标（告警仍属 E1）~~ —— **已由 B4.7 闭合（2026-09-14）**；
+    按需查询的入口**已由 B5 闭合**（`GET /v1/billing/reconcile`，2026-09-11）；
     只比较金额，不重算单价（不做"应收 vs 实收"的重新定价核对）；
     不校验 `wallet_transactions.balance_after` 的逐行链条（同 `created_at` 的顺序不唯一，
     会造假阳性），只用与顺序无关的"余额 == 流水求和"这一恒等式；
@@ -679,6 +679,39 @@ E1 也接上了规则。但 §6.3.1 规则 2 的价值是「不要一个号一�
     - **真实 new-api 部署的 `QuotaPerUnit` 取值仍未读到**：本轮全部由本地合成 schema 驱动，
       `GATEWAY_NEW_API_DATABASE_URL` 未指向任何真实库。**这部分是 `[live-gate]`**——
       它要的不是 provider 凭据，而是生产 new-api 库的只读访问。
+
+- **B4.7** `[no-cred]` **对账的定时运行与指标**。
+    **状态：已完成（2026-09-14）。** 证据见 `docs/EVIDENCE.md` 同名小节。
+    **基线**：B4.5 交付了算法，B5 交付了按需查询端点（`GET /v1/billing/reconcile`），
+    但**没有任何东西周期性地跑它**——"账目对不平"是一个需要有人想起来去问的问题。
+    E1 自己记录了这点（"B4.5 对账作业不发射任何指标，因此'对账发现不一致'目前无法告警"）
+    并明说不在其 DoD 内、本轮不改。于是它成了又一条**被记录过但从未编号**的缺口，
+    与 B4.6 同一种漏网机制。
+    **DoD**
+    - 对账进 control 主循环周期性运行，且**保持只读**（不得让审计者能修它审计的东西）。
+    - 发射指标，使 E1 能为"对账不平衡"写出告警。
+    - 窗口口径必须避开扣费作业尚未处理的区间，否则每次都报不平，等于永远在响的告警。
+    **实现摘要**
+    - `internal/control/billing_reconcile_loop.go`：`ReconciliationLoop`，15 分钟一跑。
+    - **窗口滞后 15 分钟且宽 1 小时**，两个数字各有理由：
+      滞后必须**大于** `billingRunInterval`（5m），否则窗口里全是扣费作业还没碰的 `pending` 行，
+      每次都报不平；窗口必须**大于**运行间隔，否则两次运行之间落地的行会被整段跳过，
+      而"对一段没读过的区间报 balanced"比不对账更糟。两条都有测试守着，
+      滞后不合规时 `RunOnce` **拒绝运行**而不是发一个无意义的信号。
+    - 四个指标：`control_billing_reconcile_balanced`、
+      `control_billing_reconcile_discrepancies{kind}`、`control_billing_reconcile_unsettled_rows`、
+      `control_billing_reconcile_runs_total{result}` + `..._last_success_seconds`。
+    - **每轮把六个 kind 全部写一遍（含 0）**。只写非零的会让 gauge 永不复位：
+      某类出现过一次再消失，告警会一直挂着。
+    - 三条告警规则：`BillingReconciliationUnbalanced`、`BillingReconciliationDiscrepancyKind`、
+      `BillingReconciliationNotRunning`。第三条是要点——**对账停摆与对账没发现问题，
+      在所有差额 gauge 上长得一模一样（都是 0）**，没有它，一个死掉的循环会被读成账目健康。
+    **本轮未做**
+    - 15m / 1h / 15m 三个数字**未经真实流量校准**（与 E1、A14 同一处理）。
+    - **多实例会各自跑**：本轮未加 singleton 锁。对账只读，重复跑不会损坏数据，
+      代价只是重复查询与 gauge 互相覆盖（同值，无害）。要跨实例只跑一份，
+      需复用 `fencing.go` 的 PG advisory lock——**有意未做**，不在本条 DoD 内。
+    - 告警未演练（没有真的触发过任何一条）。
 
 - **B5** P6 范围：控制台。**本轮交付后端 API，不含前端界面**（理由与取舍见 `docs/B5-CONSOLE.md` §1）。
   **状态：后端 API 已完成（2026-09-11）。** 证据见 `docs/EVIDENCE.md` 同名小节。
@@ -785,8 +818,9 @@ harness 默认严格 skipped，只接受已审计官方 base URL，不接受 fix
   **本轮未做**
   - 无 CI，两条校验命令均为手动执行（仓库本来就没有 CI 配置）。
   - 所有阈值未经真实流量校准，且未做告警演练（没有触发过任意一条规则）。
-  - B4.5 对账作业**不发射任何指标**，因此"对账发现不一致"目前无法告警。不在 E1 DoD 的五项内，
-    此处记录，本轮不改。
+  - ~~B4.5 对账作业**不发射任何指标**，因此"对账发现不一致"目前无法告警。不在 E1 DoD 的五项内，
+    此处记录，本轮不改。~~ —— **已由 B4.7 闭合（2026-09-14）**：对账现在按 15 分钟周期跑，
+    发射四个指标，并新增三条告警规则（规则总数 16 → 22）。
   - `control_billing_held_rows` 有了告警，但 held 行仍无人工处理入口（既有未决项）。
 
 - **E2** `[no-cred]` **wrapper 其余 executor 的 no-cred 部分**。

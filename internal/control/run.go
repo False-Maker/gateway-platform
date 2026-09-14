@@ -155,6 +155,12 @@ func Run(cfg Config) error {
 	billingJob := BillingJob{DB: db, Metrics: observability.Default}
 	billingTicker := time.NewTicker(billingRunInterval)
 	defer billingTicker.Stop()
+	// B4.5 shipped the algorithm and B5 an on-demand endpoint, but nothing ran
+	// it on a schedule, so "the books do not balance" stayed a question someone
+	// had to think to ask. This is the periodic consumer; it is read-only.
+	reconcileLoop := ReconciliationLoop{Reconciliation: Reconciliation{DB: db}, Metrics: observability.Default}
+	reconcileTicker := time.NewTicker(reconcileRunInterval)
+	defer reconcileTicker.Stop()
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 	trimTicker := time.NewTicker(time.Minute)
@@ -223,6 +229,15 @@ func Run(cfg Config) error {
 			}
 			if billed.RowsUnknownClass > 0 {
 				log.Printf("control billing run %s saw %d usage rows with no policy entry; they were held, not billed", billed.RunID, billed.RowsUnknownClass)
+			}
+		case <-reconcileTicker.C:
+			reconciled, err := reconcileLoop.RunOnce(ctx, time.Now())
+			if err != nil {
+				log.Printf("control billing reconciliation failed: %v", err)
+			} else if !reconciled.Balanced {
+				log.Printf("control billing reconciliation [%s, %s) is unbalanced: %v (%d unsettled rows across %d tenants)",
+					reconciled.Start.Format(time.RFC3339), reconciled.End.Format(time.RFC3339),
+					reconciled.Discrepancies, reconciled.UnsettledRows, reconciled.TenantCount)
 			}
 		case <-ticker.C:
 		}

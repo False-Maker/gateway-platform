@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/elucid/gateway-platform/internal/observability"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -251,5 +252,63 @@ func TestReconciliationSourceContainsNoWrites(t *testing.T) {
 	// Guard against the check passing because the file moved or emptied.
 	if !strings.Contains(text, "pgx.ReadOnly") {
 		t.Errorf("%s no longer opens a read-only transaction", path)
+	}
+}
+
+// The scheduled loop is only worth anything if a real discrepancy reaches a
+// real gauge. This drives the same tampering as
+// TestReconciliationAttributesDifferencesToEventIDs but asserts on the scrape,
+// which is what an alert rule actually reads.
+func TestReconciliationLoopPublishesDiscrepanciesAsGauges(t *testing.T) {
+	const tenantID = "b45-loop-tenant"
+	ctx, db := b45Fixture(t, tenantID)
+
+	if _, err := (BillingJob{DB: db}).RunOnce(ctx, b45WindowEnd); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(ctx, `UPDATE tenant_wallets SET balance = balance + 5 WHERE tenant_id=$1`, tenantID); err != nil {
+		t.Fatal(err)
+	}
+
+	registry := observability.NewRegistry()
+	// The fixture lives in 2021, so the window is pinned rather than derived
+	// from now: this asserts on publication, not on clock arithmetic (which
+	// TestReconciliationDefaultsOverlapAndClearTheBillingWindow covers).
+	loop := ReconciliationLoop{
+		Reconciliation: Reconciliation{DB: db},
+		Metrics:        registry,
+		Window:         b45WindowEnd.Sub(b45WindowStart),
+		Lag:            billingRunInterval + time.Minute,
+	}
+	result, err := loop.RunOnce(ctx, b45WindowEnd.Add(loop.Lag))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Balanced {
+		t.Fatal("a drifting balance reconciled clean")
+	}
+	if got := gaugeValue(t, registry, "control_billing_reconcile_balanced"); got != 0 {
+		t.Errorf("control_billing_reconcile_balanced = %v, want 0", got)
+	}
+	scraped := scrape(t, registry)
+	wantDrift := `control_billing_reconcile_discrepancies{kind="` + DiscrepancyWalletBalanceDrift + `"} 1`
+	if !strings.Contains(scraped, wantDrift) {
+		t.Errorf("scrape does not contain %q:\n%s", wantDrift, scraped)
+	}
+	// Kinds that found nothing must still be published, or a gauge that once
+	// fired would keep its value forever and the alert would never clear.
+	wantQuiet := `control_billing_reconcile_discrepancies{kind="` + DiscrepancyMissingWallet + `"} 0`
+	if !strings.Contains(scraped, wantQuiet) {
+		t.Errorf("a kind with no findings was not published as 0; alerts for it could never clear:\n%s", scraped)
+	}
+	// A loop that stopped ticking has to look different from one that keeps
+	// finding nothing: both leave the discrepancy gauges alone.
+	if !strings.Contains(scraped, `control_billing_reconcile_runs_total{result="ok"} 1`) {
+		t.Errorf("the run counter was not incremented:\n%s", scraped)
+	}
+	// The unpriced and held rows from the fixture are accounted for, not
+	// netted away into "balanced".
+	if got := gaugeValue(t, registry, "control_billing_reconcile_unsettled_rows"); got < 2 {
+		t.Errorf("unsettled rows = %v, want at least the fixture's unpriced and held rows", got)
 	}
 }

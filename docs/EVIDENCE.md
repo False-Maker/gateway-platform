@@ -7,6 +7,75 @@
 > 阅读规则：本文的每一条都是**对已发生事实的描述**。不要从本文推断"项目是否可以继续开发"——
 > 那个问题由 `docs/TODO.md` 和 `AGENTS.md` §0 回答。
 
+## B4.7 对账的定时运行与指标（2026-09-14）
+
+**改动**：新增 `internal/control/billing_reconcile_loop.go` 与 `billing_reconcile_loop_test.go`；
+`internal/control/run.go` 接线；`internal/control/billing_reconcile_integration_test.go` 加一个用例；
+`configs/alerts/gateway-platform.rules.yml` 加三条规则。
+**无 migration、无契约改动、未改对账算法本身、未改 B5 端点。**
+
+**两个决定，各自有一个"不这样会怎样"**
+
+1. **窗口滞后 15 分钟**（> `billingRunInterval` 的 5 分钟）。不滞后的话，窗口尾部全是扣费作业
+   还没处理的 `pending` 行，每一次运行都会报不平——一个永远在响的告警等于没有告警。
+   这个约束不是靠"记得同时改两个常量"来维持的：`RunOnce` 在 lag ≤ billingRunInterval 时
+   **拒绝运行并返回错误**，另有一个测试直接断言两个默认常量的关系。
+2. **窗口 1 小时 > 运行间隔 15 分钟**，即相邻两次运行**故意重叠**。若窗口正好铺满间隔，
+   任何 `occurred_at` 落在"上次查询之后、本次 tick 之前"的行都会被整段跳过，
+   而对一段从没读过的区间报 `balanced` 比不对账更危险。重复读是免费的——这个循环不写任何东西。
+
+**第三条告警是本轮最值得记的一条**
+
+`BillingReconciliationNotRunning`（`time() - ..._last_success_seconds > 3600`）。
+理由：**对账停摆**和**对账一直没发现问题**，在所有差额 gauge 上长得完全一样，都是 0。
+没有这条，一个死掉的对账循环会被读成"账目很健康"——这正是 E1 当初想防的失效模式
+（"写错指标名的规则永远不会触发，读起来却像有覆盖"）的时间维度版本。
+
+**只读性是怎么保证的**
+
+沿用 B4.5 的做法：`TestReconciliationLoopSourceContainsNoWrites` 对**源文件**扫
+`INSERT/UPDATE/DELETE/ALTER/TRUNCATE/.Exec(`。审计者若能修它审计的东西，就不再是独立见证。
+
+**本轮执行（命令与结果）**
+
+```
+$ go build ./... && go vet ./...                       # 通过
+$ gofmt -l internal/control                            # 仅 health.go（既有，非本轮改动）
+$ source configs/test-infra/test.env
+$ go test -count=1 -p 1 ./...                          # 全绿（真实 PG/Redis/ClickHouse）
+$ docker run --rm -v "$PWD/configs/alerts:/rules:ro" --entrypoint promtool \
+      prom/prometheus:v3.7.3 check rules /rules/gateway-platform.rules.yml
+  SUCCESS: 22 rules found                              # 此前 16 条
+```
+
+**跑通的新用例**
+
+- `TestReconciliationLoopPublishesDiscrepanciesAsGauges`（需 PG）——篡改余额后跑循环，
+  断言 **scrape 文本**里出现 `control_billing_reconcile_discrepancies{kind="wallet_balance_drift"} 1`，
+  且**无发现的 kind 也被写成 0**（否则 gauge 永不复位、告警无法自愈），
+  以及 `runs_total{result="ok"}` 递增、未结算行被单独计数而非抹平。
+- `TestReconciliationKindsCoversEveryDiscrepancyConstant` —— 用 `go/parser` 解析
+  `billing_reconcile.go`，取出所有 `Discrepancy*` 常量，断言每一个都在 `reconciliationKinds` 里。
+  新增一个 kind 却忘了加进发布列表，会导致它**被检测到、被端点报告，但永远没有 gauge**，
+  于是为它写的告警永不触发。这是 E1 那条"写错指标名"防线的下一层。
+- `TestReconciliationLoopRefusesALagInsideTheBillingWindow`、
+  `TestReconciliationDefaultsOverlapAndClearTheBillingWindow` —— 守上面两个常量关系。
+
+**测试经反向验证**：把规则里的 `control_billing_reconcile_last_success_seconds` 改成
+`..._secondz`，E1 的 `TestAlertRulesOnlyReferenceEmittedMetrics` 立即报
+`which no code in this repository emits: the rule can never fire`，随即还原。
+确认新规则确实受那条既有防线保护。
+
+**明确未由本轮证实**
+
+1. **15m / 1h / 15m 三个数字未经真实流量校准**（与 E1、A14 同一处理）。
+2. **多实例会各自跑对账**：本轮未加 singleton 锁。对账只读，重复跑不损坏数据，
+   代价是重复查询与 gauge 互相覆盖（同值，无害）。跨实例只跑一份需复用 `fencing.go` 的
+   PG advisory lock，**有意未做**。
+3. **三条新告警一次都没演练过**（未真实触发）。与 E1 既有的 16 条同样状态。
+4. `gofmt -l` 报的 `internal/control/health.go` 是**既有**未格式化文件，非本轮改动，
+   按改动边界未动它。
+
 ## B4.6 new-api `QuotaPerUnit` 换算比例的读取（2026-09-14）
 
 **改动**：`internal/migration/newapi/types.go`（`SourceQuotaPerUnit`，进 `SourceSnapshot` 与 `Summary`）、
