@@ -623,7 +623,7 @@ B4.3/B4.5 `:650` 专门列了「`estimated` 仍无生产者」——**唯独没�
 
 ### A16 `[no-cred]` `unpriced` 行的告警：指标已发射，告警规则零引用
 
-**状态：未开始（2026-09-20 第五次复盘发现）。**
+**状态：已完成（2026-09-20）。** 证据见 `docs/EVIDENCE.md` 同名小节。
 
 **设计要求**
 `docs/B4-BILLING-MODEL.md:188`（D6）：「`unpriced` 的行数与 token 量**单独可查询**；
@@ -645,10 +645,23 @@ B4.3/B4.5 `:650` 专门列了「`estimated` 仍无生产者」——**唯独没�
 （进 unpriced / 不按 0 计费 / 与 missing 分桶 / 列进 UnsettledRows），**无一条涉及告警**。
 E1 任务块 `:820-860` 的 DoD 五个方向与「本轮未做」三项均不含它。
 
-**DoD**
-- `configs/alerts/gateway-platform.rules.yml` 增规则消费 `control_billing_rows_total{state="unpriced"}`。
-- 阈值按 E1 既有口径标注**未经真实流量校准**。
-- 考虑给 `alertrules_test.go` 增反向校验（计费类关键指标须有消费方），避免同类空洞再次静默存在。
+**DoD（交付情况）**
+- ✅ 新增规则 `BillingUnpricedRows`：`increase(control_billing_rows_total{state="unpriced"}[1h]) > 0`，
+  `for: 0m`、`severity: warning`、`scope: billing`。规则总数 22 → 23。
+- ✅ `threshold_source` 按 E1 口径说明取值来自 unpriced 的**语义**（可容忍存量为 0），
+  与 `ConsoleHeldUnpricedResolution` 同一口径；窗口 1h 对齐扣费作业周期。
+- ✅ 反向校验：把 `control_billing_rows_total` 加进 `alertrules_test.go` 的
+  `TestRequiredCoverageIsPresent` 必须覆盖表。**已验证该 pin 承重**——临时把规则的 expr
+  改走后测试报 `no rule references control_billing_rows_total`，恢复后转绿。
+
+**为什么既有测试抓不到这个洞**
+`TestAlertRulesOnlyReferenceEmittedMetrics` 查的是「规则引用的指标是否存在」，
+是**规则 → 指标**的单向校验；A16 是反方向的「指标没有消费方」。
+两者不是同一件事，所以那条测试永远看不见这个洞。本轮补的 pin 走的正是反方向。
+
+**顺带修正（由 A15 落地引起的过时）**
+`ConsoleHeldUnpricedResolution` 的描述写着「只能靠显式钱包调整修正」，而 A15 之前
+该入口并不存在。已补上 `POST /v1/billing/wallets/{tenant_id}/adjust` 的指向与 §4.4 runbook。
 
 **已知取舍**
 - 通知通道（谁收、怎么收）仍属部署侧，与 E1/A9 同一边界。

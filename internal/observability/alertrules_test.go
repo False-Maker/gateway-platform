@@ -171,6 +171,12 @@ func TestRequiredCoverageIsPresent(t *testing.T) {
 		"stream pending 积压":      "control_stream_pending",
 		"UsageSource=missing 占比": "release_usage_missing_total",
 		"防饿死闸触发":                 "control_platform_starvation_release_total",
+		// A16: B4-BILLING-MODEL D6 requires "出现 unpriced 行即告警". The metric
+		// was emitted from the day B4.2 shipped and no rule ever read it, which
+		// is the exact hole TestAlertRulesOnlyReferenceEmittedMetrics cannot
+		// see: that test checks rules against metrics, never metrics against
+		// rules. Pinned here so it cannot go unconsumed again.
+		"扣费作业判出的 unpriced 行": "control_billing_rows_total",
 	}
 	for area, metric := range required {
 		if !strings.Contains(joined, metric) {

@@ -44,6 +44,42 @@
   `wallet_balance_drift`」三条属未执行断言**，待 E3 的 CI 或本机 Docker 恢复后复跑。
 - 真实运营审批流（谁有权调账、是否二人复核）属部署侧，本条未涉及。
 
+## A16 `unpriced` 行的告警（2026-09-20）
+
+**背景**：`B4-BILLING-MODEL.md:188`（D6）要求「出现 `unpriced` 行即告警」。
+指标 `control_billing_rows_total{state="unpriced"}` 从 B4.2 交付当天就在发射
+（`billing_job.go:375`），但 `configs/alerts/` 里**零引用**。
+唯一含 unpriced 的规则用的是 `control_console_held_unpriced_total`，
+只在人工裁定路径递增（`console_held.go:243`），覆盖不到 D6 点名的主场景。
+
+**改动**
+- `configs/alerts/gateway-platform.rules.yml`：新增 `BillingUnpricedRows`
+  （`increase(control_billing_rows_total{state="unpriced"}[1h]) > 0`，`for: 0m`，warning）。
+  规则总数 22 → 23。
+- `internal/observability/alertrules_test.go`：把 `control_billing_rows_total`
+  加进 `TestRequiredCoverageIsPresent` 的必须覆盖表。
+- 顺带修正 `ConsoleHeldUnpricedResolution` 的描述与 runbook：它写着「只能靠显式钱包调整修正」，
+  而该入口在 A15 之前并不存在——这是 A15 落地引起的过时，已补指向 §4.4。
+
+**为什么既有测试抓不到**
+`TestAlertRulesOnlyReferenceEmittedMetrics` 是**规则 → 指标**的单向校验
+（「规则watch的指标存在吗」）。A16 是反方向：**指标没有消费方**。
+两者不是同一件事，所以那条测试永远看不见这个洞。
+
+**本轮执行并通过**
+- `go build ./...`、`go vet ./...`、`gofmt -l` 干净；`go test -count=1 ./...` 24 个包全过。
+- `TestAlertRulesOnlyReferenceEmittedMetrics` / `TestEveryRuleDocumentsItsThreshold` /
+  `TestRequiredCoverageIsPresent` 三条均 PASS。
+- **反向验证了新 pin 是承重的**：临时把 `BillingUnpricedRows` 的 expr 改指向
+  `control_billing_unknown_usage_class_total`，`TestRequiredCoverageIsPresent` 即报
+  `E1 DoD requires coverage of 扣费作业判出的 unpriced 行, but no rule references
+  control_billing_rows_total` 并 FAIL；恢复后转绿，规则文件已还原（`git diff --stat` 确认）。
+
+**本轮未验证**
+- 阈值未经真实流量校准（与 E1 全部规则同一处理，已写进 `threshold_source`）。
+- 通知通道（谁收、怎么收）仍属部署侧，与 E1/A9 同一边界，本条未涉及。
+- 未在真实 Prometheus 里加载该规则文件求值；仅有仓库内的 YAML 解析与语义校验。
+
 ## 第五次结构性复盘（2026-09-20）
 
 **方法**：按"最少被扫过的面"选靶。前四次扫总览、两份角色文档、`AUDIT-CONTEXT` / `P2-ADMISSION`；

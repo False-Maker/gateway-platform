@@ -210,6 +210,29 @@ groups:
             由 B4.3 的语义推出：held 的定义就是"需要人来看"，可容忍存量为 0。
             for=30m 只是给扣费作业一个自然周期，未经校准。
 
+      - alert: BillingUnpricedRows
+        expr: increase(control_billing_rows_total{state="unpriced"}[1h]) > 0
+        for: 0m
+        labels:
+          severity: warning
+          scope: billing
+        annotations:
+          summary: "扣费作业把 {{ $value }} 条用量判为 unpriced（我们的定价配置有缺口）"
+          description: >-
+            B4-BILLING-MODEL D6 要求"出现 `unpriced` 行即告警"。典型成因是
+            **上新模型时忘了配价**：用量照常服务，但 `occurred_at` 时没有生效单价，
+            D3 又禁止倒填，于是这笔收入**没有收到且不可能自动收到**。
+            这与 held 是两件事——held 是"usage 丢了，需要人裁定"，
+            unpriced 是"usage 好好的，是我们自己没配价"，两者不可相加。
+            处置：先补 `POST /v1/billing/prices`（只对未来生效，救不了已发生的量），
+            再对已发生的部分做显式钱包调整
+            （`POST /v1/billing/wallets/{tenant_id}/adjust`，见 docs/B5-CONSOLE.md §4.4）。
+          runbook: "docs/B4-BILLING-MODEL.md D3/D6；docs/B5-CONSOLE.md §4.3 与 §4.4"
+          threshold_source: >-
+            取 >0 由 unpriced 的**语义**推出：它的定义就是"我们的定价配置有缺口"，
+            可容忍存量为 0，与 ConsoleHeldUnpricedResolution 同一口径。
+            窗口取 1h 对齐扣费作业的自然周期；次数阈值本身不存在，故无需校准。
+
       - alert: BillingUncappedWalletTenants
         expr: control_billing_uncapped_wallet_tenants > 0
         for: 15m
@@ -396,9 +419,10 @@ groups:
           description: >-
             运营要求按单价计费，但该行 `occurred_at` 时无生效单价（D3 禁止倒填），
             因此终态是 `unpriced` 而非 `billed`——**这笔收入没有收到，且不可能自动收到**，
-            只能靠显式钱包调整修正。托盘在"清空"，但收入没有跟上，这条规则就是
+            只能靠显式钱包调整修正（`POST /v1/billing/wallets/{tenant_id}/adjust`，
+            A15 之前这个入口并不存在）。托盘在"清空"，但收入没有跟上，这条规则就是
             用来区分这两种"托盘在缩小"的。
-          runbook: "docs/B5-CONSOLE.md §4.1"
+          runbook: "docs/B5-CONSOLE.md §4.1 与 §4.4"
           threshold_source: >-
             取 >0 由 unpriced 的**语义**推出：它的定义就是"我们的定价配置有缺口"，
             可容忍存量为 0，与 held 桶同一口径；数值本身无待校准的余量。
