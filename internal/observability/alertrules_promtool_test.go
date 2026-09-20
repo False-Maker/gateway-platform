@@ -160,6 +160,285 @@ func promtoolScenarios() []scenario {
 			wantLabels: `{result="retry"}`,
 			wantValue:  "30",
 		},
+		{
+			name:  "egress_platform_transport_rejection_fires",
+			claim: "平台级 transport 拒绝判定置位即触发（critical）",
+			series: []inputSeries{
+				{selector: `control_platform_alert{platform="anthropic",reason="transport_rejections"}`, values: `1+0x20`},
+			},
+			alert:      "PlatformTransportRejection",
+			evalTime:   "10m",
+			wantLabels: `{__name__="control_platform_alert",platform="anthropic",reason="transport_rejections"}`,
+			wantValue:  "1",
+		},
+		{
+			name:  "egress_transport_rejection_spread_fires",
+			claim: "拒绝波及的账号数超过 3 个即触发（看广度而非单账号）",
+			series: []inputSeries{
+				{selector: `control_platform_transport_rejections_accounts{platform="anthropic"}`, values: `5+0x20`},
+			},
+			alert:      "PlatformTransportRejectionSpread",
+			evalTime:   "15m",
+			wantLabels: `{__name__="control_platform_transport_rejections_accounts",platform="anthropic"}`,
+			wantValue:  "5",
+		},
+		{
+			name:  "egress_starvation_gate_fires_from_a_zero_start",
+			claim: "A22 为该指标按 platform 预置 0 之后，防饿死闸触发可见",
+			series: []inputSeries{
+				{selector: `control_platform_starvation_release_total{platform="anthropic"}`, values: `0+1x25`},
+			},
+			alert:      "StarvationGateFired",
+			evalTime:   "20m",
+			wantLabels: `{platform="anthropic"}`,
+			wantValue:  "15",
+		},
+		{
+			name:  "egress_starvation_gate_silent_when_born_at_one",
+			claim: "A22 预置之前的真实状态：闸只触发过一次，序列诞生即为 1，规则看不见。这是 SnapshotLoop.PrimeMetrics 存在的理由",
+			series: []inputSeries{
+				{selector: `control_platform_starvation_release_total{platform="anthropic"}`, values: `1+0x30`},
+			},
+			alert:    "StarvationGateFired",
+			evalTime: "20m",
+		},
+		{
+			name:  "stream_pending_backlog_fires",
+			claim: "pending 超过 1000 即触发（量级告警，与 StreamPendingStuck 的“动没动”互补）",
+			series: []inputSeries{
+				{selector: `control_stream_pending`, values: `1500+0x20`},
+			},
+			alert:      "StreamPendingBacklog",
+			evalTime:   "15m",
+			wantLabels: `{__name__="control_stream_pending"}`,
+			wantValue:  "1500",
+		},
+		{
+			name:  "stream_duplicate_spike_fires_on_sustained_duplicates",
+			claim: "重复入账持续发生时触发（阈值 >10）",
+			series: []inputSeries{
+				{selector: `usage_ledger_duplicate_total`, values: `0+1x25`},
+			},
+			alert:      "UsageLedgerDuplicateSpike",
+			evalTime:   "20m",
+			wantLabels: `{}`,
+			wantValue:  "15",
+		},
+		{
+			name:  "stream_duplicate_spike_silent_when_eleven_arrive_as_one_burst",
+			claim: "A22 那条更正的实测证据：11 次重复挤在一个突发里，序列诞生即为 11、之后平稳，increase 恒为 0，**阈值 >10 并不能免疫**。这是 A22 判定“可容忍”的那一类的真实代价",
+			series: []inputSeries{
+				{selector: `usage_ledger_duplicate_total`, values: `11+0x30`},
+			},
+			alert:    "UsageLedgerDuplicateSpike",
+			evalTime: "20m",
+		},
+		{
+			name:  "usage_trust_missing_ratio_fires",
+			claim: "missing 占成功 xadd 的比例超过 1% 即触发（critical）",
+			series: []inputSeries{
+				{selector: `release_usage_missing_total`, values: `0+1x30`},
+				{selector: `release_xadd_total{result="success"}`, values: `0+50x30`},
+			},
+			alert:      "UsageSourceMissingRatioHigh",
+			evalTime:   "20m",
+			wantLabels: `{}`,
+			wantValue:  "0.02",
+		},
+		{
+			name:  "usage_trust_synthetic_spike_fires_from_a_zero_start",
+			claim: "A22 预置 source=\"synthetic\" 之后，合成终态可见",
+			series: []inputSeries{
+				{selector: `request_attempt_recovered_total{source="synthetic"}`, values: `0+1x25`},
+			},
+			alert:      "SyntheticTerminalStateSpike",
+			evalTime:   "20m",
+			wantLabels: `{source="synthetic"}`,
+			wantValue:  "15",
+		},
+		{
+			name:  "usage_trust_synthetic_spike_silent_when_born_at_one",
+			claim: "A22 预置之前：一次合成终态让序列诞生即为 1，规则看不见",
+			series: []inputSeries{
+				{selector: `request_attempt_recovered_total{source="synthetic"}`, values: `1+0x30`},
+			},
+			alert:    "SyntheticTerminalStateSpike",
+			evalTime: "20m",
+		},
+		{
+			name:  "usage_trust_attempt_open_age_fires",
+			claim: "尝试开放时长超过 15 分钟即触发",
+			series: []inputSeries{
+				{selector: `request_attempt_open_age_seconds`, values: `1200+0x20`},
+			},
+			alert:      "AttemptOpenAgeHigh",
+			evalTime:   "10m",
+			wantLabels: `{__name__="request_attempt_open_age_seconds"}`,
+			wantValue:  "1200",
+		},
+		{
+			name:  "billing_held_rows_accumulating_fires",
+			claim: "held 托盘非空即触发，并按 usage_source 归因",
+			series: []inputSeries{
+				{selector: `control_billing_held_rows{usage_source="missing"}`, values: `4+0x40`},
+			},
+			alert:      "BillingHeldRowsAccumulating",
+			evalTime:   "35m",
+			wantLabels: `{__name__="control_billing_held_rows",usage_source="missing"}`,
+			wantValue:  "4",
+		},
+		{
+			name:  "billing_uncapped_wallet_tenants_fires",
+			claim: "预付租户 rpm 为 0（透支窗口无封顶）即触发",
+			series: []inputSeries{
+				{selector: `control_billing_uncapped_wallet_tenants`, values: `2+0x25`},
+			},
+			alert:      "BillingUncappedWalletTenants",
+			evalTime:   "20m",
+			wantLabels: `{__name__="control_billing_uncapped_wallet_tenants"}`,
+			wantValue:  "2",
+		},
+		{
+			name:  "billing_blocked_tenants_fires",
+			claim: "有租户处于停用态即触发（info）。这条正是 gateway_billing_rejected_total 被列入豁免名单的依据",
+			series: []inputSeries{
+				{selector: `control_billing_blocked_tenants`, values: `3+0x40`},
+			},
+			alert:      "BillingBlockedTenantsSpike",
+			evalTime:   "35m",
+			wantLabels: `{__name__="control_billing_blocked_tenants"}`,
+			wantValue:  "3",
+		},
+		{
+			name:  "billing_reconciliation_unbalanced_fires",
+			claim: "对账判定不平即触发（critical）。注意它是 == 0 而不是 > 0，序列缺失时同样无结果——与 A23 同形状",
+			series: []inputSeries{
+				{selector: `control_billing_reconcile_balanced`, values: `0+0x40`},
+			},
+			alert:      "BillingReconciliationUnbalanced",
+			evalTime:   "35m",
+			wantLabels: `{__name__="control_billing_reconcile_balanced"}`,
+			wantValue:  "0",
+		},
+		{
+			name:  "billing_reconciliation_discrepancy_kind_fires",
+			claim: "对账差异按 kind 归因触发",
+			series: []inputSeries{
+				{selector: `control_billing_reconcile_discrepancies{kind="orphan_debit"}`, values: `2+0x40`},
+			},
+			alert:      "BillingReconciliationDiscrepancyKind",
+			evalTime:   "35m",
+			wantLabels: `{__name__="control_billing_reconcile_discrepancies",kind="orphan_debit"}`,
+			wantValue:  "2",
+		},
+		{
+			name:  "billing_reconciliation_not_running_fires",
+			claim: "距上次成功对账超过 1 小时即触发。这条不依赖 increase()，用的是 time() 减去一个时间戳 gauge",
+			series: []inputSeries{
+				{selector: `control_billing_reconcile_last_success_seconds`, values: `0+0x130`},
+			},
+			alert:      "BillingReconciliationNotRunning",
+			evalTime:   "2h",
+			wantLabels: `{}`,
+			wantValue:  "7200",
+		},
+		{
+			name:  "detail_write_failing_fires",
+			claim: "明细持续写入失败时触发（for=10m，目标就是“持续”）",
+			series: []inputSeries{
+				{selector: `detail_flush_failures_total`, values: `0+1x25`},
+			},
+			alert:      "DetailWriteFailing",
+			evalTime:   "20m",
+			wantLabels: `{}`,
+			wantValue:  "15",
+		},
+		{
+			name:  "detail_buffer_saturated_fires",
+			claim: "缓冲区满导致持续丢弃时触发，并与 write_failed 分开归因",
+			series: []inputSeries{
+				{selector: `detail_dropped_total{reason="buffer_full"}`, values: `0+1x25`},
+			},
+			alert:      "DetailBufferSaturated",
+			evalTime:   "20m",
+			wantLabels: `{reason="buffer_full"}`,
+			wantValue:  "15",
+		},
+		{
+			name:  "console_auth_rejections_fires",
+			claim: "控制台持续收到未通过鉴权的请求时触发（阈值 >5），按 path 归因",
+			series: []inputSeries{
+				{selector: `control_console_rejected_total{path="/v1/billing/held"}`, values: `0+1x25`},
+			},
+			alert:      "ConsoleAuthRejections",
+			evalTime:   "20m",
+			wantLabels: `{path="/v1/billing/held"}`,
+			wantValue:  "15",
+		},
+		{
+			name:  "console_auth_rejections_silent_when_six_arrive_as_one_burst",
+			claim: "同 UsageLedgerDuplicateSpike：6 次拒绝挤在一个突发里，阈值 >5 也救不回诞生增量。A22 判定可容忍的依据是“扫描/爆破是重复事件”，这条测量的是那个判定不成立时的代价",
+			series: []inputSeries{
+				{selector: `control_console_rejected_total{path="/v1/billing/held"}`, values: `6+0x30`},
+			},
+			alert:    "ConsoleAuthRejections",
+			evalTime: "20m",
+		},
+		{
+			name:  "console_wallet_topup_fires",
+			claim: "运营充值可见（info）",
+			series: []inputSeries{
+				{selector: `control_console_topup_total`, values: `0+1x15`},
+			},
+			alert:      "ConsoleWalletTopUp",
+			evalTime:   "10m",
+			wantLabels: `{}`,
+			wantValue:  "5",
+		},
+		{
+			name:  "console_wallet_adjustment_fires",
+			claim: "运营对钱包做显式调整可见——A15 之前这个入口根本不存在",
+			series: []inputSeries{
+				{selector: `control_console_adjustment_total`, values: `0+1x15`},
+			},
+			alert:      "ConsoleWalletAdjustment",
+			evalTime:   "10m",
+			wantLabels: `{}`,
+			wantValue:  "5",
+		},
+		{
+			name:  "console_wallet_id_reuse_fires",
+			claim: "id 复用被拒可见（or 的 adjustment 分支）",
+			series: []inputSeries{
+				{selector: `control_console_adjustment_conflict_total`, values: `0+1x70`},
+			},
+			alert:      "ConsoleWalletIdReuse",
+			evalTime:   "65m",
+			wantLabels: `{}`,
+			wantValue:  "60",
+		},
+		{
+			name:  "console_wallet_replay_fires",
+			claim: "钱包写入被作为重放返回可见。A15 的 F1 里，这个计数器是那条丢钱路径的唯一可观测信号",
+			series: []inputSeries{
+				{selector: `control_console_adjustment_replayed_total`, values: `0+1x70`},
+			},
+			alert:      "ConsoleWalletReplay",
+			evalTime:   "65m",
+			wantLabels: `{}`,
+			wantValue:  "60",
+		},
+		{
+			name:  "console_held_unpriced_resolution_fires",
+			claim: "人工裁定落到 unpriced 可见——A22 为它预置了零序列",
+			series: []inputSeries{
+				{selector: `control_console_held_unpriced_total`, values: `0+1x70`},
+			},
+			alert:      "ConsoleHeldUnpricedResolution",
+			evalTime:   "65m",
+			wantLabels: `{}`,
+			wantValue:  "60",
+		},
 	}
 }
 
@@ -262,5 +541,62 @@ func promtoolRunner(t *testing.T) func(fixture string) (string, error) {
 		defer os.Remove(hostPath)
 		output, err := command(name, hostPath).CombinedOutput()
 		return string(output) + "\n--- fixture ---\n" + fixture, err
+	}
+}
+
+// TestEveryAlertHasAPromtoolScenario is the A24 lesson applied to A25: a check
+// that covers "the rules we happened to touch" is a check whose scope someone
+// has to remember to extend. A24 found that the metric-consumer check had been
+// scoped to two families and the whole gateway role had fallen outside it. The
+// same shape of mistake here would be a new alert shipping with no evidence it
+// can ever fire.
+//
+// This test needs no promtool and therefore runs everywhere, which is the
+// point: the gate on a new rule must not itself be skippable.
+func TestEveryAlertHasAPromtoolScenario(t *testing.T) {
+	covered := make(map[string]int)
+	for _, sc := range promtoolScenarios() {
+		covered[sc.alert]++
+	}
+	for _, group := range loadRules(t).Groups {
+		for _, rule := range group.Rules {
+			if covered[rule.Alert] == 0 {
+				t.Errorf("alert %s has no promtool scenario: nothing shows it can fire. Add one to promtoolScenarios().", rule.Alert)
+			}
+		}
+	}
+	// And the reverse: a scenario naming an alert that no longer exists would
+	// pass forever without testing anything.
+	declared := make(map[string]struct{})
+	for _, group := range loadRules(t).Groups {
+		for _, rule := range group.Rules {
+			declared[rule.Alert] = struct{}{}
+		}
+	}
+	for alert := range covered {
+		if _, ok := declared[alert]; !ok {
+			t.Errorf("a promtool scenario names alert %q, which the rules file does not define", alert)
+		}
+	}
+}
+
+// TestEveryNegativeScenarioHasAPositiveTwin guards the one way a negative
+// scenario can pass while proving nothing: if its input series never matched
+// the rule's selector -- a typo in the metric name, say -- the rule would be
+// silent for the wrong reason and exp_alerts: [] would still be satisfied.
+// Requiring a positive scenario on the same alert means the metric name in the
+// fixture is known to reach the rule.
+func TestEveryNegativeScenarioHasAPositiveTwin(t *testing.T) {
+	positives := make(map[string]bool)
+	for _, sc := range promtoolScenarios() {
+		if sc.wantValue != "" {
+			positives[sc.alert] = true
+		}
+	}
+	for _, sc := range promtoolScenarios() {
+		if sc.wantValue == "" && !positives[sc.alert] {
+			t.Errorf("%s asserts %s stays silent but no positive scenario shows that alert firing on the same series, so the silence may be a typo rather than the rule",
+				sc.name, sc.alert)
+		}
 	}
 }

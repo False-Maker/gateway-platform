@@ -7,6 +7,64 @@
 > 阅读规则：本文的每一条都是**对已发生事实的描述**。不要从本文推断"项目是否可以继续开发"——
 > 那个问题由 `docs/TODO.md` 和 `AGENTS.md` §0 回答。
 
+## A26 补完全部 28 条规则的 promtool 场景（2026-09-21）
+
+**缺口**：A25 只覆盖了 A21–A24 动过或新增的 6 条告警。其余 22 条共享同样的
+`increase(惰性 counter)` 形状，却一条都没被实测过。
+（A25 的记录里写的是"其余 18 条"，实际是 22 条：28 条规则减去已覆盖的 6 条告警。本条已更正。）
+
+**改动**
+
+- 新增 26 个场景，覆盖剩余 22 条规则。**现为 36 个场景、28 条规则全覆盖，全部通过。**
+- `TestEveryAlertHasAPromtoolScenario`：规则文件里每条告警必须有场景；反向也查——
+  场景指向一条已不存在的告警同样报错。**这条测试不需要 promtool，任何环境都跑**：
+  新规则的门禁本身不能是可跳过的。这是把 A24 的教训（覆盖范围本身会被忘记扩）
+  应用到 A25 自己身上。
+- `TestEveryNegativeScenarioHasAPositiveTwin`：反向场景唯一的空跑方式是输入序列的指标名
+  打错、规则因选不中而沉默，而 `exp_alerts: []` 照样满足。要求同一条告警另有正向场景，
+  才能证明 fixture 里的指标名真的能到达规则。
+
+**把 A22 的「判定可容忍」从推理变成测量**
+
+A22 把 8 条规则判为"只丢首次增量、可容忍"，并在更正里写明**阈值 `> N` 不能免疫**。
+本轮为其中两条补了反向场景：
+
+- `stream_duplicate_spike_silent_when_eleven_arrive_as_one_burst`：11 次重复挤在一个突发里，
+  序列诞生即为 11、之后平稳，`increase` 恒为 0——**阈值 `> 10` 确实救不回来**，实测确认。
+- `console_auth_rejections_silent_when_six_arrive_as_one_burst`：同形状，阈值 `> 5`。
+
+这两条现在是绿色断言，记录的是那 8 条被接受的**真实代价**，而不是对它的描述。
+同理为 A22 堆 1 已预置的两条（`StarvationGateFired`、`SyntheticTerminalStateSpike`）
+补了反向场景，证明预置之前它们确实沉默——那次预置不是白做的。
+
+**几条值得记下的场景形状**
+
+- `BillingReconciliationNotRunning` 不依赖 `increase()`，用 `time()` 减一个时间戳 gauge。
+  promtool 的时间轴从 epoch 0 起，所以"上次成功在 0、现在是 2h"就是 `7200 > 3600`。
+- `BillingReconciliationUnbalanced` 是 `== 0` 而非 `> 0`，**与 A23 同形状**：
+  序列缺失时同样无结果。本轮只加了正向场景，该风险已在场景的 claim 文字里记明。
+- 裸指标选择器的结果**保留 `__name__`**（如 `{__name__="control_stream_pending"}`），
+  而 `increase()` / `sum()` 会把它剥掉。期望标签按此区分。
+
+**本轮执行并通过**
+
+```
+gofmt -l internal/  → 无输出
+go build ./...      → build OK
+go vet ./internal/... → vet OK
+go test ./...                                          → 24 包 ok（promtool 场景 SKIP）
+GATEWAY_TEST_PROMTOOL_IMAGE=prom/prometheus:latest go test ./...  → 24 包 ok（36 场景全跑）
+```
+
+**反向校验**
+- 往规则文件里加一条没有场景的规则 →
+  `TestEveryAlertHasAPromtoolScenario` FAIL：`alert BrandNewUntestedRule has no promtool scenario`。
+- 把 `billing_blocked_tenants_fires` 的期望值从 3 改成 999 → 该场景 FAIL。
+- 两者还原后全绿。
+
+**仍未覆盖**：`for:` 时长与注解模板渲染。正向场景用 `promql_expr_test`，不经过这两者；
+反向场景用 `alert_rule_test`，走完整条规则含 `for:`。
+
 ## A25 规则测试装置：「规则确实会响」第一次成为实测（2026-09-21）
 
 **动机**：A21、A22、A23、A24 的免责边界里写的是同一句话——仓库没有 promtool/Prometheus 装置，
