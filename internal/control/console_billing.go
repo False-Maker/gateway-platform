@@ -554,12 +554,19 @@ func (c Console) handleInsertPrice(w http.ResponseWriter, r *http.Request) {
 		EffectiveFrom: effectiveFrom,
 	}, now); err != nil {
 		switch {
-		case errors.Is(err, ErrPriceNotEffectiveInFuture):
+		case errors.Is(err, ErrPriceNotEffectiveInFuture), errors.Is(err, ErrPriceRejected):
 			writeError(w, http.StatusBadRequest, err.Error())
 		case isUniqueViolation(err):
 			writeError(w, http.StatusConflict, "a price with this id, or the same (provider, model, effective_from), already exists")
 		default:
-			writeError(w, http.StatusBadRequest, err.Error())
+			// A29: only the two cases above are the caller's fault. Everything
+			// else -- an unreachable database, a lock timeout, the 10s context
+			// expiring -- is this platform failing, and it used to come back as
+			// a 400 quoting the driver verbatim. That told an operator to go fix
+			// their input during an outage, kept the failure out of every 5xx
+			// signal, and put the database user, database name and address in a
+			// response body, which Console.fail exists to prevent.
+			c.fail(w, "insert model price", err)
 		}
 		return
 	}

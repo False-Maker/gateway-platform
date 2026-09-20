@@ -167,7 +167,14 @@ type accountView struct {
 	ConsecutiveFailures int      `json:"consecutive_failures"`
 	CooldownUntil       string   `json:"cooldown_until,omitempty"`
 	ExcludedModels      []string `json:"excluded_models"`
-	UpdatedAt           string   `json:"updated_at"`
+	// Capabilities is the model list this account claims to serve. A31: an
+	// empty list is not "no models" -- chooser.go's supports() reads it as
+	// "matches every model", which is how A18's unreadable channel became the
+	// most permissive account in the pool. An operator deciding whether to
+	// re-enable a parked account has to be able to see that, and the board was
+	// the only place they were going to look.
+	Capabilities []string `json:"capabilities"`
+	UpdatedAt    string   `json:"updated_at"`
 }
 
 // handleAccounts is §6.5's account health board. The columns are the ones A9
@@ -202,7 +209,7 @@ func (c Console) handleAccounts(w http.ResponseWriter, r *http.Request) {
 		SELECT id,provider,platform,"group",status,
 		       COALESCE(last_error_class,''),
 		       last_error_at, consecutive_failures, cooldown_until,
-		       excluded_models, updated_at
+		       excluded_models, capabilities, updated_at
 		FROM accounts
 		WHERE ($1::text = '' OR provider = $1::text)
 		  AND ($2::text = '' OR status = $2::text)
@@ -220,10 +227,10 @@ func (c Console) handleAccounts(w http.ResponseWriter, r *http.Request) {
 		var account accountView
 		var lastErrorAt, cooldownUntil *time.Time
 		var updatedAt time.Time
-		var excluded []byte
+		var excluded, capabilities []byte
 		if err := rows.Scan(&account.ID, &account.Provider, &account.Platform, &account.Group, &account.Status,
 			&account.LastErrorClass, &lastErrorAt, &account.ConsecutiveFailures, &cooldownUntil,
-			&excluded, &updatedAt); err != nil {
+			&excluded, &capabilities, &updatedAt); err != nil {
 			c.fail(w, "scan account", err)
 			return
 		}
@@ -241,6 +248,7 @@ func (c Console) handleAccounts(w http.ResponseWriter, r *http.Request) {
 			account.CooldownUntil = cooldownUntil.UTC().Format(time.RFC3339)
 		}
 		account.ExcludedModels = decodeStringArray(excluded)
+		account.Capabilities = decodeStringArray(capabilities)
 		accounts = append(accounts, account)
 	}
 	if err := rows.Err(); err != nil {

@@ -1381,3 +1381,136 @@ func TestConsoleGenuineRetryStillReplays(t *testing.T) {
 		t.Errorf("balance %s after 10 - 2.5 applied twice, want 7.500000000000", balance)
 	}
 }
+
+// A31 end to end, on a real row: an account parked by A18 -- disabled, with a
+// capability set nobody could read -- must not go back into rotation on the
+// single action A18 points the operator at.
+//
+// The claim needs a real account because the guard runs inside the same
+// transaction as the update; asserting it against the predicate alone would
+// leave the wiring, the 409, and the "nothing was written" part unmeasured.
+func TestConsoleActivatingAParkedAccountNeedsAcknowledgement(t *testing.T) {
+	ctx, db, console := newConsoleTestConsole(t)
+	accountID := b5Account(t, ctx, db, "parked")
+	// The state A18 leaves behind: disabled, and describing no models at all.
+	if _, err := db.Exec(ctx,
+		`UPDATE accounts SET status='disabled', capabilities='[]'::jsonb WHERE id=$1`, accountID); err != nil {
+		t.Fatal(err)
+	}
+	before := b51Epoch(t, ctx, db, accountID)
+
+	response := b5Request(t, console, http.MethodPost, "/v1/accounts/"+accountID+"/status",
+		`{"status":"active","reason":"migrated channel looks fine"}`)
+	if response.Code != http.StatusConflict {
+		t.Fatalf("activating an account that describes no models: got %d, want 409 (%s)",
+			response.Code, response.Body.String())
+	}
+	// The refusal has to say why, or the operator's next move is to invent one.
+	for _, phrase := range []string{"every model", "allow_unrestricted"} {
+		if !strings.Contains(response.Body.String(), phrase) {
+			t.Errorf("the refusal does not mention %q: %s", phrase, response.Body.String())
+		}
+	}
+	// Nothing may have moved: not the status, not the epoch, not the audit log.
+	var status string
+	if err := db.QueryRow(ctx, `SELECT status FROM accounts WHERE id=$1`, accountID).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != "disabled" {
+		t.Errorf("status = %q after a refused activation, want disabled", status)
+	}
+	if got := b51Epoch(t, ctx, db, accountID); got != before {
+		t.Errorf("a refused activation bumped fence_epoch from %d to %d", before, got)
+	}
+	var audits int
+	if err := db.QueryRow(ctx, `SELECT count(*) FROM account_actions WHERE account_id=$1`, accountID).Scan(&audits); err != nil {
+		t.Fatal(err)
+	}
+	if audits != 0 {
+		t.Errorf("a refused activation wrote %d audit rows", audits)
+	}
+
+	// Acknowledged, the same request goes through -- an empty capability set is
+	// still how an api-key channel says "unrestricted", so this is a
+	// confirmation, not a prohibition.
+	response = b5Request(t, console, http.MethodPost, "/v1/accounts/"+accountID+"/status",
+		`{"status":"active","reason":"migrated channel looks fine","allow_unrestricted":true}`)
+	if response.Code != http.StatusOK {
+		t.Fatalf("acknowledged activation: got %d, want 200 (%s)", response.Code, response.Body.String())
+	}
+	if err := db.QueryRow(ctx, `SELECT status FROM accounts WHERE id=$1`, accountID).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != "active" {
+		t.Errorf("status = %q after an acknowledged activation, want active", status)
+	}
+	if got := b51Epoch(t, ctx, db, accountID); got <= before {
+		t.Errorf("an applied activation did not advance fence_epoch past %d: %d", before, got)
+	}
+}
+
+// The reverse guard: an account that does describe models must still activate
+// without ceremony. Without this, A31 would have turned a targeted
+// confirmation into a toll on every re-enable.
+func TestConsoleActivatingADescribedAccountIsNotGated(t *testing.T) {
+	ctx, db, console := newConsoleTestConsole(t)
+	accountID := b5Account(t, ctx, db, "described")
+	if _, err := db.Exec(ctx,
+		`UPDATE accounts SET status='disabled', capabilities='["claude-opus-5"]'::jsonb WHERE id=$1`, accountID); err != nil {
+		t.Fatal(err)
+	}
+	response := b5Request(t, console, http.MethodPost, "/v1/accounts/"+accountID+"/status",
+		`{"status":"active","reason":"cleared"}`)
+	if response.Code != http.StatusOK {
+		t.Fatalf("activating an account that lists its models: got %d, want 200 (%s)",
+			response.Code, response.Body.String())
+	}
+	// And disabling an undescribed account is never gated either: that is how
+	// it gets parked, and an incident is the wrong moment to ask for a flag.
+	parked := b5Account(t, ctx, db, "park-now")
+	if _, err := db.Exec(ctx, `UPDATE accounts SET capabilities='[]'::jsonb WHERE id=$1`, parked); err != nil {
+		t.Fatal(err)
+	}
+	response = b5Request(t, console, http.MethodPost, "/v1/accounts/"+parked+"/status",
+		`{"status":"disabled","reason":"park it"}`)
+	if response.Code != http.StatusOK {
+		t.Fatalf("disabling an undescribed account: got %d, want 200 (%s)", response.Code, response.Body.String())
+	}
+}
+
+// A31: the board is where the decision gets made, so it has to carry the field
+// the decision turns on. Asserted against a real row because the column had to
+// be added to the query and the scan, not just the struct.
+func TestConsoleAccountsBoardCarriesCapabilitiesFromTheRow(t *testing.T) {
+	ctx, db, console := newConsoleTestConsole(t)
+	described := b5Account(t, ctx, db, "board-described")
+	parked := b5Account(t, ctx, db, "board-parked")
+	if _, err := db.Exec(ctx, `UPDATE accounts SET capabilities='["claude-opus-5","claude-sonnet-5"]'::jsonb WHERE id=$1`, described); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(ctx, `UPDATE accounts SET capabilities='[]'::jsonb WHERE id=$1`, parked); err != nil {
+		t.Fatal(err)
+	}
+	response := b5Request(t, console, http.MethodGet, "/v1/accounts?provider=b51-prov&limit=200", "")
+	if response.Code != http.StatusOK {
+		t.Fatalf("accounts board: got %d (%s)", response.Code, response.Body.String())
+	}
+	var body struct {
+		Accounts []accountView `json:"accounts"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	seen := map[string][]string{}
+	for _, account := range body.Accounts {
+		seen[account.ID] = account.Capabilities
+	}
+	if got, ok := seen[described]; !ok || len(got) != 2 {
+		t.Errorf("a described account reports capabilities %v", got)
+	}
+	// The one that matters: an empty list has to be distinguishable on the
+	// board from a populated one, because it means the opposite of "no models".
+	if got, ok := seen[parked]; !ok || len(got) != 0 {
+		t.Errorf("a parked account reports capabilities %v, want an empty list", got)
+	}
+}

@@ -35,6 +35,18 @@ var ErrPriceNotEffectiveInFuture = errors.New("model price effective_from must b
 // debit, so a missing wallet is a real error rather than a zero balance.
 var ErrWalletNotFound = errors.New("tenant wallet does not exist")
 
+// ErrPriceRejected marks the InsertModelPrice failures the caller caused, so a
+// handler can answer 400 for those and 500 for everything else.
+//
+// A29: handleInsertPrice used to send *every* repository error back as a 400
+// carrying err.Error(). An unreachable database therefore told the operator
+// their input was wrong -- and told them so in the driver's own words, which
+// name the database user, database and address. The sibling money endpoints
+// route unrecognised errors through Console.fail, which logs the detail and
+// answers 500; this sentinel is what lets the price endpoint do the same
+// without losing the genuine 400s underneath it.
+var ErrPriceRejected = errors.New("model price rejected")
+
 // ModelPrice is one immutable price row. Once inserted it is never updated or
 // deleted: a change is a new row with a later EffectiveFrom, which is what
 // makes a past bill replayable against the price that was actually in effect.
@@ -95,13 +107,13 @@ func (r PGBillingRepository) InsertModelPrice(ctx context.Context, price ModelPr
 		return errors.New("billing database pool is nil")
 	}
 	if price.ID == "" || price.Provider == "" || price.Model == "" {
-		return errors.New("model price needs an id, provider and model")
+		return fmt.Errorf("%w: needs an id, provider and model", ErrPriceRejected)
 	}
 	if price.Currency == "" {
 		price.Currency = "USD"
 	}
 	if price.UnitScale <= 0 {
-		return fmt.Errorf("model price unit_scale must be positive, got %d", price.UnitScale)
+		return fmt.Errorf("%w: unit_scale must be positive, got %d", ErrPriceRejected, price.UnitScale)
 	}
 	if !price.EffectiveFrom.After(now) {
 		return fmt.Errorf("%w: %s is not after %s", ErrPriceNotEffectiveInFuture,
@@ -115,10 +127,10 @@ func (r PGBillingRepository) InsertModelPrice(ctx context.Context, price ModelPr
 	}
 	for column, amount := range amounts {
 		if err := checkMoney(column, amount); err != nil {
-			return err
+			return fmt.Errorf("%w: %w", ErrPriceRejected, err)
 		}
 		if sign, ok := amount.Sign(); !ok || sign < 0 {
-			return fmt.Errorf("model price %s must not be negative, got %q", column, amount)
+			return fmt.Errorf("%w: %s must not be negative, got %q", ErrPriceRejected, column, amount)
 		}
 	}
 	_, err := r.DB.Exec(ctx, `
@@ -376,20 +388,42 @@ func checkMoney(column string, amount contracts.Decimal) error {
 
 // moneyIntegerDigits counts the digits left of the decimal point once any
 // exponent is applied ("1.5e3" is 1500, so four).
+//
+// A30: the first version added the exponent to the length of the integer part
+// alone, which ignores the fractional digits a positive exponent consumes.
+// "0.001e28" is exactly 1e25 -- 26 integer digits, storable -- but was counted
+// as 28 and rejected. The error only ever ran one way, so nothing unstorable
+// slipped through to PostgreSQL; what it cost was a 400 on amounts the money
+// columns can hold. A20 shipped a reverse guard against exactly this ("the
+// ceiling value must still be accepted") but wrote it with plain decimals, so
+// the exponent forms went unmeasured.
+//
+// The count is taken from the significant digits instead. Concatenating the
+// integer and fractional parts puts the decimal point after len(integer)
+// places; the exponent slides it, and the leading zeros that are not digits of
+// the value are subtracted rather than counted.
 func moneyIntegerDigits(amount contracts.Decimal) int {
 	raw := strings.TrimSpace(string(amount))
-	raw = strings.TrimPrefix(raw, "-")
+	raw = strings.TrimLeft(raw, "+-")
 	exponent := 0
 	if index := strings.IndexAny(raw, "eE"); index >= 0 {
 		exponent, _ = strconv.Atoi(raw[index+1:])
 		raw = raw[:index]
 	}
-	integer := raw
+	integer, fraction := raw, ""
 	if dot := strings.IndexByte(raw, '.'); dot >= 0 {
-		integer = raw[:dot]
+		integer, fraction = raw[:dot], raw[dot+1:]
 	}
-	integer = strings.TrimLeft(integer, "0")
-	digits := len(integer) + exponent
+	all := integer + fraction
+	significant := strings.TrimLeft(all, "0")
+	if significant == "" {
+		// Every digit is a zero, so the value is zero however the exponent
+		// moves the point. Zero needs no integer digits it does not have.
+		return 0
+	}
+	// Digits dropped by TrimLeft sit left of the first significant one, so they
+	// are positions the point has to travel past, not digits of the value.
+	digits := len(integer) + exponent - (len(all) - len(significant))
 	if digits > 0 {
 		return digits
 	}

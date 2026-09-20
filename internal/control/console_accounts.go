@@ -54,6 +54,33 @@ type accountActionResult struct {
 
 var errAccountNotFound = errors.New("account not found")
 
+// errUnrestrictedNotAcknowledged is returned when an operator would re-enable
+// an account that describes no models.
+//
+// A31: A18 parks a migrated channel whose model list could not be read as
+// `disabled`, because gateway's supports() treats an empty capability set as
+// "matches every model" -- the account nobody could describe would otherwise be
+// the most permissive one in the pool. A18 pointed the operator at this
+// endpoint to release it again, but nothing here, and nothing anywhere in
+// control, ever writes accounts.capabilities: the only available move restores
+// exactly the state A18 removed, silently, on an account whose board row looks
+// healthy. This makes that move deliberate instead of default. An empty set is
+// still legitimate -- it is how an api-key channel says "unrestricted" -- so
+// this asks for confirmation rather than refusing, the same shape as E2's two
+// independent confirmations for the fixture executor.
+var errUnrestrictedNotAcknowledged = errors.New("activating an account with an empty capability set needs an explicit acknowledgement")
+
+// needsUnrestrictedAcknowledgement reports whether this status change would put
+// an account that matches every model back into rotation without the operator
+// having said that is what they want.
+//
+// Only activation is gated. Disabling such an account is how it got parked, and
+// demanding a confirmation to take something *out* of the pool would slow down
+// the one action nobody should have to argue for during an incident.
+func needsUnrestrictedAcknowledgement(status string, capabilities []string, acknowledged bool) bool {
+	return status == "active" && len(capabilities) == 0 && !acknowledged
+}
+
 // handleAccountStatus disables or re-enables an account.
 //
 // Only 'active' and 'disabled' are accepted. The status column also carries
@@ -70,6 +97,10 @@ func (c Console) handleAccountStatus(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Status string `json:"status"`
 		Reason string `json:"reason"`
+		// AllowUnrestricted acknowledges that activating an account with an
+		// empty capability set puts an account that matches *every* model back
+		// into the pool. See errUnrestrictedNotAcknowledged.
+		AllowUnrestricted bool `json:"allow_unrestricted"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16<<10)).Decode(&body); err != nil {
 		writeError(w, http.StatusBadRequest, "body must be JSON: "+err.Error())
@@ -93,8 +124,21 @@ func (c Console) handleAccountStatus(w http.ResponseWriter, r *http.Request) {
 	result, err := c.applyAccountAction(ctx, accountID, "set_status:"+status, reason, operator(r),
 		`UPDATE accounts SET status=$2, fence_epoch=fence_epoch+1, updated_at=now()
 		 WHERE id=$1 AND status <> $2
-		 RETURNING fence_epoch`)
+		 RETURNING fence_epoch`,
+		func(capabilities []string) error {
+			if needsUnrestrictedAcknowledgement(status, capabilities, body.AllowUnrestricted) {
+				return errUnrestrictedNotAcknowledged
+			}
+			return nil
+		})
 	if err != nil {
+		if errors.Is(err, errUnrestrictedNotAcknowledged) {
+			writeError(w, http.StatusConflict, fmt.Sprintf(
+				"account %s has an empty capability set, which gateway reads as \"serves every model\", not \"serves none\". "+
+					"A18 parks a migrated channel here when its model list could not be read, and nothing since has repaired it. "+
+					"Re-send with \"allow_unrestricted\": true if an unrestricted account is what you intend.", accountID))
+			return
+		}
 		c.accountActionError(w, "set account status", err)
 		return
 	}
@@ -130,7 +174,7 @@ func (c Console) handleClearCooldown(w http.ResponseWriter, r *http.Request) {
 		`UPDATE accounts SET cooldown_until=NULL, consecutive_failures=0,
 		        fence_epoch=fence_epoch+1, updated_at=now()
 		 WHERE id=$1 AND (cooldown_until IS NOT NULL OR consecutive_failures > 0)
-		 RETURNING fence_epoch`)
+		 RETURNING fence_epoch`, nil)
 	if err != nil {
 		c.accountActionError(w, "clear account cooldown", err)
 		return
@@ -164,7 +208,7 @@ func (c Console) handleClearExcludedModels(w http.ResponseWriter, r *http.Reques
 	result, err := c.applyAccountAction(ctx, accountID, "clear_excluded_models", reason, operator(r),
 		`UPDATE accounts SET excluded_models='[]'::jsonb, fence_epoch=fence_epoch+1, updated_at=now()
 		 WHERE id=$1 AND excluded_models <> '[]'::jsonb
-		 RETURNING fence_epoch`)
+		 RETURNING fence_epoch`, nil)
 	if err != nil {
 		c.accountActionError(w, "clear excluded models", err)
 		return
@@ -184,7 +228,11 @@ func (c Console) handleClearExcludedModels(w http.ResponseWriter, r *http.Reques
 // (which would invalidate an in-flight refresh for no reason) and must not
 // write an audit row claiming a change that did not happen. The audit row is
 // only written when something actually moved.
-func (c Console) applyAccountAction(ctx context.Context, accountID, action, reason, who, updateSQL string) (accountActionResult, error) {
+// guard, when non-nil, is consulted inside the transaction with the account's
+// current capability set. Running it here rather than in the handler removes
+// the window between reading the row and updating it, the same reason
+// handleTopup leans on the foreign key instead of a prior existence check.
+func (c Console) applyAccountAction(ctx context.Context, accountID, action, reason, who, updateSQL string, guard func(capabilities []string) error) (accountActionResult, error) {
 	result := accountActionResult{
 		AccountID:       accountID,
 		Action:          action,
@@ -202,12 +250,17 @@ func (c Console) applyAccountAction(ctx context.Context, accountID, action, reas
 	// Confirm the account exists before deciding whether a no-op was "already
 	// in that state" or "no such account". Without this, disabling a typo'd id
 	// would return a cheerful 200 saying it was already disabled.
-	var exists bool
-	if err := tx.QueryRow(ctx, `SELECT true FROM accounts WHERE id=$1`, accountID).Scan(&exists); err != nil {
+	var capabilitiesJSON []byte
+	if err := tx.QueryRow(ctx, `SELECT capabilities FROM accounts WHERE id=$1`, accountID).Scan(&capabilitiesJSON); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return result, errAccountNotFound
 		}
 		return result, err
+	}
+	if guard != nil {
+		if err := guard(decodeStringArray(capabilitiesJSON)); err != nil {
+			return result, err
+		}
 	}
 
 	var epoch int64

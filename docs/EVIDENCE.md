@@ -7,6 +7,156 @@
 > 阅读规则：本文的每一条都是**对已发生事实的描述**。不要从本文推断"项目是否可以继续开发"——
 > 那个问题由 `docs/TODO.md` 和 `AGENTS.md` §0 回答。
 
+## 第八次复盘：A29 / A30 / A31（2026-09-21）
+
+**两个靶子**：① 对抗性复核 A17–A28 与 B5.1 的新代码（全仓唯一从未被作者以外任何人读过的部分）；
+② 系统清扫「本轮未做 / 有意未做 / 未验证」散文段落里的欠账——`EVIDENCE.md:829` 记的第四类
+漏网机制，项目为它吃过四次亏（B4.6 / B4.7 / E3 / B5.1），却从未被任何一轮系统扫过。
+
+**未重扫**：总览 / 两份角色文档 / `AUDIT-CONTEXT` / `P2-ADMISSION` / `B4`/`B5` 设计文档 /
+§4 契约正文——第 3–6 次已逐条核对，本轮按「换靶子」原则跳过。§C 全 `[live-gate]`，§D 未碰。
+
+**一次自我推翻**：第一次 grep `AcquireTenant` 只看到测试调用，差点记成「有表无写者」，
+是 `| head` 截断了输出。读完整路径后推翻——正是第四次复盘要防的错法。
+
+---
+
+## A29 单价录入把平台故障报成 400，并把驱动错误原文回给调用方（2026-09-21）
+
+**发现方式**：横向比对控制台六个写端点的错误映射时，`console_billing.go:561` 的
+`default: writeError(w, http.StatusBadRequest, err.Error())` 与其余五个不一致。
+
+**实测复现**（构造指向无人监听端口的 pgxpool，同一动作打两个端点）：
+
+```
+价格端点 / PG 不可达 -> status=400 body={"error": "insert model price p1: failed to
+  connect to `user=u database=nope`: ... dial tcp 127.0.0.1:1: connect: connection refused"}
+充值端点 / PG 不可达 -> status=500 body={"error": "ensure wallet failed"}
+```
+
+**两个后果**：① PG 不可达 / 锁超时 / context 到期全被报成「你的输入不对」，
+4xx 不进任何 5xx 口径，平台故障在这条路径上对监控不可见；
+② 违反本包自己写明的策略（`console.go:344-346`：数据库错误不该进响应体），
+把用户名、库名、地址端口回给了调用方。
+
+**修法**：新增 `ErrPriceRejected` 哨兵，`InsertModelPrice` 里每条落在 PG 之前的校验都包它；
+handler 的 `default:` 改走 `c.fail` → 500。`ErrPriceNotEffectiveInFuture` 保留自己的分支。
+
+**验证**
+- ✅ `TestPriceEndpointReportsDatabaseFailureAsServerError`：500，且响应体不含
+  `127.0.0.1` / `database=` / `user=` / `connection refused` / `dial` 任一。
+- ✅ `TestPriceEndpointStillRejectsBadInputWithFourHundred`：三类真 400 存活且各自指名原因。
+- ✅ `TestEveryPriceValidationCarriesTheRejectedSentinel`：9 种输入错误逐条断言带哨兵
+  （**防清单腐烂**——新校验忘包哨兵会默认掉进 500），并断言 retroactive 保留自己的哨兵。
+- **反向校验**：`default:` 改回 `400 + err.Error()` → FAIL（`got 400, want 500`）；
+  去掉 `unit_scale` 那条的哨兵 → FAIL 并指名该条；还原后转绿。
+
+---
+
+## A30 `moneyIntegerDigits` 对带指数的写法多算整数位（2026-09-21）
+
+**发现方式**：对抗性读 A20 新增的 `moneyIntegerDigits` 时，注意到它用
+「整数部分长度 + 指数」，会忽略被正指数吃掉的小数位。
+
+**实测**：
+
+```
+0.001e28    真实整数位=26  计算=28  可存 → 被拒   <<< 与真实可存性不符
+0.0001e29   真实整数位=26  计算=29  可存 → 被拒   <<< 与真实可存性不符
+1e25        真实整数位=26  计算=26  可存 → 接受
+1e30        真实整数位=31  计算=31  不可存 → 拒绝（正确）
+```
+
+**方向是安全的**：只会多算、不会少算，**A20 要堵的 500 没有回来**；
+代价是 `NUMERIC(38,12)` 能存的值被误判成 400。另有 `+1e30` 的 `+` 未 trim，多算一位。
+
+**这条真正的教训**：A20 自己写了反向保护「断言上限值仍被接受，防止修复悄悄收窄可记录范围」——
+**保护存在、方向正确、只是覆盖面差一格**（只用了普通十进制写法）。
+这是「手写清单不是机制」（第六次 F3）那一课的下一层：**写了反向保护也不等于测到了。**
+
+**修法**：改按有效数字 + 小数点位置计数——拼接整数与小数部分，指数滑动小数点，
+再减去前导零（那是小数点要走过的位置，不是值的数位）；`TrimLeft(raw, "+-")` 修符号；
+全零显式返回 0。
+
+**验证**
+- ✅ `TestMoneyIntegerDigitsCountsExponentForms`：17 组覆盖普通 / 正负指数 / 符号 /
+  边界两侧 / 全零，并**按可存性**（而非数位）断言 `checkMoney` 的接受与拒绝两侧。
+- **一次自我更正**：初版把 `0.1e27` 期望成 26 位——它是 `1e26`，27 位，应落在拒绝侧。
+  是测试用例错了，代码是对的，已改正并补 `0.1e26`（= 1e25，可存）作为对照。
+- **反向校验**：还原成 A20 旧算法 → FAIL 并逐条列出 `0.001e28 = 29, want 26` 等五条；
+  还原后转绿。
+
+---
+
+## A31 A18 停放了账号，但它指的那条转正路径会原样恢复缺陷（2026-09-21）
+
+**发现方式**：对抗性复核 A18 时，它本身的停放逻辑是对的，于是转去查它指的转正路径。
+
+**逐段验证的链条**：
+
+1. A18 把区分信息写进 `migration_records.conversion`（`disabled_because` / `source_status`）。
+2. 控制台**完全不暴露 `conversion`**，而 `accountView` 有 `excluded_models` 却**没有
+   `capabilities`**。运营看到的只是 `status: disabled`，与「源渠道本来就禁用」一模一样。
+   A18 说这个歧义靠 `conversion.source_status` 区分，**但产品里没有任何地方能读到它**。
+3. A18 明写转正走 `POST /v1/accounts/{id}/status`，该端点对能力集**零前置条件**。
+4. 全 control 包 `capabilities` **只被读、从无写入点**（仅 `snapshot_loop.go:73/139`），
+   控制台亦无对应端点——**能力集根本修不了**。
+
+于是运营唯一能做的动作，就是把账号原样放回池子，且它依然匹配所有模型
+（`chooser.go:301` 把空能力集读作「匹配任意模型」）。
+**A18 修的洞，从 A18 自己指的那扇门走回来了**，而且无声——账号在看板上完全健康。
+
+**修法**：看板暴露 `capabilities`（**刻意不加 `omitempty`**，缺键与空列表会读成一样，
+而空列表正是最该被看见的）；转正空能力集需 `allow_unrestricted` 确认，否则 409 并说明理由；
+判定收在事务内（`applyAccountAction` 新增 `guard` 形参），消除读行与改行之间的窗口。
+
+**有意不做**：不新造状态词（沿用 A18 的理由）；不加修能力集的端点——
+那要在「运营手填」与「重跑迁移转换」之间做设计决定，不在本条范围。
+空集仍然合法（apikey 渠道表达「无限制」的方式），所以这里是确认而非禁止，
+与 E2 对 fixture executor 的两个独立确认同形。
+
+**验证（真实 PG）**
+- ✅ `TestConsoleActivatingAParkedAccountNeedsAcknowledgement`：409 且文案含
+  `every model` / `allow_unrestricted`；**并断言什么都没动**——status 仍 disabled、
+  `fence_epoch` 未变、`account_actions` 零行；随后带确认重发则 200 且 epoch 推进。
+- ✅ `TestConsoleActivatingADescribedAccountIsNotGated`（反向保护）：有模型的账号照常 200，
+  停用无描述的账号也照常 200。
+- ✅ `TestConsoleAccountsBoardCarriesCapabilitiesFromTheRow`：两行真实数据，
+  空列表与非空列表在看板上可区分。
+- ✅ `TestActivatingAnUndescribedAccountNeedsAcknowledgement`：判定函数 5 组，无需 PG。
+- **反向校验（三条）**：去掉 guard → `got 200, want 409` 且 `= false, want true`；
+  让 guard 连 `disabled` 也拦 → 反向保护 FAIL（`got 409, want 200`）；
+  从看板查询去掉该列 → FAIL 并指出能力集为空。三条还原后全绿。
+
+---
+
+## 第八次复盘的验证总账（2026-09-21）
+
+```
+gofmt -l cmd internal pkg                                         → 无输出
+go build ./...                                                    → OK
+go vet ./...                                                      → OK
+go test -count=1 ./...                                            → 24 包全过（门禁套件 skip）
+source configs/test-infra/test.env && go test -count=1 -p 1 ./...  → 24 包全过（真实 PG/Redis/ClickHouse）
+go test -race -count=1 -p 1 ./pkg/contracts ./internal/control/... → 全过
+GATEWAY_TEST_PROMTOOL_IMAGE=prom/prometheus:latest \
+  go test -count=1 ./internal/observability/                       → 全过（47 个 promtool 场景）
+六条反向校验                                                        → 各自 FAIL 并指名问题，还原后全绿
+```
+
+**本轮未做 / 未验证**
+- A31 未在真实迁移上跑一次「A18 停放 → 看板可见 → 确认转正」的完整链路；
+  停放侧与转正侧分别有测试，**接缝本身未端到端演练**。
+- 未新增告警规则。三条都是 HTTP 面的行为，`ConsoleAuthRejections` 之外无对应指标；
+  A29 让 5xx 归位，但控制台**没有按状态码分桶的计数器**，所以「价格端点在报 500」
+  目前仍只能从日志看见。**这是一条新的可观测性缺口，记在此处**。
+- A30 只改计数，**未对真实 PG 做过一次 `1e25` 级别的实际 INSERT**；
+  可存性是按 `NUMERIC(38,12)` 的定义推的，不是测出来的。
+- 轴②的清扫**只覆盖 `docs/` 与 `AGENTS.md`**，未扫 `fluxgate/` `keyhive/` 两份架构文档里的
+  同类散文段落。
+
+---
+
 ## A28 收掉 `for:` 与注解两块剩余空白（2026-09-21）
 
 A25/A26 明确列出两处未覆盖：`for:` 时长与注解模板渲染。本条收掉它们。
@@ -2508,7 +2658,7 @@ NOPERM 拒绝；`test-wrapper` `HGETALL` 被 NOPERM 拒绝。
 
 `go fmt ./...` 顺带改动了 `cmd/new-api-migrate/main_test.go` 的一处格式，已还原，不计入本轮。
 本轮未执行真实 provider 请求、生产写入、部署或切流。最高剩余风险：token 传播依赖 control 15s tick 与
-gateway 5s 轮询，撤销最坏延迟约 20s；per-tenant 限流与粘滞会话隔离尚未实现。
+gateway 5s 轮询，撤销最坏延迟约 20s；~~per-tenant 限流与粘滞会话隔离尚未实现~~ —— **该句由第八次复盘更正（2026-09-21）**：两者均已接线，见 `docs/TODO.md` A6 的更正块。
 
 ## D1 Docker PostgreSQL + Redis 7.0.15 全量集成验收（2026-09-10）
 
