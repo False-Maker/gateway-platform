@@ -1173,25 +1173,15 @@ func TestConsoleHeldTrayDoesNotOfferACursorToAnEmptyPage(t *testing.T) {
 // UPDATE: a hand-written repair would register as wallet_balance_drift.
 func TestConsoleAdjustCorrectsWalletAndStaysReconciled(t *testing.T) {
 	ctx, db, console := newConsoleTestConsole(t)
-	tenantID := fmt.Sprintf("b5-adjust-%d", rand.Int63())
-	t.Cleanup(func() {
-		background := context.Background()
-		db.Exec(background, `DELETE FROM wallet_transactions WHERE tenant_id=$1`, tenantID)
-		db.Exec(background, `DELETE FROM tenant_wallets WHERE tenant_id=$1`, tenantID)
-		db.Exec(background, `DELETE FROM tenants WHERE id=$1`, tenantID)
-	})
-	if _, err := db.Exec(ctx, `INSERT INTO tenants (id,name) VALUES ($1,'B5 adjust fixture')`, tenantID); err != nil {
-		t.Fatal(err)
-	}
+	// b5Fixture rather than a bare tenant, and that choice is the whole point:
+	// Reconciliation.Run builds its tenant set from usage_ledger rows inside
+	// the window, so a tenant with no ledger rows is never examined and the
+	// drift assertion below would pass without checking anything. The first
+	// version of this test did exactly that -- it was green and vacuous. The
+	// fixture's held row is enough to put the tenant in the window, and the
+	// report.Tenants assertion further down keeps it honest.
+	tenantID, _ := b5Fixture(t, ctx, db, "adjust")
 	repository := PGBillingRepository{DB: db}
-	if err := repository.EnsureWallet(ctx, tenantID, "USD"); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := repository.ApplyMovement(ctx, WalletMovement{
-		ID: tenantID + "-seed", TenantID: tenantID, Kind: "topup", Amount: "10",
-	}); err != nil {
-		t.Fatal(err)
-	}
 
 	// Negative: the under-charge case from B4 §D6. A top-up cannot express it.
 	debit := `{"id":"` + tenantID + `-adj1","amount":"-2.5","reason":"late price entry for b5-model"}`
@@ -1251,6 +1241,24 @@ func TestConsoleAdjustCorrectsWalletAndStaysReconciled(t *testing.T) {
 	report, err := (Reconciliation{DB: db}).Run(ctx, b5OccurredAt.Add(-time.Hour), time.Now().UTC().Add(time.Hour))
 	if err != nil {
 		t.Fatal(err)
+	}
+	// Non-vacuity guard, and it is load-bearing: Run only examines tenants
+	// that have usage_ledger rows in the window, so without this the loop
+	// below could iterate over a report that never looked at this wallet at
+	// all. Assert the tenant was actually reconciled before trusting the
+	// absence of a drift finding.
+	examined := false
+	for _, tenant := range report.Tenants {
+		if tenant.TenantID == tenantID {
+			examined = true
+			if tenant.WalletBalance != "8.750000000000" || tenant.JournalSum != "8.750000000000" {
+				t.Errorf("reconcile saw balance=%s journal=%s, want both 8.750000000000",
+					tenant.WalletBalance, tenant.JournalSum)
+			}
+		}
+	}
+	if !examined {
+		t.Fatal("reconcile never examined this tenant, so the drift assertion below proves nothing")
 	}
 	for _, discrepancy := range report.Discrepancies {
 		if discrepancy.Kind == DiscrepancyWalletBalanceDrift && discrepancy.TenantID == tenantID {

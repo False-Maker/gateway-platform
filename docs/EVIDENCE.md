@@ -35,14 +35,39 @@
 - 新端点已加入两张既有枚举表：`console_test.go` 的 `TestConsoleAuthorizesEveryRoute`
   与 `console_hardening_test.go` 的写路径表（只读 token POST 须 403）—— 均 PASS。
 
-**本轮未验证（重要）**
-- 新增的两个集成测试 `TestConsoleAdjustCorrectsWalletAndStaysReconciled`、
-  `TestConsoleAdjustRequiresAnExistingWallet` **本轮未执行**：本机 WSL 发行版当前
-  `docker` 不可用（`could not be found in this WSL 2 distro`），`GATEWAY_TEST_DATABASE_URL` 未设置。
-  已确认两者**已注册且严格 skipped**（`-v -run Adjust` 输出 `--- SKIP` 并给出原因），
-  不是被构建标签排除。**因此「余额按双向正确变动」「重放不重复修正」「对账不产生
-  `wallet_balance_drift`」三条属未执行断言**，待 E3 的 CI 或本机 Docker 恢复后复跑。
+**首次提交时未验证，同日 Docker 恢复后已补跑（2026-09-20）**
+- 提交 `05d8362` 当时本机 WSL 里 `docker` 不可用，两个集成测试严格 skipped，
+  「余额按双向正确变动」「重放不重复修正」「对账不产生 `wallet_balance_drift`」三条属未执行断言。
+- Docker 恢复后（Server 29.4.0）起 `configs/test-infra` 三容器（PG 16 / Redis 7.0.15 /
+  ClickHouse 24.8，均 healthy），`source configs/test-infra/test.env` 后
+  `go test -count=1 -p 1 ./...` **24 个包全部通过**，此前 skipped 的 gated 套件全部真跑；
+  `go vet`、`gofmt`、`-race`（`pkg/contracts` + `internal/control/...`）均通过。
+
+**一次空跑的自我更正（重要，2026-09-20）**
+- `TestConsoleAdjustCorrectsWalletAndStaysReconciled` 第一版用裸租户（tenant + wallet + topup），
+  断言「report 里没有本租户的 `wallet_balance_drift`」并**通过**了——但它是**空跑通过**。
+- 真因：`Reconciliation.Run` 的租户集合只来自窗口内的 `usage_ledger` 行
+  （`billing_reconcile.go:167` `windowRows` → `byTenant` → `tenantIDs` → `walletTotals`，
+  drift 检查在 `:266`）。没有 ledger 行的租户**根本不进对账**，
+  那个循环遍历的是一份从未看过这个钱包的报告。
+- 发现方式：写了个临时测试直接 `UPDATE tenant_wallets SET balance = balance - 3`
+  绕过 `applyMovement` 制造 drift，预期对账报警——结果**没有报**。顺这条线才查出租户没进窗口。
+  临时测试用完即删，未进仓库。
+- 修法：改用 `b5Fixture`（含一条 held ledger 行，足以让租户进窗口），
+  并加**防空跑断言**：先确认租户出现在 `report.Tenants` 且 `WalletBalance == JournalSum == 8.75`，
+  再断言无 drift。
+- 已反向验证断言现在是活的：在该测试内注入 `balance - 3` 后 FAIL，同时报出
+  `reconcile saw balance=5.750000000000 journal=8.750000000000` 与
+  `wallet_balance_drift ... Expected:8.75 Actual:5.75`；恢复后转绿，
+  `git diff --stat` 确认文件已还原。
+- **结论：对账机制本身没有问题**，问题只在测试租户没进窗口。
+  这条记录保留，是因为「绿的断言未必是活的断言」正是本轮最值得记住的教训。
+
+**仍未验证**
 - 真实运营审批流（谁有权调账、是否二人复核）属部署侧，本条未涉及。
+- 一个钱包**没有任何窗口内 ledger 行**时，其 drift 不会被对账发现——这是
+  `Reconciliation.Run` 的既有窗口语义（按计费活动对账），不是本条引入的问题，本轮**未改**。
+  仅在此记录一次。
 
 ## A16 `unpriced` 行的告警（2026-09-20）
 

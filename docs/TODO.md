@@ -553,9 +553,7 @@ E1 也接上了规则。但 §6.3.1 规则 2 的价值是「不要一个号一�
 ### A15 `[no-cred]` 钱包 `adjustment` 冲正/退款：设计定为唯一修正手段，全仓库零写入方
 
 **状态：已完成（2026-09-20）。** 证据见 `docs/EVIDENCE.md` 同名小节。
-**注意本条有未执行的断言**：三个 PG 集成断言（余额双向变动、重放不重复修正、
-对账无 `wallet_balance_drift`）因本机 Docker 不可用而**未跑**，测试已注册并严格 skipped，
-待 CI 或本机 Docker 恢复后复跑。
+PG 集成断言已于同日 Docker 恢复后**真跑通过**，并修掉了其中一条**空跑**的断言（见下）。
 
 > **三路独立确认**：本条由两个互不知情的复盘分片从**不同文档**各自撞到，
 > 加一次直接代码验证。B4 分片从 `docs/B4-BILLING-MODEL.md:85` 进入，
@@ -605,8 +603,22 @@ B4.3/B4.5 `:650` 专门列了「`estimated` 仍无生产者」——**唯独没�
 - ✅ 幂等键沿用 `WalletMovement.ID`；重放返回原流水并计 `control_console_adjustment_replayed_total`。
 - ✅ 读写级能力：POST 经 `authorize` 按方法分级，只读 token 得 403；已加入
   `console_hardening_test.go` 的写路径枚举表与 `TestConsoleAuthorizesEveryRoute`。
-- ⚠️ 对账恒等式回归**已写未跑**（`TestConsoleAdjustCorrectsWalletAndStaysReconciled`），
-  原因见上方状态行。
+- ✅ 对账恒等式回归 `TestConsoleAdjustCorrectsWalletAndStaysReconciled` 真跑通过
+  （真实 PG，2026-09-20）。**但第一版是空跑的**——见下。
+
+> **一次空跑的自我更正（2026-09-20）**：该测试第一版用裸租户（只建 tenant + wallet + topup），
+> 断言「report 里没有本租户的 `wallet_balance_drift`」并**通过**了。它通过的原因不是不变量成立，
+> 而是 `Reconciliation.Run` 的租户集合**只来自窗口内的 `usage_ledger` 行**
+> （`billing_reconcile.go:167` `windowRows` → `byTenant` → `tenantIDs` → `walletTotals`），
+> 没有 ledger 行的租户**根本不进对账**，循环遍历了一份从未看过这个钱包的报告。
+> 发现方式：额外写了个临时测试，直接 `UPDATE tenant_wallets SET balance = balance - 3`
+> 绕过 `applyMovement` 制造 drift，结果对账**没有报**——顺着这条线才查出是租户没进窗口。
+> 修法：改用 `b5Fixture`（带一条 held ledger 行，足以让租户进窗口），
+> 并加一条**防空跑断言**——先确认租户出现在 `report.Tenants` 且
+> `WalletBalance == JournalSum == 8.75`，再去断言没有 drift。
+> 已反向验证该断言现在是活的：注入 `balance - 3` 后测试 FAIL 并同时报出
+> 「reconcile saw balance=5.75 journal=8.75」与 `wallet_balance_drift`，恢复后转绿。
+> **对账机制本身没有问题**，问题只在我的测试租户没进窗口。
 
 **实现摘要**
 - 钱包必须已存在：不调 `EnsureWallet`，`ErrWalletNotFound` → 404。打错租户 id 应当是 404，
