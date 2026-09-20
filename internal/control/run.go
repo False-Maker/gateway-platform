@@ -127,6 +127,10 @@ func Run(cfg Config) error {
 		}
 	}
 	consumer := eventsConsumer(rdb, cfg.ConsumerID, ledger)
+	// A22: the DLQ and synthetic-terminal counters must exist at zero before
+	// the first event, or increase() cannot see the increment that creates the
+	// series. See Consumer.PrimeMetrics.
+	consumer.PrimeMetrics()
 	refreshLoop, err := NewRefreshLoop(db, cfg.CredentialKey)
 	if err != nil {
 		return err
@@ -188,6 +192,7 @@ func Run(cfg Config) error {
 			return fmt.Errorf("console auth: %w", err)
 		}
 		console := Console{Auth: auth, DB: db, Detail: detailWriter, Metrics: observability.Default}
+		console.PrimeMetrics()
 		if cfg.ConsoleReadOnlyToken != "" {
 			log.Printf("control console: read-only token configured; writes require %s", ConsoleTokenEnv)
 		}

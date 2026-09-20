@@ -316,6 +316,31 @@ func decode(values map[string]any) (contracts.StreamEvent, error) {
 	return contracts.StreamEvent{EventType: f.EventType, SchemaVersion: schema, EventID: f.EventID, RequestID: f.RequestID, AttemptID: f.AttemptID, ProducerID: f.ProducerID, OccurredAt: occurred, Payload: json.RawMessage(f.Payload)}, nil
 }
 
+// dlqCategories is every `category` deadLetter is called with. It exists so
+// PrimeMetrics can publish the DLQ series at zero; TestDLQCategoriesCoverEvery
+// DeadLetterCall reads this file's deadLetter call sites rather than trusting
+// this list, so the two cannot drift apart silently.
+func dlqCategories() []string {
+	return []string{"invalid_envelope", "invalid_contract", "invalid_json", "retry_exhausted"}
+}
+
+// PrimeMetrics publishes this consumer's alerting counters at zero. A22: the
+// registry creates a series on first AddCounter and the exposition carries no
+// _created, so increase() -- last minus first inside the window -- cannot see
+// the increment that brought a series into existence. For a counter whose
+// normal value is zero forever, that increment *is* the event, and the rule
+// watching it is dead. StreamDLQGrowing (critical) and
+// SyntheticTerminalStateSpike are both that shape.
+func (c Consumer) PrimeMetrics() {
+	for _, category := range dlqCategories() {
+		c.metrics().AddCounter("control_stream_dlq_total", 0, "reason", category)
+	}
+	// Only the `synthetic` source is primed: it is the one this consumer emits
+	// and the one SyntheticTerminalStateSpike watches. `gateway` comes from the
+	// ledger and no rule reads it.
+	c.metrics().AddCounter("request_attempt_recovered_total", 0, "source", "synthetic")
+}
+
 func (c Consumer) deadLetter(ctx context.Context, message redis.XMessage, category string, reason error) error {
 	retries, _ := c.Redis.Get(ctx, "gateway:events:retry:"+message.ID).Result()
 	original, marshalErr := json.Marshal(message.Values)

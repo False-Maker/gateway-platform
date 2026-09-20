@@ -365,7 +365,24 @@ func lineAmount(row billableRow, price ModelPrice) (*big.Rat, error) {
 // rather than on the first completed run matters because RunOnce returns early
 // when the price table is empty, which is the deployment order that produces
 // that first unpriced batch.
-func (j BillingJob) PrimeMetrics() { j.publishRowCounts(BillingRunResult{}) }
+// A22 adds the unknown-usage-class counter here for the same reason. Its own
+// comment says it is "never expected to be non-zero", which makes it the purest
+// form of the defect: the increment that creates the series is the entire event,
+// so BillingUnknownUsageClass (critical) could not fire on a single occurrence.
+func (j BillingJob) PrimeMetrics() {
+	j.publishRowCounts(BillingRunResult{})
+	j.publishUnknownClass(0)
+}
+
+func (j BillingJob) publishUnknownClass(rows int) {
+	if j.Metrics == nil {
+		return
+	}
+	// A class the policy table does not cover. Never expected to be non-zero;
+	// if it is, the policy is behind the contract. Zero is published too, so
+	// the first occurrence is a 0 -> N step increase() can see.
+	j.Metrics.AddCounter("control_billing_unknown_usage_class_total", float64(rows))
+}
 
 func (j BillingJob) publishRowCounts(result BillingRunResult) {
 	if j.Metrics == nil {
@@ -392,11 +409,7 @@ func (j BillingJob) publishSignals(ctx context.Context, result BillingRunResult)
 		return
 	}
 	j.publishRowCounts(result)
-	if result.RowsUnknownClass > 0 {
-		// A class the policy table does not cover. Never expected to be
-		// non-zero; if it is, the policy is behind the contract.
-		j.Metrics.AddCounter("control_billing_unknown_usage_class_total", float64(result.RowsUnknownClass))
-	}
+	j.publishUnknownClass(result.RowsUnknownClass)
 	rows, err := j.DB.Query(ctx, `
 		SELECT usage_source,count(*) FROM usage_ledger
 		WHERE billing_state='held' GROUP BY usage_source`)

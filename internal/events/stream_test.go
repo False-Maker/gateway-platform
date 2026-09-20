@@ -4,10 +4,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http/httptest"
+	"os"
+	"regexp"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/alicebob/miniredis/v2"
+	"github.com/elucid/gateway-platform/internal/observability"
 	"github.com/elucid/gateway-platform/pkg/contracts"
 	"github.com/redis/go-redis/v9"
 )
@@ -197,4 +202,77 @@ func TestTrimPreservesOldestPendingMessage(t *testing.T) {
 	if len(entries) != 2 || entries[0].ID != ids[1] || entries[1].ID != ids[2] {
 		t.Fatalf("trim crossed pending boundary: %#v", entries)
 	}
+}
+
+// A22 pins the enumeration PrimeMetrics depends on. A hand-kept list of DLQ
+// categories would rot the first time someone adds a rejection path, and the
+// symptom would be invisible: one unprimed series, one alert that misses the
+// first message of that category. So read the call sites instead of trusting
+// the list -- the same approach alertrules_test.go uses for metric names.
+func TestDLQCategoriesCoverEveryDeadLetterCall(t *testing.T) {
+	source, err := os.ReadFile("stream.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	calls := regexp.MustCompile(`deadLetter\(ctx, message, "([a-z_]+)"`).FindAllSubmatch(source, -1)
+	if len(calls) == 0 {
+		t.Fatal("found no deadLetter call sites; the scanner is broken")
+	}
+	declared := make(map[string]bool)
+	for _, category := range dlqCategories() {
+		declared[category] = true
+	}
+	used := make(map[string]bool)
+	for _, call := range calls {
+		category := string(call[1])
+		used[category] = true
+		if !declared[category] {
+			t.Errorf("deadLetter is called with %q but dlqCategories() omits it: that series is never primed", category)
+		}
+	}
+	for category := range declared {
+		if !used[category] {
+			t.Errorf("dlqCategories() lists %q but no deadLetter call produces it", category)
+		}
+	}
+}
+
+func TestPrimeMetricsCreatesZeroSeriesForEveryDLQCategory(t *testing.T) {
+	metrics := observability.NewRegistry()
+	consumer := Consumer{Metrics: metrics}
+
+	// Guard against an empty assertion: if the series already existed the
+	// checks below would pass without proving priming does anything.
+	if before := scrapeRegistry(t, metrics); before != "" {
+		t.Fatalf("registry was not empty before priming: %s", before)
+	}
+
+	consumer.PrimeMetrics()
+	primed := scrapeRegistry(t, metrics)
+	for _, category := range dlqCategories() {
+		want := `control_stream_dlq_total{reason="` + category + `"} 0`
+		if !strings.Contains(primed, want) {
+			t.Errorf("missing primed series %s; got:\n%s", want, primed)
+		}
+	}
+	if want := `request_attempt_recovered_total{source="synthetic"} 0`; !strings.Contains(primed, want) {
+		t.Errorf("missing primed series %s; got:\n%s", want, primed)
+	}
+
+	// The transition a zero start buys: 0 -> 1 is what increase() can see.
+	consumer.metrics().AddCounter("control_stream_dlq_total", 1, "reason", "invalid_json")
+	after := scrapeRegistry(t, metrics)
+	if !strings.Contains(after, `control_stream_dlq_total{reason="invalid_json"} 1`) {
+		t.Errorf("the primed series did not advance; got:\n%s", after)
+	}
+	if !strings.Contains(after, `control_stream_dlq_total{reason="retry_exhausted"} 0`) {
+		t.Errorf("an unrelated category moved; got:\n%s", after)
+	}
+}
+
+func scrapeRegistry(t *testing.T, registry *observability.Registry) string {
+	t.Helper()
+	recorder := httptest.NewRecorder()
+	registry.ServeHTTP(recorder, httptest.NewRequest("GET", "/metrics", nil))
+	return recorder.Body.String()
 }

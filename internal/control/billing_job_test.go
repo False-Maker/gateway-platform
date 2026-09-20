@@ -119,3 +119,28 @@ func TestPrimeMetricsCreatesZeroSeriesForEveryBillingState(t *testing.T) {
 	// without one), so priming must stay a no-op rather than panic.
 	BillingJob{}.PrimeMetrics()
 }
+
+// A22: the unknown-usage-class counter's own comment says it is "never expected
+// to be non-zero", which makes the increment that creates its series the entire
+// event. BillingUnknownUsageClass is critical and watches it with increase(),
+// so without a zero start a single occurrence could never fire.
+func TestPrimeMetricsCreatesZeroSeriesForUnknownUsageClass(t *testing.T) {
+	metrics := observability.NewRegistry()
+	job := BillingJob{Metrics: metrics}
+
+	if before := scrape(t, metrics); strings.Contains(before, "control_billing_unknown_usage_class_total") {
+		t.Fatalf("the counter existed before priming: %s", before)
+	}
+
+	job.PrimeMetrics()
+	if want := "control_billing_unknown_usage_class_total 0"; !strings.Contains(scrape(t, metrics), want) {
+		t.Errorf("missing primed series %s; got:\n%s", want, scrape(t, metrics))
+	}
+
+	// 0 -> 2 is the step increase() can see; the old `> 0` guard suppressed the
+	// zero and the series would have been born at 2.
+	job.publishUnknownClass(2)
+	if want := "control_billing_unknown_usage_class_total 2"; !strings.Contains(scrape(t, metrics), want) {
+		t.Errorf("the primed series did not advance; got:\n%s", scrape(t, metrics))
+	}
+}

@@ -68,6 +68,21 @@ func (c Console) metrics() *observability.Registry {
 	return observability.Default
 }
 
+// PrimeMetrics publishes the console counters whose alerts cannot survive a
+// missing first increment. A22: the registry creates a series on first
+// AddCounter and the exposition has no _created, so increase() cannot see the
+// increment that brought the series into existence. `held_unpriced` is a
+// once-in-a-while event -- a single manual resolution landing on `unpriced`,
+// which is revenue that was served and can never be collected -- so that one
+// increment is the whole signal ConsoleHeldUnpricedResolution watches.
+//
+// The other console counters (topup, adjustment, conflict, replayed, rejected)
+// are deliberately left alone: they are routine, recurring operator traffic, so
+// only the very first event of a process is missed. Recorded in TODO A22.
+func (c Console) PrimeMetrics() {
+	c.metrics().AddCounter("control_console_held_unpriced_total", 0)
+}
+
 // Handler returns the console's routes.
 //
 // The mux is built here rather than on the global DefaultServeMux so that the

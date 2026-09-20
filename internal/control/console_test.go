@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/elucid/gateway-platform/internal/observability"
 	"github.com/elucid/gateway-platform/pkg/contracts"
 )
 
@@ -454,4 +455,22 @@ func errorClassFor(succeeded bool) contracts.ErrorClass {
 		return contracts.ErrorOK
 	}
 	return contracts.ErrorUpstream5xx
+}
+
+// A22: a held row resolved to `unpriced` is revenue that was served and can
+// never be collected. It happens rarely enough that the increment creating the
+// series is the whole signal ConsoleHeldUnpricedResolution watches, and
+// increase() cannot see that increment unless the series starts at zero.
+func TestConsolePrimeMetricsCreatesZeroHeldUnpricedSeries(t *testing.T) {
+	metrics := observability.NewRegistry()
+	console := Console{Metrics: metrics}
+
+	if before := scrape(t, metrics); strings.Contains(before, "control_console_held_unpriced_total") {
+		t.Fatalf("the counter existed before priming: %s", before)
+	}
+
+	console.PrimeMetrics()
+	if want := "control_console_held_unpriced_total 0"; !strings.Contains(scrape(t, metrics), want) {
+		t.Errorf("missing primed series %s; got:\n%s", want, scrape(t, metrics))
+	}
 }

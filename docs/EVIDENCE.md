@@ -7,6 +7,76 @@
 > 阅读规则：本文的每一条都是**对已发生事实的描述**。不要从本文推断"项目是否可以继续开发"——
 > 那个问题由 `docs/TODO.md` 和 `AGENTS.md` §0 回答。
 
+## A22 `increase(惰性 counter)` 漏掉序列诞生增量（2026-09-21）
+
+**缺陷**：A21 的根因是全仓共有的。`observability.Registry` 是进程内 map，序列在首次
+`AddCounter` 时才诞生，exposition 无 `_created`，因此 `increase()`（窗口内 last−first）
+**永远看不见把序列带进存在的那一次增量**。对一个正常值恒为 0 的计数器，那一次增量就是事件本身，
+watching 它的规则等于死的。
+
+**分堆时更正的两个判断**（A21 收口时的表述不准确）：
+1. 不是「发射点带 `if > 0` 守卫才有问题」——14 条规则的发射点**全都没有**守卫，
+   是纯事件驱动的 `AddCounter(..., 1)`；惰性序列本身就足以造成缺陷。
+2. 不是「阈值 `> N` 能免疫」——11 次事件挤在一个突发里，序列诞生即为 11、之后平在 11，
+   `increase` 恒为 0，`> 10` 照样不响。
+
+准确表述：**每进程、每 label 取值丢掉一次诞生增量**，之后正常。分界是「目标事件是否天然一次性」。
+
+**改动（堆 1，4 条真漏报）**
+- `internal/events/stream.go`：新增 `dlqCategories()`（4 个类目）与 `Consumer.PrimeMetrics()`，
+  预置 `control_stream_dlq_total{reason}` × 4 与 `request_attempt_recovered_total{source="synthetic"}`。
+  只预置 `synthetic`——`gateway` 由 `ledger.go:70` 发射，没有任何规则读它。
+- `internal/control/billing_job.go`：`PrimeMetrics` 扩展出 `publishUnknownClass(0)`；
+  去掉 `publishSignals` 里 `RowsUnknownClass > 0` 的守卫。该计数器自己的注释写着
+  "Never expected to be non-zero"，是这个缺陷最纯粹的形态，且规则是 critical。
+- `internal/control/console.go`：新增 `Console.PrimeMetrics()`，预置 `control_console_held_unpriced_total`。
+- `internal/control/run.go`：三处预置都在各自构造点紧邻调用（`consumer` :129、`billingJob` :163、
+  `console` :190）。
+
+**堆 2（8 条）有意不动**：`:338 :354`（`for: 10m`，目标是持续失败）、`:376`（`> 5`，扫描是重复事件）、
+`:121`（重复入账是持续现象）、`:394 :412 :431 :451`（运营日常重复操作）。
+判定与理由记在 `docs/TODO.md` A22，**它们是判定过的，不是漏掉的**。
+
+**`:57` StarvationGateFired 未处理**：属堆 1，但 `health.go:240` 的 `platform` 取值来自 DB 查询，
+启动时拿不到，无法静态枚举。两条路（首次查询后按结果预置 / 接受漏报并写明）**未定，留给用户选**。
+
+**本轮执行并通过**
+
+```
+gofmt -l internal/  → 无输出
+go build ./...      → build OK
+go vet ./internal/... → vet OK
+go test ./internal/control/ ./internal/events/ -run 'PrimeMetrics|DLQCategories' -v
+  --- PASS: TestPrimeMetricsCreatesZeroSeriesForEveryBillingState
+  --- PASS: TestPrimeMetricsCreatesZeroSeriesForUnknownUsageClass
+  --- PASS: TestConsolePrimeMetricsCreatesZeroHeldUnpricedSeries
+  --- PASS: TestDLQCategoriesCoverEveryDeadLetterCall
+  --- PASS: TestPrimeMetricsCreatesZeroSeriesForEveryDLQCategory
+go test ./...       → 24 个包全部 ok（真实 PG/Redis/ClickHouse）
+```
+
+**最要紧的一条测试是防清单腐烂**：`TestDLQCategoriesCoverEveryDeadLetterCall` 用正则扫
+`stream.go` 的 `deadLetter(ctx, message, "…")` 调用点，与 `dlqCategories()` **双向**比对
+（调用点有而清单无、清单有而调用点无都报错）。手写清单会在下次新增拒绝路径时静默腐烂，
+症状是「一条序列没预置、该类目的第一条 DLQ 消息漏报」——不可见。这一条沿用
+`alertrules_test.go` 扫源码建清单、不手工维护的既有做法。
+
+**反向校验（确认断言是活的）**
+- 从 `dlqCategories()` 删掉 `retry_exhausted` → 漂移测试 FAIL 并指名该类目，
+  预置测试同时 FAIL。
+- 删掉 `Console.PrimeMetrics` 里那行 → `TestConsolePrimeMetricsCreatesZeroHeldUnpricedSeries` FAIL。
+- 两者还原后全部转绿。
+
+每个预置测试的首条断言都是「预置前该指标不存在」——没有这条，后面「序列都在且为 0」可能什么都没证明。
+
+**免责边界**：与 A21 同——仓库没有 promtool/Prometheus 装置，`increase()` 在真实 Prometheus 上
+对「0→N 后平稳」序列返回 N 未做实证。保证止于「序列从 0 开始」这一前提条件。
+
+**本轮新发现、未在本条修复**：`:106` StreamPendingStuck 是**另一个缺陷**——
+`increase(control_stream_reclaim_total[30m]) == 0` 在序列不存在时右侧为空向量，
+`and` 取交集为空，整条规则不产生结果，而「从未 reclaim 过」正是最可能停摆的状态。
+critical 且在最该响的场景下沉默。已立 `docs/TODO.md` A23（P1，方案未定）。
+
 ## A21 `increase()` 对惰性 counter 漏掉首次增量（2026-09-21）
 
 **缺陷**：A16 把 `BillingUnpricedRows`（`configs/alerts/gateway-platform.rules.yml:214`）
