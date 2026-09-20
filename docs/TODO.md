@@ -62,8 +62,32 @@
 >
 > `A14 出口路径短路` 2026-09-14 完成（含一处实现时的自我更正，见该条目开头的引用块）。
 >
-> **下一步**：§A/§B/§E 的 `[no-cred]` 再次清空；§C 全部 `[live-gate]`，§D 为部署边界（D1 已完成）。
+> ~~**下一步**：§A/§B/§E 的 `[no-cred]` 再次清空~~ —— **该判断由第五次复盘第三次推翻。**
 > 连续两次复盘都在"清单已空"之后找出 P0 级缺口，因此"清单空了"**不应**被当作开发完成的证据。
+>
+> **2026-09-20 第五次复盘（结构分析）**：这次按"最少被扫过的面"选靶——前四次扫的是总览、
+> 两份角色文档和 `AUDIT-CONTEXT` / `P2-ADMISSION`，而 **`B4-BILLING-MODEL.md` 与
+> `B5-CONSOLE.md` 是第四次复盘当天或之后才写的，从未被任何复盘扫过**。
+> 方法上沿用第四次的教训：每个候选缺口都读完整函数再下结论。
+> 结果：找出**两个**设计要求、代码零实现、从未进清单的缺口 —— **A15**（钱包 `adjustment`
+> 冲正/退款，P0）与 **A16**（`unpriced` 告警规则缺失，P1）。
+>
+> A15 由两个互不知情的分片从**不同文档**各自撞到（B4 分片从 `B4-BILLING-MODEL.md:85`，
+> B5 分片从 `B5-CONSOLE.md:118`），加一次直接代码验证，三路独立收敛。
+> 尤其值得记住的是：**这个"有表无写者"的形状项目已经犯过一次并修过**
+> （B5 §4.3 关掉的 `model_prices` 无写入方，见 `B5-CONSOLE.md:111`），
+> 这次漏在隔壁的 `wallet_transactions` 上。同一形状会复发，修一次不等于免疫。
+>
+> 本次**核对通过**（设计与代码一致，不再重复列为缺口）的项：fluxgate §2.1 防饿死闸
+> （一度疑为 A14 式"只做一半"，读完 `ReplaceBucket` 全文后**推翻自己**——epoch 每次发布必 +1，
+> `chooser.go:67-74` 在 epoch 变化时清空该桶本地冷却，本地冷却活不过一个快照周期，
+> 控制面的 `ReleaseStarvedCooldowns` 已是权威闸）、keyhive §4 全部固定索引与回收约束
+> （含 `TerminalEventID=sha256(attempt_id+":terminal")`、`FOR UPDATE SKIP LOCKED`、
+> advisory lock、quota outbox 重试循环）、A12 / E2 / C6 三份文档全部规范性要求、
+> B5 的 §1–§6 全部条目。
+>
+> **下一步**：先取 A15（P0，钱包无法反向修正是账务硬伤），再取 A16。
+> §C 全部 `[live-gate]`，§D 为部署边界（D1 已完成）。
 > A12/E1/E2 不阻塞 B4，可并行取。P4（B4）在 A11 之前不进入编码——迁移来的用户还停在 staging，没有可扣费主体。
 
 ---
@@ -523,6 +547,96 @@ E1 也接上了规则。但 §6.3.1 规则 2 的价值是「不要一个号一�
 **已知取舍**
 - 真实 WAF 的拦截特征与恢复时间属 `[live-gate]`（C3）。本任务只交付机制与本地 fixture 验证，
   **不声称**任何真实上游的拦截行为已核实。
+
+---
+
+### A15 `[no-cred]` 钱包 `adjustment` 冲正/退款：设计定为唯一修正手段，全仓库零写入方
+
+**状态：未开始（2026-09-20 第五次复盘发现）。**
+
+> **三路独立确认**：本条由两个互不知情的复盘分片从**不同文档**各自撞到，
+> 加一次直接代码验证。B4 分片从 `docs/B4-BILLING-MODEL.md:85` 进入，
+> B5 分片从 `docs/B5-CONSOLE.md:118` 进入，结论一致。
+
+**设计要求**
+- `docs/B4-BILLING-MODEL.md:85`（D3 第 4 条）：「已经扣过费的 ledger 行不因后续改价而重算。
+  **修正只能通过 `wallet_transactions` 里一条显式的 `adjustment` 记录完成**，留下痕迹。」
+- `docs/B4-BILLING-MODEL.md:189`（D6 第 3 条）：「这里的补救是**人工确认后的 `adjustment`**」。
+- `docs/B5-CONSOLE.md:118`（§4.3）：「生效之前的用量成为 `unpriced`（B4.3 判定的终态），
+  **只能靠显式钱包调整修正，不能靠倒填单价。**」
+
+**代码实际**
+- `adjustment` 全仓库只以三种身份存在：schema CHECK（`migrations/005_billing.sql:73,77`）、
+  校验分支（`internal/control/billing.go:339-342` `checkMovementKind`）、该校验器的单元测试
+  （`billing_test.go:54-56`）。**校验器存在，调用者不存在。**
+- 三个真实 `Kind:` 产生点全非 adjustment：`console_billing.go:198`（`topup`）、
+  `billing_job.go:252`（`debit`）、`console_held.go:339`（`debit`）。
+- 控制台路由表 `internal/control/console.go:77-91` 共 13 条，**无 adjustment / refund 端点**。
+  唯一钱包写入口 `handleTopup` 在 `console_billing.go:172` 硬拒非正数、`Kind` 硬编码 `"topup"`
+  ——**只能加钱不能减钱**，而 `unpriced` 的典型修正方向（晚配价导致少收）恰恰是扣减。
+
+**为什么是 P0 而不是运营待办**
+`unpriced` 是终态且 D3 禁止补价（`migrations/006_usage_billing.sql:10`、`console_held.go:315`
+都写明「can never be priced afterwards」），文档指定的唯一补救就是 `adjustment`——而这条路不存在。
+同理超收、误扣、上游事故退款、租户销户退余额**全部无入口**。绕过只能直接 psql 写
+`wallet_transactions`，而那会绕过 `applyMovement` 对 `balance_after` 与 `tenant_wallets.balance`
+的同事务维护，被 `billing_reconcile.go` 判为 `wallet_balance_drift` 账务事故。
+**钱包目前是单向的。**
+
+**这个形状项目已经犯过一次**
+`docs/B5-CONSOLE.md:111` 记录 B5 §4.3 关掉的缺口是「B4.1 交付了 `model_prices` 表和不可变触发器，
+但**没有任何写入方**」——与本条形状完全一致。B5 补了三个写端点（held 裁定 / 充值 / 单价录入），
+**唯独漏了 `wallet_transactions` 上的这一个**。
+
+**TODO 零命中证据**
+`adjustment|冲正|退款|refund|调账` 在 `docs/TODO.md` 与 `docs/B5-CONSOLE.md` 均 **0 命中**。
+B5 条目 `:734` 写「充值入口到此闭合」、B4.1 `:580` 写「已由 B5 闭合」、
+B4.3/B4.5 `:650` 专门列了「`estimated` 仍无生产者」——**唯独没列 `adjustment` 无生产者**。
+
+**DoD**
+- 控制台新增写端点产生 `kind='adjustment'` 流水，走 `applyMovement` 同一路径（余额与流水同事务，
+  `FOR UPDATE`，`balance_after` 由应用层维护），金额可正可负、禁零（校验器已就绪）。
+- 要求显式 `reason` 与操作者标识并落审计，口径对齐 A9/B5.1 的 `account_actions`（写操作留痕）。
+- 幂等键沿用 `WalletMovement.ID`，重放只产生一条流水。
+- 属读写级能力（B5.1 两级权限中的 read-write），不得对只读 token 开放。
+- 回归：调整后 `billing_reconcile` 的「余额 == 流水求和」恒等式仍成立，不产生 `wallet_balance_drift`。
+
+**已知取舍**
+- 真实的运营审批流（谁有权调账、是否需二人复核）属部署侧，不在本条；本条只交付机制与留痕。
+
+---
+
+### A16 `[no-cred]` `unpriced` 行的告警：指标已发射，告警规则零引用
+
+**状态：未开始（2026-09-20 第五次复盘发现）。**
+
+**设计要求**
+`docs/B4-BILLING-MODEL.md:188`（D6）：「`unpriced` 的行数与 token 量**单独可查询**；
+**出现 `unpriced` 行即告警**（属 E1 的规则文件范围）」。
+
+**代码实际**
+- 指标存在：`internal/control/billing_job.go:375` 发射
+  `control_billing_rows_total{state="unpriced"}`（仅 `rows > 0` 时递增，无 gauge 版本）。
+- 但 `configs/alerts/gateway-platform.rules.yml` 的 billing 分组 7 条规则里
+  **`control_billing_rows_total` 一次都没被引用**（全仓该指标名只有发射点与 EVIDENCE 的一句描述）。
+- 唯一含 `unpriced` 的规则是 `:389` 的 `control_console_held_unpriced_total`，
+  而该计数器只在**人工裁定**路径递增（`console_held.go:243`），
+  **覆盖不到 D6 点名的主场景**——B4.2 作业对「上新模型时忘了配价」产生的批量 `unpriced`。
+- E1 的语义校验 `internal/observability/alertrules_test.go` 只查「规则引用的指标是否存在」，
+  **不查反向**（指标是否有消费方），所以这个空洞测不出来。
+
+**TODO 零命中证据**
+`unpriced` 在 `docs/TODO.md` 6 处命中（`:559 :588 :589 :607 :639 :725`）全是语义描述
+（进 unpriced / 不按 0 计费 / 与 missing 分桶 / 列进 UnsettledRows），**无一条涉及告警**。
+E1 任务块 `:820-860` 的 DoD 五个方向与「本轮未做」三项均不含它。
+
+**DoD**
+- `configs/alerts/gateway-platform.rules.yml` 增规则消费 `control_billing_rows_total{state="unpriced"}`。
+- 阈值按 E1 既有口径标注**未经真实流量校准**。
+- 考虑给 `alertrules_test.go` 增反向校验（计费类关键指标须有消费方），避免同类空洞再次静默存在。
+
+**已知取舍**
+- 通知通道（谁收、怎么收）仍属部署侧，与 E1/A9 同一边界。
 
 ---
 
