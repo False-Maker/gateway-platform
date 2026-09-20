@@ -121,8 +121,8 @@
 > **下一步**：第六次复盘条目（A17–A21）与 A22/A23 已全部收口；
 > 第七次复盘（A24，指标消费方反向校验）亦已收口。**§A 当前没有未完成条目**，
 > §C 全部 `[live-gate]`、§D 为部署边界。
-> 唯一已知的系统性空白：仓库没有 promtool/Prometheus 规则测试装置，
-> A21–A24 的保证都止于"序列形状正确"，"规则确实会响"始终未端到端验证。
+> A25 已补上 promtool 规则测试装置，"规则确实会响"对 A21–A24 涉及的规则**已是实测**。
+> 剩余空白：规则文件里其余 18 条规则尚无 promtool 场景，`for:` 时长与注解模板未覆盖。
 > §C 全部 `[live-gate]`，§D 为部署边界（D1 已完成）。
 > A12/E1/E2 不阻塞 B4，可并行取。P4（B4）在 A11 之前不进入编码——迁移来的用户还停在 staging，没有可扣费主体。
 
@@ -1049,6 +1049,62 @@ quota 对账每分钟一轮。配置错误持续存在时序列会持续增长�
 都有条目且写了理由，机制健全；核对了其中引用的 `control_billing_reconcile_last_success_seconds`
 确实存在（`billing_reconcile_loop.go:138`）且有 `BillingReconciliationNotRunning` 规则。
 `control_platform_error_total` 与三个 `detail_*` 计量指标后果均有规则覆盖，看板用途。
+
+---
+
+### A25 `[no-cred]` 规则测试装置：让「规则确实会响」第一次成为实测
+
+**状态：已完成（2026-09-21）。** 证据见 `docs/EVIDENCE.md` 同名小节。
+
+A21–A24 每一轮都在免责边界里写同一句话：仓库没有 promtool/Prometheus 装置，
+保证止于「序列形状正确」，**「规则确实会响」依据 Prometheus 文档语义、未做实证**。
+四轮下来这是唯一的系统性空白。
+
+**装置**：`internal/observability/alertrules_promtool_test.go`。
+用 `prom/prometheus` 镜像里的 promtool（3.7.3）跑 promtool 原生的规则单元测试。
+env 门禁与 PG 集成测试同款，**未配置时 `t.Skip` 并打印完整启用命令**，不假装校验过：
+
+```
+GATEWAY_TEST_PROMTOOL_IMAGE=prom/prometheus:latest go test ./internal/observability/
+```
+
+**关键设计：expr 从规则文件里读出来注入，从不手抄。** 一份自带表达式副本的测试会在别人
+改了规则之后继续绿——这正是本仓库反复吃过的亏。正向用 `promql_expr_test`（断言表达式的取值），
+反向用 `alert_rule_test` + `exp_alerts: []`（走完整条规则，含 `for:`）。
+**这个拆分的代价要说清楚**：正向不覆盖 `for:` 时长与注解模板。
+原因是 promtool 按**完全相等**比较注解，把本仓库的多段式 description 抄进 fixture，
+会让每次措辞改动都弄红测试。
+
+**10 个场景，每个都写明它在主张什么**（全部通过）：
+
+| 场景 | 主张 |
+|---|---|
+| A21 正 / 反 | 0→3 后平稳则触发且 `$value`=3；诞生即为 3 则**不**触发 |
+| A22 unknown class 正 / 反 | 同上形状，critical 规则 |
+| A22 DLQ 正 / 反 | 某 reason 持续增长则按 reason 归因触发；诞生即为 1 则不触发 |
+| A23 反 / 正 | reclaim 序列**缺失**时整条 critical 规则无结果；预置为 0 后触发 |
+| A24 | SnapshotAccountsDropped 与 QuotaSnapshotNotDraining 确实会响 |
+
+反向那一半是重点：**A21/A22/A23 修复前的 bug 全部被复现为绿色断言**，
+证明那三轮修的不是想象出来的问题，也证明正向那一半不是空跑。
+
+**装置当场产出的两条修正**
+
+1. **两条 A24 新规则缺 `round()`**：`QuotaSnapshotNotDraining` 实测 `$value` =
+   `30.000000000000004`。已按 A21 的先例给两条都补上 `round()`。
+2. **A21 对 `round()` 的说明是错的**：A21 记「单次 +1 常算成 1.0166…」，
+   实测在该规则的密集平坦序列形状下 `increase()` 返回**精确的 3**，`round()` 在那里是空操作。
+   它真正消去的是**持续增长计数器**上的浮点噪声。已在该规则的 `threshold_source` 里更正，
+   A21 的历史记录未改写。
+
+**反向校验（两条都验了装置本身是活的）**
+
+- 摘掉 `QuotaSnapshotNotDraining` 的 `round()` → 实测 `30.000000000000004` ≠ 30，FAIL。
+- 把 `BillingUnpricedRows` 的阈值改成 `> 1000` → 表达式无结果，FAIL。
+- 还原后全绿。
+
+**仍未覆盖**：`for:` 时长、注解模板渲染、以及规则文件里其余 18 条规则
+（本轮只覆盖 A21–A24 动过或新增的那些）。补场景的成本是每条几行，不需要新机制。
 
 ---
 

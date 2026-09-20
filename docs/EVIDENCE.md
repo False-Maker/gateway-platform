@@ -7,6 +7,82 @@
 > 阅读规则：本文的每一条都是**对已发生事实的描述**。不要从本文推断"项目是否可以继续开发"——
 > 那个问题由 `docs/TODO.md` 和 `AGENTS.md` §0 回答。
 
+## A25 规则测试装置：「规则确实会响」第一次成为实测（2026-09-21）
+
+**动机**：A21、A22、A23、A24 的免责边界里写的是同一句话——仓库没有 promtool/Prometheus 装置，
+保证止于「序列形状正确」，「规则确实会响」依据文档语义、未做实证。四轮下来这是唯一的系统性空白。
+在本文件之前，那三次修复和它们所修的 bug 都是**论证**而不是**测量**。
+
+**装置**：`internal/observability/alertrules_promtool_test.go`，用 `prom/prometheus` 镜像里的
+promtool 3.7.3 跑 promtool 原生规则单元测试。env 门禁与 PG 集成测试同款；
+未配置时 `t.Skip` 并打印完整启用命令，不假装校验过。
+
+```
+GATEWAY_TEST_PROMTOOL_IMAGE=prom/prometheus:latest go test ./internal/observability/
+```
+
+**expr 从规则文件读出注入，从不手抄**——自带表达式副本的测试会在别人改了规则之后继续绿。
+正向用 `promql_expr_test`，反向用 `alert_rule_test` + `exp_alerts: []`（走完整条规则含 `for:`）。
+拆分的代价已写进文件头注释：正向不覆盖 `for:` 与注解模板，因为 promtool 按完全相等比较注解，
+把多段式 description 抄进 fixture 会让每次措辞改动都弄红测试。
+
+**10 个场景全部通过**（`go test -v` 每条会打印它在主张什么）：
+
+```
+--- PASS: A21_unpriced_fires_when_the_series_starts_at_zero
+--- PASS: A21_unpriced_stays_silent_when_the_series_is_born_at_three
+--- PASS: A22_unknown_usage_class_fires_from_a_zero_start
+--- PASS: A22_unknown_usage_class_stays_silent_when_born_at_one
+--- PASS: A22_dlq_fires_while_a_reason_keeps_growing
+--- PASS: A22_dlq_stays_silent_when_the_reason_series_is_born_at_one
+--- PASS: A23_pending_stuck_stays_silent_while_the_reclaim_series_is_absent
+--- PASS: A23_pending_stuck_fires_once_the_reclaim_series_exists_at_zero
+--- PASS: A24_snapshot_accounts_dropped_fires
+--- PASS: A24_quota_not_draining_fires_on_sustained_retry
+```
+
+**反向那一半是重点**：A21 / A22 / A23 修复前的 bug 全部被复现为绿色断言——
+序列诞生即为 N 时规则确实沉默，reclaim 序列缺失时整条 critical 规则确实不产生结果。
+这既证明那三轮修的不是想象出来的问题，也证明正向那一半不是空跑。
+
+**装置当场产出的两条修正**
+
+1. **两条 A24 新规则缺 `round()`**：`QuotaSnapshotNotDraining` 实测 `$value` 为
+   `30.000000000000004`。已按 A21 的先例给 `SnapshotAccountsDropped` 与
+   `QuotaSnapshotNotDraining` 都补上 `round()`。
+2. **A21 对 `round()` 的说明被实测推翻了一半**：A21 记「`increase()` 外推到窗口边界，
+   单次 +1 常报成 1.0166…」。实测在 `BillingUnpricedRows` 的密集平坦序列形状下
+   `increase()` 返回**精确的 3**，`round()` 在那里是空操作——包括把样本跨度拉到接近整个
+   1h 窗口（`0+0x30 3+0x35` @65m）仍然是精确的 3。它真正消去的是**持续增长计数器**上的
+   浮点噪声。已在 `BillingUnpricedRows` 的 `threshold_source` 里更正并注明依据，
+   A21 的历史记录未改写。
+
+   这条修正本身就是装置的价值证明：**一个被写进两份文档、当作修复理由的断言，在第一次实测时
+   就被发现只对部分形状成立。**
+
+**本轮执行并通过**
+
+```
+gofmt -l internal/  → 无输出
+go build ./...      → build OK
+go vet ./internal/... → vet OK
+go test ./...                                          → 24 包 ok（promtool 场景 SKIP）
+GATEWAY_TEST_PROMTOOL_IMAGE=prom/prometheus:latest go test ./...  → 24 包 ok（promtool 场景全跑）
+promtool check rules gateway-platform.rules.yml        → SUCCESS: 28 rules found
+```
+
+**反向校验（验装置本身是活的）**
+- 摘掉 `QuotaSnapshotNotDraining` 的 `round()` → `exp: 3E+01 / got: 3.0000000000000004E+01`，FAIL。
+- 把 `BillingUnpricedRows` 阈值改成 `> 1000` → `exp: 3E+00 / got: nil`，FAIL。
+- 两者还原后全绿。
+
+第一次尝试的反向校验（摘掉 `BillingUnpricedRows` 的 `round()`）**没有变红**，
+这正是上面第 2 条修正的来源——它暴露的是那个场景当时根本没在证明 `round()`，
+场景的 claim 文字已据实改写。
+
+**仍未覆盖，明确列出**：`for:` 时长、注解模板渲染、规则文件里其余 18 条规则
+（本轮只覆盖 A21–A24 动过或新增的）。补场景的成本是每条几行，不需要新机制。
+
 ## A24 指标消费方反向校验只覆盖两个族（2026-09-21，第七次复盘）
 
 **本轮范围**：只查「已发射但无人消费的指标」。理由是前三轮（A16、A21、A22/A23）连续在

@@ -167,7 +167,7 @@ groups:
             clamp_min 防止零流量时除零。真实基线未知。
 
       - alert: SnapshotAccountsDropped
-        expr: increase(control_snapshot_accounts_dropped_total[15m]) > 0
+        expr: round(increase(control_snapshot_accounts_dropped_total[15m])) > 0
         for: 0m
         labels:
           severity: warning
@@ -266,8 +266,12 @@ groups:
             窗口取 1h 对齐扣费作业的自然周期；次数阈值本身不存在，故无需校准。
             A21：`increase()` 取窗口内 last−first，因此序列必须从 0 开始才可能算出非零——
             扣费作业在进程启动时预置四条 state 序列为 0（`BillingJob.PrimeMetrics`），
-            这条规则的可触发性依赖那个预置。`round()` 只为消去 `increase()` 外推到窗口
-            边界产生的小数（单次 +1 常算成 1.0166…），不改变触发条件。
+            这条规则的可触发性依赖那个预置。**A25 用 promtool 实测确认了这一条**：
+            序列 0→3 后平稳时本规则触发且 `$value` = 3；序列诞生即为 3 时不触发。
+            `round()` 不改变触发条件。**A25 修正了 A21 对它的说明**：A21 记的
+            "单次 +1 常算成 1.0166…"对本规则的密集平坦序列**不成立**（实测返回精确的 3，
+            此处 `round()` 是空操作）；它真正消去的是持续增长计数器上的浮点噪声——
+            同类的 QuotaSnapshotNotDraining 去掉 `round()` 后实测返回 30.000000000000004。
             已知残留：进程重启后序列从 0 重建，Prometheus 判 counter reset 并补值，
             `$value` 会被夸大——这是无 `_created` 的计数器的固有行为，不是误报。
 
@@ -523,7 +527,7 @@ groups:
   - name: gateway-platform-quota
     rules:
       - alert: QuotaSnapshotNotDraining
-        expr: increase(quota_snapshot_reconcile_total{result="retry"}[30m]) > 0 or increase(quota_snapshot_reconcile_total{result="stale"}[30m]) > 0
+        expr: round(increase(quota_snapshot_reconcile_total{result="retry"}[30m])) > 0 or round(increase(quota_snapshot_reconcile_total{result="stale"}[30m])) > 0
         for: 15m
         labels:
           severity: warning
