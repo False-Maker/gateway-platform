@@ -28,6 +28,7 @@ func TestConsoleReadOnlyTokenMayReadButNotWrite(t *testing.T) {
 	// only covered one route would not notice a handler escaping the wrapper.
 	for _, path := range []string{
 		"/v1/billing/wallets/t1/topup",
+		"/v1/billing/wallets/t1/adjust",
 		"/v1/billing/prices",
 		"/v1/billing/held/e1/resolve",
 		"/v1/accounts/a1/status",

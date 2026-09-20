@@ -7,6 +7,68 @@
 > 阅读规则：本文的每一条都是**对已发生事实的描述**。不要从本文推断"项目是否可以继续开发"——
 > 那个问题由 `docs/TODO.md` 和 `AGENTS.md` §0 回答。
 
+## A15 钱包 `adjustment` 冲正/退款入口（2026-09-20）
+
+**背景**：第五次结构复盘发现设计把 `adjustment` 定为已扣费行的唯一修正手段
+（`B4-BILLING-MODEL.md:85`、`:189`，`B5-CONSOLE.md:118`），但全仓库零写入方——
+校验器（`billing.go:339` `checkMovementKind`）与 schema CHECK（`005_billing.sql:73,77`）都在，
+调用者不在。
+
+**改动**
+- `internal/control/console_billing.go`：新增 `adjustRequest` / `handleAdjust` / `adjustmentNote`；
+  `replayTopup` 更名 `replayMovement`（同一函数现服务 topup 与 adjust 两个调用点，本就与 kind 无关）。
+- `internal/control/console.go`：挂 `POST /v1/billing/wallets/{tenantID}/adjust`。
+- 未加迁移：schema 早已允许 `adjustment`，缺的只是入口。
+- 未改 `applyMovement`、`billing_job`、held 裁定与对账逻辑。
+
+**与 topup 的三处有意差异**：金额可负（§D6 晚配价要把钱扣出去，topup 做不到）；
+钱包必须已存在（不 `EnsureWallet`，打错租户 id 应是 404 而非静默成功）；`reason` 必填。
+审计走 `note`（`wallet_transactions` 无 operator 列是 B5 的既有决定，因为 B4.5 要对账该表）。
+
+**本轮执行并通过**
+- `go build ./...`、`go vet ./...`、`gofmt -l` 干净。
+- `go test -count=1 ./...` 全部 24 个包通过。
+- `go test -race -count=1 ./pkg/contracts ./internal/control/...` 通过。
+- 新增单元测试（无需 PG，因校验全部先于 `c.DB == nil`）：`TestConsoleAdjustRejectsBadRequests`
+  （缺 id / 缺 reason / 空白 reason / 零金额 / 非十进制 / 未知字段共 6 例）、
+  `TestConsoleAdjustAcceptsBothSigns`、`TestAdjustmentNoteCarriesOperatorAndReason` —— 均 PASS。
+- 新端点已加入两张既有枚举表：`console_test.go` 的 `TestConsoleAuthorizesEveryRoute`
+  与 `console_hardening_test.go` 的写路径表（只读 token POST 须 403）—— 均 PASS。
+
+**本轮未验证（重要）**
+- 新增的两个集成测试 `TestConsoleAdjustCorrectsWalletAndStaysReconciled`、
+  `TestConsoleAdjustRequiresAnExistingWallet` **本轮未执行**：本机 WSL 发行版当前
+  `docker` 不可用（`could not be found in this WSL 2 distro`），`GATEWAY_TEST_DATABASE_URL` 未设置。
+  已确认两者**已注册且严格 skipped**（`-v -run Adjust` 输出 `--- SKIP` 并给出原因），
+  不是被构建标签排除。**因此「余额按双向正确变动」「重放不重复修正」「对账不产生
+  `wallet_balance_drift`」三条属未执行断言**，待 E3 的 CI 或本机 Docker 恢复后复跑。
+- 真实运营审批流（谁有权调账、是否二人复核）属部署侧，本条未涉及。
+
+## 第五次结构性复盘（2026-09-20）
+
+**方法**：按"最少被扫过的面"选靶。前四次扫总览、两份角色文档、`AUDIT-CONTEXT` / `P2-ADMISSION`；
+而 `B4-BILLING-MODEL.md` 与 `B5-CONSOLE.md` 是第四次复盘当天或之后才写的，从未被扫过。
+沿用第四次教训：每个候选缺口读完整函数再下结论。
+
+**结果**：两个缺口 —— A15（钱包 adjustment 零写入方，P0）、A16（`unpriced` 告警零引用，P1）。
+A15 由两个互不知情的分片从不同文档各自撞到，加一次直接代码验证，三路收敛。
+
+**一次自我推翻（记录下来，因为它正是第四次复盘要防的错法）**：
+fluxgate §2.1 的「防饿死闸」在 gateway 侧 grep 零命中，一度判为 A14 式"只做了一半"。
+读完 `chooser.go` 的 `ReplaceBucket` 全文后推翻：`snapshot/redis.go:87` 每次发布 `epoch+1`，
+`chooser.go:67-74` 在 epoch 变化时清空该桶本地冷却，本地冷却活不过一个快照周期，
+控制面的 `ReleaseStarvedCooldowns` 已是权威闸。**不是缺口。**
+
+**核对通过、不再列为缺口**：keyhive §4 全部固定索引与回收约束（`usage_ledger` 双唯一、
+`request_attempts` 的 `terminal_event_id` UNIQUE + state CHECK、`accounts` 源唯一、
+`migration_records` 三元唯一、`FOR UPDATE SKIP LOCKED`、
+`TerminalEventID=sha256(attempt_id+":terminal")`（`contracts.go:425`）、advisory lock、
+quota outbox 重试循环）；A12 / E2 / C6 三份文档全部规范性要求；B5 §1–§6 全部条目。
+
+**备录（未达缺口门槛）**：`console_billing.go` 的 `handleInsertPrice` default 分支把
+`InsertModelPrice` 的原始错误直接作为 400 返回，与同文件 `fail()`「DB 错误只进日志」的口径相反；
+但 `B5-CONSOLE.md` 无对应规范性句子，按规则不计为文档缺口，也未在本轮改动。
+
 ## B5.1 控制台硬化（2026-09-14）
 
 **改动**：`internal/control/console_auth.go`（两级）、`console.go`（路由 + 按方法授权 + accounts 分页）、

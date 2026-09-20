@@ -91,6 +91,7 @@ func TestConsoleAuthorizesEveryRoute(t *testing.T) {
 		{http.MethodGet, "/v1/accounts", ""},
 		{http.MethodGet, "/v1/billing/wallets/t1", ""},
 		{http.MethodPost, "/v1/billing/wallets/t1/topup", `{"id":"x","amount":"1"}`},
+		{http.MethodPost, "/v1/billing/wallets/t1/adjust", `{"id":"x","amount":"-1","reason":"r"}`},
 		{http.MethodGet, "/v1/billing/prices", ""},
 		{http.MethodPost, "/v1/billing/prices", `{"id":"p"}`},
 		{http.MethodGet, "/v1/billing/held", ""},
@@ -325,6 +326,68 @@ func TestWalletBlockedMatchesThePublishRule(t *testing.T) {
 		if got := walletBlocked(contracts.Decimal(amount)); got != want {
 			t.Errorf("balance %s: blocked=%v, want %v", amount, got, want)
 		}
+	}
+}
+
+// A15: the adjustment endpoint validates before it touches the database, so
+// these run without PostgreSQL. A 503 here would mean a bad request reached
+// the repository, which is how a zero-amount or reason-less correction would
+// end up as a 500 instead of a named 400.
+func TestConsoleAdjustRejectsBadRequests(t *testing.T) {
+	handler := newTestConsole("operator-secret").Handler()
+	cases := map[string]struct{ body, wants string }{
+		"missing id":     {`{"amount":"-1","reason":"over-charged"}`, "idempotency key"},
+		"missing reason": {`{"id":"a1","amount":"-1"}`, "reason is required"},
+		"blank reason":   {`{"id":"a1","amount":"-1","reason":"   "}`, "reason is required"},
+		// Zero is the one amount an adjustment may never be: it would write a
+		// journal row that moves nothing, which is noise an auditor has to
+		// explain away later.
+		"zero amount": {`{"id":"a1","amount":"0","reason":"over-charged"}`, "non-zero"},
+		// Caught by contracts.Decimal at decode time rather than by the
+		// handler's own check, which is why it names the decimal and not the
+		// sign. Asserted so the earlier rejection stays deliberate.
+		"not a decimal": {`{"id":"a1","amount":"abc","reason":"over-charged"}`, "invalid decimal"},
+		"unknown field": {`{"id":"a1","amount":"-1","reason":"r","note":"x"}`, ""},
+	}
+	for name, test := range cases {
+		t.Run(name, func(t *testing.T) {
+			response := consoleRequest(t, handler, http.MethodPost,
+				"/v1/billing/wallets/t1/adjust", "operator-secret", test.body)
+			if response.Code != http.StatusBadRequest {
+				t.Fatalf("got %d, want 400 (body %s)", response.Code, response.Body.String())
+			}
+			if test.wants != "" && !strings.Contains(response.Body.String(), test.wants) {
+				t.Errorf("error %s does not mention %q", response.Body.String(), test.wants)
+			}
+		})
+	}
+}
+
+// Both signs must be accepted: correcting an over-charge refunds, correcting
+// an under-charge (B4 §D6's late price entry) debits. A top-up can only ever
+// do the first, which is why it could not stand in for this endpoint.
+func TestConsoleAdjustAcceptsBothSigns(t *testing.T) {
+	handler := newTestConsole("operator-secret").Handler()
+	for _, amount := range []string{"-1.25", "1.25"} {
+		response := consoleRequest(t, handler, http.MethodPost, "/v1/billing/wallets/t1/adjust",
+			"operator-secret", `{"id":"a1","amount":"`+amount+`","reason":"incident refund"}`)
+		// No database is configured, so a request that passes validation stops
+		// at 503. Anything else means validation rejected a legal amount.
+		if response.Code != http.StatusServiceUnavailable {
+			t.Errorf("amount %s: got %d, want 503 (body %s)", amount, response.Code, response.Body.String())
+		}
+	}
+}
+
+func TestAdjustmentNoteCarriesOperatorAndReason(t *testing.T) {
+	note := adjustmentNote("alice", "  refund for incident 42  ")
+	if !strings.Contains(note, "alice") || !strings.Contains(note, "refund for incident 42") {
+		t.Fatalf("note %q lost the operator or the reason", note)
+	}
+	// wallet_transactions has no operator column by design (B4.5 reconciles
+	// that table), so the note is the only attribution channel there is.
+	if strings.Contains(note, "  ") {
+		t.Errorf("note %q kept the caller's padding", note)
 	}
 }
 

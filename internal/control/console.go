@@ -83,6 +83,7 @@ func (c Console) Handler() http.Handler {
 
 	mux.HandleFunc("GET /v1/billing/wallets/{tenantID}", c.handleWallet)
 	mux.HandleFunc("POST /v1/billing/wallets/{tenantID}/topup", c.handleTopup)
+	mux.HandleFunc("POST /v1/billing/wallets/{tenantID}/adjust", c.handleAdjust)
 	mux.HandleFunc("GET /v1/billing/prices", c.handlePrices)
 	mux.HandleFunc("POST /v1/billing/prices", c.handleInsertPrice)
 	mux.HandleFunc("GET /v1/billing/held", c.handleHeld)

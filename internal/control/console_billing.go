@@ -200,7 +200,7 @@ func (c Console) handleTopup(w http.ResponseWriter, r *http.Request) {
 		Note:   topupNote(operator(r), request.Note),
 	})
 	if err != nil {
-		if replay, ok := c.replayTopup(ctx, tenantID, request.ID); ok {
+		if replay, ok := c.replayMovement(ctx, tenantID, request.ID); ok {
 			c.metrics().AddCounter("control_console_topup_replayed_total", 1)
 			writeJSON(w, http.StatusOK, map[string]any{"movement": replay, "replayed": true})
 			return
@@ -219,10 +219,104 @@ func (c Console) handleTopup(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// replayTopup returns an existing movement when a top-up failed because its id
-// was already used. It reads the row back rather than assuming, so the response
-// describes what is actually in the journal.
-func (c Console) replayTopup(ctx context.Context, tenantID, id string) (walletMovementVw, bool) {
+type adjustRequest struct {
+	// ID is the idempotency key, same contract as topupRequest.ID: a retried
+	// correction must not correct twice.
+	ID     string            `json:"id"`
+	Amount contracts.Decimal `json:"amount"`
+	// Reason is required. See handleAdjust.
+	Reason string `json:"reason"`
+}
+
+// handleAdjust writes an explicit wallet correction.
+//
+// B4-BILLING-MODEL §D3 makes this the *only* sanctioned way to correct money
+// that has already been billed: a priced ledger row is never recomputed when a
+// price later changes, and B4.3's `unpriced` is terminal and can never be
+// priced afterwards. Until this endpoint existed the platform had a validator
+// for `adjustment` and a CHECK constraint permitting it, but no writer -- so
+// an over-charge, a mis-charge, an upstream-incident refund and a closing
+// tenant's remaining balance all had no entry point, and the only way out was
+// a hand-written UPDATE. That bypasses applyMovement, which is the sole writer
+// of tenant_wallets.balance, and therefore breaks the balance == sum(journal)
+// identity B4.5 reconciles on: the repair would register as wallet_balance_drift.
+//
+// Three differences from handleTopup, all deliberate:
+//   - The amount may be negative. Correcting an under-charge -- §D6's "a new
+//     model shipped before its price did" -- has to move money *out*, which is
+//     exactly what handleTopup refuses.
+//   - The wallet must already exist. An adjustment presumes something to
+//     correct; creating one here would turn a mistyped tenant id into a
+//     silently successful no-op instead of a 404.
+//   - reason is required. Months later a correction without a stated cause is
+//     indistinguishable from a bug, and this row is what an audit reads.
+func (c Console) handleAdjust(w http.ResponseWriter, r *http.Request) {
+	tenantID := strings.TrimSpace(r.PathValue("tenantID"))
+	if tenantID == "" {
+		writeError(w, http.StatusBadRequest, "tenant id is required")
+		return
+	}
+	var request adjustRequest
+	if err := decodeBody(r, &request); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if strings.TrimSpace(request.ID) == "" {
+		writeError(w, http.StatusBadRequest, "id is required: it is the idempotency key for this adjustment")
+		return
+	}
+	if strings.TrimSpace(request.Reason) == "" {
+		writeError(w, http.StatusBadRequest, "reason is required: an adjustment must record what it corrects")
+		return
+	}
+	// Zero is rejected here as well as in checkMovementKind so the caller gets
+	// a 400 naming the field rather than a 500 from the repository.
+	if sign, ok := request.Amount.Sign(); !ok || sign == 0 {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("amount %q must be a non-zero decimal", request.Amount))
+		return
+	}
+	if c.DB == nil {
+		writeError(w, http.StatusServiceUnavailable, "database is not configured")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+	repository := PGBillingRepository{DB: c.DB}
+	movement, err := repository.ApplyMovement(ctx, WalletMovement{
+		ID: request.ID, TenantID: tenantID, Kind: "adjustment",
+		Amount: request.Amount,
+		Note:   adjustmentNote(operator(r), request.Reason),
+	})
+	if err != nil {
+		if errors.Is(err, ErrWalletNotFound) {
+			writeError(w, http.StatusNotFound,
+				fmt.Sprintf("no wallet for tenant %s: an adjustment corrects an existing wallet, top up to create one", tenantID))
+			return
+		}
+		if replay, ok := c.replayMovement(ctx, tenantID, request.ID); ok {
+			c.metrics().AddCounter("control_console_adjustment_replayed_total", 1)
+			writeJSON(w, http.StatusOK, map[string]any{"movement": replay, "replayed": true})
+			return
+		}
+		c.fail(w, "apply adjustment", err)
+		return
+	}
+	c.metrics().AddCounter("control_console_adjustment_total", 1)
+	writeJSON(w, http.StatusCreated, map[string]any{
+		"movement": walletMovementVw{
+			ID: movement.ID, Kind: movement.Kind, Amount: movement.Amount,
+			BalanceAfter: movement.BalanceAfter, BillingRunID: movement.BillingRunID,
+			Note: movement.Note, CreatedAt: movement.CreatedAt.UTC().Format(time.RFC3339),
+		},
+		"replayed": false,
+	})
+}
+
+// replayMovement returns an existing movement when a write failed because its
+// id was already used. It reads the row back rather than assuming, so the
+// response describes what is actually in the journal.
+func (c Console) replayMovement(ctx context.Context, tenantID, id string) (walletMovementVw, bool) {
 	var movement walletMovementVw
 	var createdAt time.Time
 	err := c.DB.QueryRow(ctx, `
@@ -247,6 +341,13 @@ func topupNote(who, note string) string {
 		return "console top-up by " + who
 	}
 	return fmt.Sprintf("console top-up by %s: %s", who, note)
+}
+
+// adjustmentNote stamps operator and reason into the journal note, for the same
+// reason topupNote does. Unlike a top-up the reason is mandatory, so there is
+// no bare-attribution form.
+func adjustmentNote(who, reason string) string {
+	return fmt.Sprintf("console adjustment by %s: %s", who, strings.TrimSpace(reason))
 }
 
 // priceView is a price row as the console reports it.

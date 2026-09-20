@@ -552,7 +552,10 @@ E1 也接上了规则。但 §6.3.1 规则 2 的价值是「不要一个号一�
 
 ### A15 `[no-cred]` 钱包 `adjustment` 冲正/退款：设计定为唯一修正手段，全仓库零写入方
 
-**状态：未开始（2026-09-20 第五次复盘发现）。**
+**状态：已完成（2026-09-20）。** 证据见 `docs/EVIDENCE.md` 同名小节。
+**注意本条有未执行的断言**：三个 PG 集成断言（余额双向变动、重放不重复修正、
+对账无 `wallet_balance_drift`）因本机 Docker 不可用而**未跑**，测试已注册并严格 skipped，
+待 CI 或本机 Docker 恢复后复跑。
 
 > **三路独立确认**：本条由两个互不知情的复盘分片从**不同文档**各自撞到，
 > 加一次直接代码验证。B4 分片从 `docs/B4-BILLING-MODEL.md:85` 进入，
@@ -593,13 +596,25 @@ E1 也接上了规则。但 §6.3.1 规则 2 的价值是「不要一个号一�
 B5 条目 `:734` 写「充值入口到此闭合」、B4.1 `:580` 写「已由 B5 闭合」、
 B4.3/B4.5 `:650` 专门列了「`estimated` 仍无生产者」——**唯独没列 `adjustment` 无生产者**。
 
-**DoD**
-- 控制台新增写端点产生 `kind='adjustment'` 流水，走 `applyMovement` 同一路径（余额与流水同事务，
-  `FOR UPDATE`，`balance_after` 由应用层维护），金额可正可负、禁零（校验器已就绪）。
-- 要求显式 `reason` 与操作者标识并落审计，口径对齐 A9/B5.1 的 `account_actions`（写操作留痕）。
-- 幂等键沿用 `WalletMovement.ID`，重放只产生一条流水。
-- 属读写级能力（B5.1 两级权限中的 read-write），不得对只读 token 开放。
-- 回归：调整后 `billing_reconcile` 的「余额 == 流水求和」恒等式仍成立，不产生 `wallet_balance_drift`。
+**DoD（交付情况）**
+- ✅ `POST /v1/billing/wallets/{tenantID}/adjust` 产生 `kind='adjustment'` 流水，
+  走 `applyMovement` 同一路径（余额与流水同事务、`FOR UPDATE`、`balance_after` 应用层维护）；
+  金额可正可负、禁零。
+- ✅ `reason` 必填，操作者与 reason 落 `note`——`wallet_transactions` 无 operator 列是 B5 既有决定
+  （B4.5 要对账该表），note 即审计通道，与 `topupNote` 同口径。
+- ✅ 幂等键沿用 `WalletMovement.ID`；重放返回原流水并计 `control_console_adjustment_replayed_total`。
+- ✅ 读写级能力：POST 经 `authorize` 按方法分级，只读 token 得 403；已加入
+  `console_hardening_test.go` 的写路径枚举表与 `TestConsoleAuthorizesEveryRoute`。
+- ⚠️ 对账恒等式回归**已写未跑**（`TestConsoleAdjustCorrectsWalletAndStaysReconciled`），
+  原因见上方状态行。
+
+**实现摘要**
+- 钱包必须已存在：不调 `EnsureWallet`，`ErrWalletNotFound` → 404。打错租户 id 应当是 404，
+  而不是凭空建钱包后"成功"地调整了零。这是与 `handleTopup` 的有意差异（topup 恰恰要建钱包）。
+- 金额可负是本条存在的理由：§D6 的「晚配价」要把钱**扣出去**，而 `handleTopup`
+  在 `console_billing.go:172` 硬拒非正数。
+- 未加迁移——schema 早已允许 `adjustment`，缺的只是入口。
+- `replayTopup` 更名 `replayMovement`：同一函数现服务两个调用点，其实现本就与 kind 无关。
 
 **已知取舍**
 - 真实的运营审批流（谁有权调账、是否需二人复核）属部署侧，不在本条；本条只交付机制与留痕。

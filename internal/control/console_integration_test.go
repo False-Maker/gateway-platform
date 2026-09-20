@@ -1164,3 +1164,110 @@ func TestConsoleHeldTrayDoesNotOfferACursorToAnEmptyPage(t *testing.T) {
 		cursor = body.NextCursor
 	}
 }
+
+// A15: an adjustment is the only sanctioned way to correct money that has
+// already been billed, so the properties that matter are that it moves the
+// balance in both directions, that a retry cannot correct twice, and that the
+// balance == sum(journal) identity B4.5 reconciles on still holds afterwards.
+// The last one is the whole reason this endpoint exists instead of a psql
+// UPDATE: a hand-written repair would register as wallet_balance_drift.
+func TestConsoleAdjustCorrectsWalletAndStaysReconciled(t *testing.T) {
+	ctx, db, console := newConsoleTestConsole(t)
+	tenantID := fmt.Sprintf("b5-adjust-%d", rand.Int63())
+	t.Cleanup(func() {
+		background := context.Background()
+		db.Exec(background, `DELETE FROM wallet_transactions WHERE tenant_id=$1`, tenantID)
+		db.Exec(background, `DELETE FROM tenant_wallets WHERE tenant_id=$1`, tenantID)
+		db.Exec(background, `DELETE FROM tenants WHERE id=$1`, tenantID)
+	})
+	if _, err := db.Exec(ctx, `INSERT INTO tenants (id,name) VALUES ($1,'B5 adjust fixture')`, tenantID); err != nil {
+		t.Fatal(err)
+	}
+	repository := PGBillingRepository{DB: db}
+	if err := repository.EnsureWallet(ctx, tenantID, "USD"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repository.ApplyMovement(ctx, WalletMovement{
+		ID: tenantID + "-seed", TenantID: tenantID, Kind: "topup", Amount: "10",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Negative: the under-charge case from B4 §D6. A top-up cannot express it.
+	debit := `{"id":"` + tenantID + `-adj1","amount":"-2.5","reason":"late price entry for b5-model"}`
+	if response := b5Request(t, console, http.MethodPost, "/v1/billing/wallets/"+tenantID+"/adjust", debit); response.Code != http.StatusCreated {
+		t.Fatalf("negative adjustment: got %d (%s)", response.Code, response.Body.String())
+	}
+	// Replaying the same id must return the original rather than correct twice.
+	replayed := b5Request(t, console, http.MethodPost, "/v1/billing/wallets/"+tenantID+"/adjust", debit)
+	if replayed.Code != http.StatusOK {
+		t.Fatalf("replayed adjustment: got %d (%s)", replayed.Code, replayed.Body.String())
+	}
+	var replay struct {
+		Replayed bool `json:"replayed"`
+	}
+	if err := json.Unmarshal(replayed.Body.Bytes(), &replay); err != nil {
+		t.Fatal(err)
+	}
+	if !replay.Replayed {
+		t.Error("a repeated adjustment id was not reported as a replay")
+	}
+
+	// Positive: the over-charge refund direction.
+	credit := `{"id":"` + tenantID + `-adj2","amount":"1.25","reason":"refund for incident 42"}`
+	if response := b5Request(t, console, http.MethodPost, "/v1/billing/wallets/"+tenantID+"/adjust", credit); response.Code != http.StatusCreated {
+		t.Fatalf("positive adjustment: got %d (%s)", response.Code, response.Body.String())
+	}
+
+	balance, exists, err := repository.Balance(ctx, tenantID)
+	if err != nil || !exists {
+		t.Fatalf("read balance: %v (exists=%v)", err, exists)
+	}
+	if balance != "8.750000000000" {
+		t.Fatalf("balance %s after 10 - 2.5 (applied twice) + 1.25, want 8.750000000000", balance)
+	}
+
+	// Both rows are journalled as adjustments, with operator and reason. The
+	// journal has no operator column by design, so the note is the audit trail.
+	rows, err := repository.ListWalletTransactions(ctx, tenantID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	adjustments := 0
+	for _, row := range rows {
+		if row.Kind != "adjustment" {
+			continue
+		}
+		adjustments++
+		if !strings.Contains(row.Note, "b5-test-operator") {
+			t.Errorf("adjustment %s note %q does not attribute the operator", row.ID, row.Note)
+		}
+	}
+	if adjustments != 2 {
+		t.Errorf("journal holds %d adjustment rows, want 2 (a replay must not add one)", adjustments)
+	}
+
+	// The identity B4.5 checks must survive the correction.
+	report, err := (Reconciliation{DB: db}).Run(ctx, b5OccurredAt.Add(-time.Hour), time.Now().UTC().Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, discrepancy := range report.Discrepancies {
+		if discrepancy.Kind == DiscrepancyWalletBalanceDrift && discrepancy.TenantID == tenantID {
+			t.Fatalf("adjusting through the console drifted the wallet: %+v", discrepancy)
+		}
+	}
+}
+
+// Adjusting a tenant with no wallet is a 404, not a silently created wallet.
+// A correction presumes something to correct; a mistyped tenant id must not
+// look like success.
+func TestConsoleAdjustRequiresAnExistingWallet(t *testing.T) {
+	_, _, console := newConsoleTestConsole(t)
+	response := b5Request(t, console, http.MethodPost,
+		"/v1/billing/wallets/b5-no-such-tenant-adjust/adjust",
+		`{"id":"b5-adjust-orphan","amount":"-1","reason":"should not apply"}`)
+	if response.Code != http.StatusNotFound {
+		t.Fatalf("adjust on a walletless tenant: got %d (%s), want 404", response.Code, response.Body.String())
+	}
+}
