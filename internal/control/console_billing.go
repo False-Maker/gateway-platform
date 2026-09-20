@@ -173,6 +173,11 @@ func (c Console) handleTopup(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, fmt.Sprintf("amount %q must be a positive decimal", request.Amount))
 		return
 	}
+	// A20: see handleAdjust. handleTopup had the identical gap.
+	if err := checkMoney("amount", request.Amount); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	if c.DB == nil {
 		writeError(w, http.StatusServiceUnavailable, "database is not configured")
 		return
@@ -285,6 +290,14 @@ func (c Console) handleAdjust(w http.ResponseWriter, r *http.Request) {
 	// a 400 naming the field rather than a 500 from the repository.
 	if sign, ok := request.Amount.Sign(); !ok || sign == 0 {
 		writeError(w, http.StatusBadRequest, fmt.Sprintf("amount %q must be a non-zero decimal", request.Amount))
+		return
+	}
+	// A20: the same rule the repository enforces, applied here so an amount the
+	// money columns cannot hold comes back as a named 400 instead of a 500 from
+	// PostgreSQL. Calling checkMoney rather than restating its limits keeps one
+	// source of truth for what NUMERIC(38,12) accepts.
+	if err := checkMoney("amount", request.Amount); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	if c.DB == nil {

@@ -379,6 +379,64 @@ func TestConsoleAdjustAcceptsBothSigns(t *testing.T) {
 	}
 }
 
+// A20: an amount the money columns cannot hold is a bad request, not a broken
+// platform. Both endpoints had the same gap: the handler checked only format
+// and sign, so an over-precise or over-large value reached PostgreSQL and came
+// back as a 500. These run without a database precisely because the rejection
+// must happen before one is needed.
+func TestConsoleWalletRejectsUnstorableAmountsWith400(t *testing.T) {
+	handler := newTestConsole("operator-secret").Handler()
+	cases := map[string]struct{ target, body, wants string }{
+		"adjust: 13 decimal places": {
+			"/v1/billing/wallets/t1/adjust",
+			`{"id":"a1","amount":"-0.0000000000001","reason":"r"}`,
+			"decimal places",
+		},
+		"adjust: 31 integer digits": {
+			"/v1/billing/wallets/t1/adjust",
+			`{"id":"a1","amount":"1e30","reason":"r"}`,
+			"integer digits",
+		},
+		"topup: 13 decimal places": {
+			"/v1/billing/wallets/t1/topup",
+			`{"id":"t1","amount":"0.0000000000001"}`,
+			"decimal places",
+		},
+		"topup: 31 integer digits": {
+			"/v1/billing/wallets/t1/topup",
+			`{"id":"t1","amount":"1e30"}`,
+			"integer digits",
+		},
+	}
+	for name, test := range cases {
+		t.Run(name, func(t *testing.T) {
+			response := consoleRequest(t, handler, http.MethodPost, test.target, "operator-secret", test.body)
+			// 503 here would mean it reached the "no database" check, i.e. the
+			// validation did not happen in the handler at all.
+			if response.Code != http.StatusBadRequest {
+				t.Fatalf("got %d, want 400 (body %s)", response.Code, response.Body.String())
+			}
+			if !strings.Contains(response.Body.String(), test.wants) {
+				t.Errorf("error %s does not name %q", response.Body.String(), test.wants)
+			}
+		})
+	}
+}
+
+// The ceiling itself must still be accepted, or the fix above would quietly
+// narrow what the platform can record.
+func TestConsoleWalletAcceptsAmountsAtTheCeiling(t *testing.T) {
+	handler := newTestConsole("operator-secret").Handler()
+	for _, amount := range []string{"99999999999999999999999999", "0.000000000001"} {
+		response := consoleRequest(t, handler, http.MethodPost, "/v1/billing/wallets/t1/topup",
+			"operator-secret", `{"id":"t1","amount":"`+amount+`"}`)
+		// No database configured, so a legal amount stops at 503.
+		if response.Code != http.StatusServiceUnavailable {
+			t.Errorf("amount %s: got %d, want 503 (body %s)", amount, response.Code, response.Body.String())
+		}
+	}
+}
+
 func TestAdjustmentNoteCarriesOperatorAndReason(t *testing.T) {
 	note := adjustmentNote("alice", "  refund for incident 42  ")
 	if !strings.Contains(note, "alice") || !strings.Contains(note, "refund for incident 42") {

@@ -7,6 +7,53 @@
 > 阅读规则：本文的每一条都是**对已发生事实的描述**。不要从本文推断"项目是否可以继续开发"——
 > 那个问题由 `docs/TODO.md` 和 `AGENTS.md` §0 回答。
 
+## A17 TLS profile 跨包 pin + A20 金额上限（2026-09-20）
+
+### A17：总览 §5 的跨包不变量第一次有了强制
+
+**缺陷**：§5 要求「control 写下名字，gateway 必须真的实现该 utls profile」，
+但没有任何测试核对这个包含关系——`tlsprofile_test.go` 只测 gateway 单侧。
+新 provider 写一个 gateway 没实现的指纹，build / test / CI 全绿，
+只在运行时该渠道每请求 fail-closed 503，渠道静默死掉。
+
+**改动**
+- 新增 `provider.RegisteredProviders()`：返回全部已注册 provider，
+  含 `Get()` 会折叠掉的 `byAuth` 双模式变体。
+- 新增 `internal/gateway/tlsprofile_crosspackage_test.go`：`builtin.RegisterAll` 后
+  遍历注册表，对每个 `Profile()` 产出的 `TLSFingerprint` 调 `lookupTLSProfile`，必须命中。
+- **刻意不写指纹清单**——驱动源是注册表，新 provider 注册即自动被检查。
+  这是 F3 的直接教训：A16 的手写指标表让紧接着的一个提交原样穿过。
+- 空 `TLSFingerprint` 视为合法（apikey 渠道用默认 transport），不计入。
+- 无导入环：`internal/control/provider` 不依赖 `internal/gateway`。
+
+**验证**：`checked 2 provider fingerprints`；**反向验证承重**——把 claude 的指纹临时改成
+`chrome131_not_implemented`，测试即 FAIL 并指名 provider 与指纹，恢复后转绿，文件已还原。
+另有两条防空跑断言：注册表为空、或无任何 provider 产出指纹，都直接 Fatal。
+
+### A20：`1e30` 不再变成 500
+
+**缺陷**：`checkMoney` 只查小数位（`moneyScale=12`），不查量级。
+`1e30` 正则合法，且 `moneyPlaces` 在指数抵消后算出 0 位小数，于是一路放行到 PG，
+撞 `NUMERIC(38,12)` 的整数位上限报 `numeric field overflow` → **500**。
+13 位小数则被 `checkMoney` 拒但错误没被 handler 拦，同样落成 500。
+钱没动（tx 回滚已确认），但动钱端点对合法格式返回 500 会被误判为平台故障。
+
+**改动**
+- `checkMoney` 增整数位上限 `moneyPrecision(38) - moneyScale(12) = 26`，
+  配套 `moneyIntegerDigits`（正确处理指数：`1.5e3` 记 4 位、`1500e-2` 记 2 位）。
+  规则落在**仓储层**，因此 `applyMovement` 本身也不再把 `1e30` 漏给 PG。
+- `handleAdjust` / `handleTopup` 都改为调用 `checkMoney` 并把错误转成具名 400——
+  **复用同一条规则而不是另写一套**。
+
+**验证（真实 PG/Redis/ClickHouse）**
+- `go test -count=1 -p 1 ./...` 24 包全过；`build`/`vet`/`gofmt`/`-race` 干净。
+- `TestMoneyIntegerDigitsAndCeiling`：11 组边界（含 `0.5`→0、`1.5e3`→4、`1500e-2`→2、
+  `1e30`→31、恰好 26 位）；并断言 26 位**被接受**、`1e30` 被拒、13 位小数的旧规则未变。
+- `TestConsoleWalletRejectsUnstorableAmountsWith400`：两个端点 × 两类超限 = 4 例全 400。
+  这些测试**不需要 PG**——校验先于 `c.DB == nil`，所以 503 就意味着校验没在 handler 里发生。
+- `TestConsoleWalletAcceptsAmountsAtTheCeiling`：上限值必须仍被接受，
+  防止本次修复悄悄收窄可记录范围（与 A18 的反向保护同一思路）。
+
 ## A18 迁移「待人工确认」落地：解析失败不再等价于无限制（2026-09-20）
 
 **缺陷**：总览 §6.1:236 要求「未识别模型不丢弃账号，写入待人工确认状态」。

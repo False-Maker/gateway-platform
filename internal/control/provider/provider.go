@@ -123,6 +123,36 @@ func Get(kind string) (Provider, bool) {
 	return p, ok
 }
 
+// RegisteredProviders returns every registered provider, including the
+// per-auth-mode variants that Get collapses to one entry per kind.
+//
+// It exists so cross-package invariants can be checked against what is
+// actually registered rather than against a hand-maintained list -- overview
+// §5 requires that every TLSFingerprint control writes is a profile gateway
+// implements, and a list that has to be updated by hand is not an invariant.
+func RegisteredProviders() []Provider {
+	registry.RLock()
+	defer registry.RUnlock()
+	seen := make(map[Provider]struct{})
+	var all []Provider
+	add := func(p Provider) {
+		if _, ok := seen[p]; ok {
+			return
+		}
+		seen[p] = struct{}{}
+		all = append(all, p)
+	}
+	for _, p := range registry.items {
+		add(p)
+	}
+	for _, modes := range registry.byAuth {
+		for _, p := range modes {
+			add(p)
+		}
+	}
+	return all
+}
+
 // GetForAuth resolves providers that expose both OAuth and API-key profiles
 // without changing the stable Provider interface or provider kind.
 func GetForAuth(kind, authMode string) (Provider, bool) {

@@ -19,6 +19,11 @@ import (
 // rounded by PostgreSQL, so it is rejected instead.
 const moneyScale = 12
 
+// moneyPrecision is the total digit budget of the same NUMERIC(38,12) columns.
+// precision - scale is therefore the integer-digit ceiling; exceeding it is a
+// PostgreSQL "numeric field overflow", which callers must not meet as a 500.
+const moneyPrecision = 38
+
 // ErrPriceNotEffectiveInFuture is returned when a price would take effect at
 // or before the moment it is inserted. D3: a price change only applies
 // forward, so a row that is already in effect on arrival could retroactively
@@ -355,7 +360,40 @@ func checkMoney(column string, amount contracts.Decimal) error {
 	if places := moneyPlaces(amount); places > moneyScale {
 		return fmt.Errorf("%s has %d decimal places, more than the %d stored exactly: %q", column, places, moneyScale, amount)
 	}
+	// A20: the money columns are NUMERIC(38,12), so 26 integer digits is the
+	// ceiling. Without this check a legally-formatted "1e30" passed every Go
+	// guard -- moneyPlaces sees no fractional digits once the exponent is
+	// applied -- and failed in PostgreSQL with "numeric field overflow",
+	// surfacing to the caller as a 500 on a money endpoint. The money never
+	// moved, but "you sent an unstorable number" and "the platform is broken"
+	// must not look the same.
+	if digits := moneyIntegerDigits(amount); digits > moneyPrecision-moneyScale {
+		return fmt.Errorf("%s needs %d integer digits, more than the %d the money columns hold: %q",
+			column, digits, moneyPrecision-moneyScale, amount)
+	}
 	return nil
+}
+
+// moneyIntegerDigits counts the digits left of the decimal point once any
+// exponent is applied ("1.5e3" is 1500, so four).
+func moneyIntegerDigits(amount contracts.Decimal) int {
+	raw := strings.TrimSpace(string(amount))
+	raw = strings.TrimPrefix(raw, "-")
+	exponent := 0
+	if index := strings.IndexAny(raw, "eE"); index >= 0 {
+		exponent, _ = strconv.Atoi(raw[index+1:])
+		raw = raw[:index]
+	}
+	integer := raw
+	if dot := strings.IndexByte(raw, '.'); dot >= 0 {
+		integer = raw[:dot]
+	}
+	integer = strings.TrimLeft(integer, "0")
+	digits := len(integer) + exponent
+	if digits > 0 {
+		return digits
+	}
+	return 0
 }
 
 // moneyPlaces counts the fractional digits a decimal needs, taking any

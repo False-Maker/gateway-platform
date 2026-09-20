@@ -67,3 +67,42 @@ func TestCheckMovementKindEnforcesSignPerKind(t *testing.T) {
 		t.Errorf("non-decimal amount error = %v", err)
 	}
 }
+
+// A20: the integer-digit ceiling of NUMERIC(38,12). Before this, "1e30" passed
+// every Go guard -- moneyPlaces reports 0 fractional digits once the exponent
+// is applied -- and only failed inside PostgreSQL.
+func TestMoneyIntegerDigitsAndCeiling(t *testing.T) {
+	for amount, want := range map[string]int{
+		"0":                          0,
+		"0.5":                        0,
+		"-0.5":                       0,
+		"7":                          1,
+		"-7":                         1,
+		"123.45":                     3,
+		"1.5e3":                      4, // 1500
+		"1500e-2":                    2, // 15
+		"1e30":                       31,
+		"007":                        1,
+		"99999999999999999999999999": 26, // exactly the ceiling
+	} {
+		if got := moneyIntegerDigits(contracts.Decimal(amount)); got != want {
+			t.Errorf("moneyIntegerDigits(%s) = %d, want %d", amount, got, want)
+		}
+	}
+
+	// At the ceiling it is storable; one digit past it is not.
+	atCeiling := contracts.Decimal("99999999999999999999999999")
+	if err := checkMoney("amount", atCeiling); err != nil {
+		t.Errorf("26 integer digits must be accepted: %v", err)
+	}
+	past := contracts.Decimal("1e30")
+	if err := checkMoney("amount", past); err == nil {
+		t.Error("1e30 must be rejected before it reaches PostgreSQL")
+	} else if !strings.Contains(err.Error(), "integer digits") {
+		t.Errorf("rejection %q does not name the problem", err)
+	}
+	// The scale rule must still hold, unchanged.
+	if err := checkMoney("amount", contracts.Decimal("0.0000000000001")); err == nil {
+		t.Error("13 decimal places must still be rejected")
+	}
+}

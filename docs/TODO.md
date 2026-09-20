@@ -713,7 +713,7 @@ E1 任务块 `:820-860` 的 DoD 五个方向与「本轮未做」三项均不含
 
 ### A17 `[no-cred]` TLS profile 名字的跨包不变量没有任何 pin
 
-**状态：未开始（2026-09-20 第六次复盘发现）。P2。**
+**状态：已完成（2026-09-20）。** 证据见 `docs/EVIDENCE.md` 同名小节。
 
 总览 §5：「control 写下名字，gateway **必须真的实现**该 utls profile；profile 名字定死不改。」
 今天是对的——control 只写 `codex_rustls` / `node24`（`provider/profile.go:59,82`），
@@ -725,8 +725,15 @@ gateway 恰好实现这两个（`tlsprofile.go:37-38`）。但**没有任何测�
 压 P2 而非 P1：失败是 fail-closed（不会把不受控流量打上游），A7 已保证未知名拒绝出站。
 **形态同 A16/F3——不变量有，强制没有。**
 
-**DoD**：加一条跨包测试，断言 control 侧所有 `EndpointProfile.TLSFingerprint`
-都能在 gateway 的注册表里查到。TODO 零命中：`:249` 只覆盖 A7 的"未知名 fail-closed"（gateway 单侧）。
+**DoD（交付情况）**
+- ✅ `internal/gateway/tlsprofile_crosspackage_test.go`：`builtin.RegisterAll` 后遍历**注册表**，
+  对每个 provider 的 `Profile()` 取 `TLSFingerprint`，逐个 `lookupTLSProfile` 必须命中。
+- ✅ **不是手写清单**——新增 `provider.RegisteredProviders()`（含 `byAuth` 的双模式变体），
+  新 provider 注册即自动被检查。这是 F3 的教训：手写清单不是机制。
+- ✅ 防空跑：断言注册表非空、且至少有一个 provider 真的产出了指纹，否则直接 Fatal。
+- ✅ 已反向验证承重：把 claude 的指纹临时改成 `chrome131_not_implemented`，
+  测试即 FAIL 并指名 provider 与指纹；恢复后转绿。
+- 空 `TLSFingerprint` 视为合法（apikey 渠道用默认 transport），不计入检查。
 
 ---
 
@@ -783,7 +790,7 @@ TODO 零命中：`rolled_back` 0 处。
 
 ### A20 `[no-cred]` 控制台钱包端点对合法格式输入返回 500
 
-**状态：未开始（2026-09-20 第六次复盘发现，原 F4）。P2。**
+**状态：已完成（2026-09-20）。** 证据见 `docs/EVIDENCE.md` 同名小节。
 
 `console_billing.go` 的注释承诺「零金额在 handler 拦下，调用方拿到指名字段的 400 而不是仓储的 500」，
 但 handler 只查 `Valid()` 与 `sign != 0`，没查 scale 与量级：
@@ -791,7 +798,17 @@ TODO 零命中：`rolled_back` 0 处。
 - `1e30` → 正则合法且 `moneyPlaces` 因指数抵消算成 0、`checkMoney` 放行 → PG `numeric field overflow` → **500**。
 
 钱没动（tx 回滚，已确认），但动钱端点对合法格式返回 500 会被误判为平台故障。
-`handleTopup` 有完全相同的两个缺口。**DoD**：两处都在 handler 内校验 scale 与量级，返回具名 400。
+`handleTopup` 有完全相同的两个缺口。
+
+**DoD（交付情况）**
+- ✅ `checkMoney` 新增整数位上限：`moneyPrecision(38) - moneyScale(12) = 26` 位，
+  配套 `moneyIntegerDigits`（正确处理指数，`1.5e3` 记 4 位）。规则落在**仓储层**，
+  因此 `applyMovement` 也不再把 `1e30` 漏给 PG。
+- ✅ 两个 handler 都改为调用 `checkMoney` 并把错误转成具名 400——
+  **复用同一条规则而非另写一套**，保持单一事实源。
+- ✅ 边界锁定：26 位整数与 12 位小数（恰好在上限）必须**接受**，
+  由 `TestConsoleWalletAcceptsAmountsAtTheCeiling` 保证修复没有悄悄收窄可记录范围。
+- ✅ 端点测试不需要 PG：校验先于 `c.DB == nil`，因此 503 就意味着校验没在 handler 里发生。
 
 ---
 
