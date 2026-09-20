@@ -183,6 +183,44 @@ type SnapshotLoop struct {
 	Redis      redis.UniversalClient
 }
 
+// PrimeMetrics publishes the starvation counter at zero for every platform that
+// currently has an account. A22: increase() is last minus first inside the
+// window, so it cannot see the increment that brings a series into existence,
+// and the starvation gate firing is a one-shot event -- that increment is the
+// whole signal StarvationGateFired watches.
+//
+// Unlike the other primed counters this label set is not a compile-time list:
+// `platform` is free-form text read out of `accounts`. It does not need to be,
+// because the loop already reads exactly that set every minute; this reuses
+// ListSnapshotBuckets rather than introducing a second query or a hand-kept
+// enumeration that would rot the first time a platform is added.
+//
+// Priming is best-effort: a platform whose first account appears later is
+// covered by the next RunOnce, and a failed read leaves the counters unprimed
+// rather than taking the loop down -- the snapshot itself is the loop's job.
+func (l SnapshotLoop) PrimeMetrics(ctx context.Context) {
+	if l.Repository == nil {
+		return
+	}
+	buckets, err := l.Repository.ListSnapshotBuckets(ctx)
+	if err != nil {
+		log.Printf("control starvation counter priming skipped: %v", err)
+		return
+	}
+	l.primeStarvationCounters(buckets)
+}
+
+func (l SnapshotLoop) primeStarvationCounters(buckets []SnapshotBucket) {
+	seen := make(map[string]struct{}, len(buckets))
+	for _, bucket := range buckets {
+		if _, ok := seen[bucket.Platform]; ok {
+			continue
+		}
+		seen[bucket.Platform] = struct{}{}
+		observability.Default.AddCounter("control_platform_starvation_release_total", 0, "platform", bucket.Platform)
+	}
+}
+
 func (l SnapshotLoop) RunOnce(ctx context.Context) error {
 	if l.Repository == nil {
 		return errors.New("snapshot repository is not configured")
@@ -201,6 +239,10 @@ func (l SnapshotLoop) RunOnce(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("list snapshot buckets: %w", err)
 	}
+	// Re-primed every iteration so a platform whose first account appears after
+	// startup also gets a zero start. AddCounter(0) is a no-op once the series
+	// exists, so this cannot erase a real count.
+	l.primeStarvationCounters(buckets)
 	sort.Slice(buckets, func(i, j int) bool {
 		if buckets[i].Platform == buckets[j].Platform {
 			return buckets[i].Group < buckets[j].Group

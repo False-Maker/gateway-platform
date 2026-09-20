@@ -3,11 +3,13 @@ package control
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/alicebob/miniredis/v2"
 	providerpkg "github.com/elucid/gateway-platform/internal/control/provider"
 	"github.com/elucid/gateway-platform/internal/control/provider/builtin"
+	"github.com/elucid/gateway-platform/internal/observability"
 	"github.com/elucid/gateway-platform/internal/snapshot"
 	"github.com/elucid/gateway-platform/pkg/contracts"
 	"github.com/redis/go-redis/v9"
@@ -144,4 +146,46 @@ func TestSnapshotLoopDropsAccountsWhoseProviderDeclaresNoUsageIntegrity(t *testi
 	if loaded.Accounts[0].UsageIntegrity != contracts.UsageIntegrityFailover {
 		t.Fatalf("account was published without a usage_integrity stamp: %+v", loaded.Accounts[0])
 	}
+}
+
+// A22: the starvation gate firing is a one-shot event, so the increment that
+// creates its series is the whole signal StarvationGateFired watches, and
+// increase() cannot see that increment. Unlike the other primed counters the
+// `platform` label is free-form text out of `accounts`, so the enumeration
+// comes from the bucket list the loop already reads every minute rather than
+// from a hand-kept list that would rot when a platform is added.
+//
+// The counter is published to observability.Default because its real emitter
+// (PGSnapshotRepository.ReleaseStarvedCooldowns) is too; a separate registry
+// here would prove nothing about the series the alert actually reads. The
+// platform names are unique to this test so the pre-assertion stays meaningful
+// even though the registry is process-wide.
+func TestPrimeStarvationCountersZeroesEveryPlatformInTheBucketList(t *testing.T) {
+	const alpha, beta = "a22-prime-alpha", "a22-prime-beta"
+	loop := SnapshotLoop{}
+
+	before := scrape(t, observability.Default)
+	if strings.Contains(before, alpha) || strings.Contains(before, beta) {
+		t.Fatalf("this test's platforms already had series before priming: %s", before)
+	}
+
+	// Two groups on one platform: the label is the platform, so the duplicate
+	// must collapse rather than being counted twice.
+	loop.primeStarvationCounters([]SnapshotBucket{
+		{Platform: alpha, Group: "g1"},
+		{Platform: alpha, Group: "g2"},
+		{Platform: beta, Group: "g1"},
+	})
+
+	primed := scrape(t, observability.Default)
+	for _, platform := range []string{alpha, beta} {
+		want := `control_platform_starvation_release_total{platform="` + platform + `"} 0`
+		if !strings.Contains(primed, want) {
+			t.Errorf("missing primed series %s; got:\n%s", want, primed)
+		}
+	}
+
+	// A nil repository must not panic: PrimeMetrics is best-effort and runs
+	// before the loop has proven it can talk to the database.
+	SnapshotLoop{}.PrimeMetrics(context.Background())
 }

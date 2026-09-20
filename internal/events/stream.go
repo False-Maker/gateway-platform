@@ -339,6 +339,15 @@ func (c Consumer) PrimeMetrics() {
 	// and the one SyntheticTerminalStateSpike watches. `gateway` comes from the
 	// ledger and no rule reads it.
 	c.metrics().AddCounter("request_attempt_recovered_total", 0, "source", "synthetic")
+	// A23: StreamPendingStuck is a different failure from the rest of A22. It
+	// reads `increase(control_stream_reclaim_total[30m]) == 0`, and `and` is a
+	// label-set intersection -- while the series does not exist the right-hand
+	// operand is an empty vector, the intersection is empty, and the rule
+	// produces no result at all. A process that has never reclaimed anything is
+	// exactly the one most likely to be stalled, so that critical alert was
+	// silent in the state it exists to catch. Existing at zero is what makes
+	// `== 0` a true comparison rather than a missing series.
+	c.metrics().AddCounter("control_stream_reclaim_total", 0)
 }
 
 func (c Consumer) deadLetter(ctx context.Context, message redis.XMessage, category string, reason error) error {

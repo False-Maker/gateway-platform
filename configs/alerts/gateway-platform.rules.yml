@@ -67,6 +67,11 @@ groups:
           threshold_source: >-
             uncalibrated。取 >0（任意一次即报）是因为该路径设计上应罕见；
             若上线后发现它常态触发，要回调的是闸本身而不是这条规则。
+            A22："设计上应罕见"正是 `increase()` 看不见的那种事件——它取窗口内
+            last−first，永远看不见把序列带进存在的那一次增量。`SnapshotLoop` 按
+            `ListSnapshotBuckets` 读到的 platform 列表在启动时并每轮预置 0 序列，
+            这条规则的可触发性依赖那个预置。已知残留：某 platform 的第一个账号在启动后
+            才出现、且闸在同一轮内即触发时，仍会漏掉那一次。
 
   # =========================================================================
   # 事件流健康 —— 总览 §4.1 列为 P0 必须暴露的可验收指标。
@@ -116,6 +121,10 @@ groups:
           threshold_source: >-
             由失效模式推出。30m 窗口 uncalibrated——它必须显著大于
             reclaim 周期，本轮未核对实际 reclaim 间隔。
+            A23：`and` 是按标签取交集，右侧序列不存在时是空向量，交集为空、整条规则不产生
+            任何结果。而"从未 reclaim 过"恰恰是最可能完全停摆的状态，这条 critical 曾在自己
+            最该响的场景下必然沉默。`Consumer.PrimeMetrics` 在启动时把
+            `control_stream_reclaim_total` 预置为 0，使 `== 0` 是一次真实比较而非缺失序列。
 
       - alert: UsageLedgerDuplicateSpike
         expr: increase(usage_ledger_duplicate_total[15m]) > 10

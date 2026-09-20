@@ -117,9 +117,9 @@
 > 同理，「绿的断言未必是活的断言」在本轮再次应验——F1 能存在，正是因为 A15 的测试**全部止于 400/503**，
 > 没有一条覆盖 err 分支。
 >
-> **下一步**：第六次复盘条目（A17–A21）已全部收口，**A22**（堆 1 四条已修、堆 2 八条判定可容忍）亦已收口。
-> 剩余两项均需你先定方案：**A23**（StreamPendingStuck 在完全停摆时必然沉默，critical，P1）
-> 与 A22 里的 `:57` StarvationGateFired（platform 标签来自 DB，无法静态枚举）。
+> **下一步**：第六次复盘条目（A17–A21）已全部收口；**A22**（堆 1 五条已修、堆 2 八条判定可容忍）
+> 与 **A23**（StreamPendingStuck 空向量）亦已收口。**§A 当前没有未完成条目**，
+> §C 全部 `[live-gate]`、§D 为部署边界。
 > §C 全部 `[live-gate]`，§D 为部署边界（D1 已完成）。
 > A12/E1/E2 不阻塞 B4，可并行取。P4（B4）在 A11 之前不进入编码——迁移来的用户还停在 staging，没有可扣费主体。
 
@@ -884,7 +884,7 @@ TODO 零命中：`rolled_back` 0 处。
 ### A22 `[no-cred]` `increase(惰性 counter)` 漏掉序列诞生增量（堆 1 已修，堆 2 判定可容忍）
 
 **状态：已完成（2026-09-21）。** 证据见 `docs/EVIDENCE.md` 同名小节。
-**`:57` StarvationGateFired 未修，需你定方案**（见下方「待定」）。
+堆 1 五条全部落地（含 `:57`），堆 2 八条判定可容忍。
 
 根因不是 `billing_job.go` 独有的：`internal/observability/metrics.go` 的 `Registry` 是进程内 map，
 **序列在首次 `AddCounter` 时才诞生**，输出 text 0.0.4 无 `_created`。
@@ -897,7 +897,7 @@ TODO 零命中：`rolled_back` 0 处。
 准确表述是：**每个进程生命周期内、每个 label 取值上，丢掉一次「诞生增量」**；之后计数器行为正常。
 因此真正的分界不是阈值，而是**该指标的目标事件是否天然一次性**。
 
-**堆 1 — 真漏报，已修（4 条）**
+**堆 1 — 真漏报，已修（5 条）**
 
 | 行 | 规则 | 严重度 | 预置点 |
 |---|---|---|---|
@@ -905,6 +905,7 @@ TODO 零命中：`rolled_back` 0 处。
 | `:77` | StreamDLQGrowing | critical | `Consumer.PrimeMetrics`，4 个 `reason` 类目 |
 | `:161` | SyntheticTerminalStateSpike | warning | `Consumer.PrimeMetrics`，`source="synthetic"` |
 | `:467` | ConsoleHeldUnpricedResolution | warning | `Console.PrimeMetrics`（无标签） |
+| `:57` | StarvationGateFired | warning | `SnapshotLoop.PrimeMetrics`，按 `ListSnapshotBuckets` 的 platform 列表 |
 
 `:161` 只预置 `synthetic`：`gateway` 那个取值由 `ledger.go:70` 发射，没有任何规则读它。
 
@@ -920,12 +921,18 @@ TODO 零命中：`rolled_back` 0 处。
 
 记在这里是为了下次复盘不必重新推一遍：**这 8 条是判定过的，不是漏掉的**。
 
-**待定 —— `:57` StarvationGateFired（唯一未处理项）**
+**`:57` StarvationGateFired —— 原以为要在「预置」与「接受漏报」之间二选一，实际不必**
 
-它属于堆 1（防饿死闸触发是天然一次性事件），但 `health.go:240` 的 `platform` 标签取值
-**来自 DB 查询，进程启动时拿不到**，无法像其余三条那样静态枚举。两条路：
-在 `StarvationGuard` 首次成功查询后按查到的 platform 列表预置 0；或接受漏报并在
-`threshold_source` 写明。**未定，不擅自选。**
+它的 `platform` 取值确实来自 DB（`health.go:240`），不能静态枚举。但
+`snapshot_loop.go:45` 的 `ListSnapshotBuckets` 本来就是
+`SELECT DISTINCT platform,"group" FROM accounts`，**快照循环每分钟已经在读这个列表**。
+于是复用它即可：`SnapshotLoop.PrimeMetrics(ctx)` 在 `run.go` 首次 `RunOnce` **之前**调用
+（必须在之前——`RunOnce` 自己就会跑防饿死闸，之后预置会漏掉首轮触发的那次），
+`RunOnce` 内部在取到 buckets 后每轮再预置一次，覆盖启动后才出现的新 platform。
+既不新增查询，也不引入会腐烂的手写清单。
+
+**已知残留**：某 platform 的第一个账号在启动后才出现、且闸在同一轮内即触发时，仍会漏掉那一次。
+已写入该规则的 `threshold_source`。
 
 **DoD（堆 1 部分已全部满足）**
 
@@ -936,6 +943,8 @@ TODO 零命中：`rolled_back` 0 处。
   **扫描 `stream.go` 的 `deadLetter` 调用点**反查，双向断言（调用点有而清单无、清单有而调用点无
   都报错）。手写清单会在下次新增拒绝路径时静默腐烂，而症状是「一条序列没预置、一条告警漏掉该类目
   的第一条消息」——不可见。这一条沿用 `alertrules_test.go` 扫源码建清单的既有做法。
+- ✅ `SnapshotLoop.PrimeMetrics` / `primeStarvationCounters`：按 bucket 列表去重后按 platform 预置 0；
+  `run.go` 在首次 `RunOnce` 之前调用，`RunOnce` 内每轮复预置。
 - ✅ 每个预置测试的首条断言都是「预置前该指标不存在」的防空跑断言。
 - ✅ 反向校验：从 `dlqCategories()` 删掉一个类目 → 漂移测试 FAIL 并指名 `retry_exhausted`；
   删掉 console 的预置行 → 对应测试 FAIL。还原后转绿。
@@ -944,7 +953,7 @@ TODO 零命中：`rolled_back` 0 处。
 
 ### A23 `[no-cred]` StreamPendingStuck 在「完全停摆」时必然沉默
 
-**状态：未开始（2026-09-21 做 A22 分堆时发现）。P1——它是 critical 且在最该响的场景下失效。**
+**状态：已完成（2026-09-21）。** 证据见 `docs/EVIDENCE.md` 同名小节。
 
 `configs/alerts/gateway-platform.rules.yml:106`：
 
@@ -963,8 +972,18 @@ min_over_time(control_stream_pending[30m]) > 0 and increase(control_stream_recla
 给 reclaim 计数器预置 0（复用 `Consumer.PrimeMetrics`），或规则改用 `absent()` 兜底。
 前者顺带让 A22 的形状也成立，后者不依赖发射端。**未定。**
 
-**DoD**：规则在「pending 非零 + 从未 reclaim 过」的状态下能产生结果；
-配一个「预置前序列不存在」的防空跑断言。
+**选定的修法**：在 `Consumer.PrimeMetrics` 里把 `control_stream_reclaim_total` 预置为 0。
+选它而不是给规则套 `absent()`：预置让 `== 0` 成为一次**真实比较**而不是缺失序列，
+同时顺带让该指标在 A22 的形状下也成立（首次 reclaim 是 0→N 而非诞生即 N）；
+`absent()` 只绕过症状，且会让规则表达式更难读。
+
+**DoD（已满足）**
+
+- ✅ `Consumer.PrimeMetrics` 预置 `control_stream_reclaim_total` 为 0，与 A22 的 DLQ 预置同一调用。
+- ✅ 规则 `threshold_source` 写明：可触发性依赖该预置，并记录原失效机制。
+- ✅ `TestPrimeMetricsCreatesZeroReclaimSeries`：首条断言是预置前该序列不存在；
+  再断言真实 reclaim 能在 0 之上正常累加。
+- ✅ 反向校验：删掉那行预置该测试 FAIL，还原后转绿。
 
 ---
 

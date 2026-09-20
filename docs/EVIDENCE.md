@@ -7,6 +7,43 @@
 > 阅读规则：本文的每一条都是**对已发生事实的描述**。不要从本文推断"项目是否可以继续开发"——
 > 那个问题由 `docs/TODO.md` 和 `AGENTS.md` §0 回答。
 
+## A23 StreamPendingStuck 在「完全停摆」时必然沉默（2026-09-21）
+
+**缺陷**：`configs/alerts/gateway-platform.rules.yml:106`
+
+```promql
+min_over_time(control_stream_pending[30m]) > 0 and increase(control_stream_reclaim_total[30m]) == 0
+```
+
+`control_stream_reclaim_total`（`internal/events/stream.go:147`）在第一次 reclaim 之前
+**序列根本不存在**。`and` 是按标签取交集，右侧为空向量时交集为空，**整条规则不产生任何结果**。
+规则的目标是「pending 持续非零且 30 分钟无 reclaim，消费可能完全停摆」，
+而一个从未 reclaim 过的进程恰恰是最可能停摆的那个——**critical 告警在自己最该响的场景下必然沉默**。
+
+**与 A22 不是同一个缺陷**：A22 是「序列存在、值不动，`increase()` 看不见诞生增量」；
+本条是「序列不存在，规则无结果」。
+
+**改动**：`Consumer.PrimeMetrics` 增加 `AddCounter("control_stream_reclaim_total", 0)`，
+与 A22 的 DLQ 预置同一调用、同一启动点。
+**选它而不是给规则套 `absent()`**：预置让 `== 0` 成为一次真实比较而不是缺失序列，
+并顺带让该指标在 A22 的形状下也成立（首次 reclaim 是 0→N 而非诞生即 N）；
+`absent()` 只绕过症状，还会让表达式更难读。规则的 `threshold_source` 已写明可触发性依赖该预置。
+
+**本轮执行并通过**
+
+```
+go test ./internal/events/ -run PrimeMetricsCreatesZeroReclaim -v
+  --- PASS: TestPrimeMetricsCreatesZeroReclaimSeries
+go test ./...  → 24 个包全部 ok（真实 PG/Redis/ClickHouse）
+gofmt / build / vet 干净
+```
+
+**反向校验**：删掉 `Consumer.PrimeMetrics` 里那行预置 → 该测试 FAIL 并报缺失序列；还原后转绿。
+测试首条断言是预置前 `control_stream_reclaim_total` 不存在；第二条断言真实 reclaim 能在 0 之上正常累加。
+
+**免责边界**：与 A21/A22 同——仓库没有 promtool/Prometheus 装置，
+「空向量导致 `and` 交集为空」与「预置后 `== 0` 成立」这两步依据 PromQL 文档语义，未做实证。
+
 ## A22 `increase(惰性 counter)` 漏掉序列诞生增量（2026-09-21）
 
 **缺陷**：A21 的根因是全仓共有的。`observability.Registry` 是进程内 map，序列在首次
@@ -37,8 +74,20 @@ watching 它的规则等于死的。
 `:121`（重复入账是持续现象）、`:394 :412 :431 :451`（运营日常重复操作）。
 判定与理由记在 `docs/TODO.md` A22，**它们是判定过的，不是漏掉的**。
 
-**`:57` StarvationGateFired 未处理**：属堆 1，但 `health.go:240` 的 `platform` 取值来自 DB 查询，
-启动时拿不到，无法静态枚举。两条路（首次查询后按结果预置 / 接受漏报并写明）**未定，留给用户选**。
+**`:57` StarvationGateFired 也已修，且没有走当初设想的二选一**：它的 `platform` 取值确实来自 DB
+（`health.go:240`）不能静态枚举，但 `snapshot_loop.go:45` 的 `ListSnapshotBuckets` 本来就是
+`SELECT DISTINCT platform,"group" FROM accounts`——快照循环每分钟已经在读这个列表。
+新增 `SnapshotLoop.PrimeMetrics(ctx)` 复用它，在 `run.go` 首次 `RunOnce` **之前**调用
+（必须在之前：`RunOnce` 自己就会跑防饿死闸，之后预置会漏掉首轮触发那次），
+`RunOnce` 内取到 buckets 后每轮复预置一次，覆盖启动后才出现的 platform。
+不新增查询，也不引入会腐烂的手写清单。
+已知残留：某 platform 的第一个账号在启动后才出现、且闸在同一轮内即触发时仍会漏那一次，
+已写入该规则的 `threshold_source`。
+
+该计数器发布到 `observability.Default` 而非一个注入的 registry——它真正的发射方
+`PGSnapshotRepository.ReleaseStarvedCooldowns` 也是直接用 `Default`，两边若用不同 registry，
+测试证明的就不是告警真正读的那条序列。测试用独有的 platform 名，使「预置前不存在」这条
+前置断言在进程级 registry 下依然成立。
 
 **本轮执行并通过**
 
@@ -72,10 +121,7 @@ go test ./...       → 24 个包全部 ok（真实 PG/Redis/ClickHouse）
 **免责边界**：与 A21 同——仓库没有 promtool/Prometheus 装置，`increase()` 在真实 Prometheus 上
 对「0→N 后平稳」序列返回 N 未做实证。保证止于「序列从 0 开始」这一前提条件。
 
-**本轮新发现、未在本条修复**：`:106` StreamPendingStuck 是**另一个缺陷**——
-`increase(control_stream_reclaim_total[30m]) == 0` 在序列不存在时右侧为空向量，
-`and` 取交集为空，整条规则不产生结果，而「从未 reclaim 过」正是最可能停摆的状态。
-critical 且在最该响的场景下沉默。已立 `docs/TODO.md` A23（P1，方案未定）。
+**本轮新发现**：`:106` StreamPendingStuck 是**另一个缺陷**，同批修复，见下方 A23 小节。
 
 ## A21 `increase()` 对惰性 counter 漏掉首次增量（2026-09-21）
 

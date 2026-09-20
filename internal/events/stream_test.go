@@ -270,6 +270,32 @@ func TestPrimeMetricsCreatesZeroSeriesForEveryDLQCategory(t *testing.T) {
 	}
 }
 
+// A23: StreamPendingStuck reads `increase(control_stream_reclaim_total[30m]) == 0`
+// and joins it with `and`, which is a label-set intersection. While the series
+// does not exist the right-hand operand is empty, the intersection is empty and
+// the rule produces no result -- so a consumer that has never reclaimed anything,
+// the one most likely to be stalled, could not trigger the critical alert that
+// exists to catch exactly that. Existing at zero is the whole fix.
+func TestPrimeMetricsCreatesZeroReclaimSeries(t *testing.T) {
+	metrics := observability.NewRegistry()
+	consumer := Consumer{Metrics: metrics}
+
+	if before := scrapeRegistry(t, metrics); strings.Contains(before, "control_stream_reclaim_total") {
+		t.Fatalf("the counter existed before priming: %s", before)
+	}
+
+	consumer.PrimeMetrics()
+	if want := "control_stream_reclaim_total 0"; !strings.Contains(scrapeRegistry(t, metrics), want) {
+		t.Errorf("missing primed series %s; got:\n%s", want, scrapeRegistry(t, metrics))
+	}
+
+	// A real reclaim still counts normally on top of the zero.
+	consumer.metrics().AddCounter("control_stream_reclaim_total", 4)
+	if want := "control_stream_reclaim_total 4"; !strings.Contains(scrapeRegistry(t, metrics), want) {
+		t.Errorf("the primed series did not advance; got:\n%s", scrapeRegistry(t, metrics))
+	}
+}
+
 func scrapeRegistry(t *testing.T, registry *observability.Registry) string {
 	t.Helper()
 	recorder := httptest.NewRecorder()

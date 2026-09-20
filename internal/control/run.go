@@ -151,6 +151,10 @@ func Run(cfg Config) error {
 	snapshotTicker := time.NewTicker(snapshotRefreshInterval)
 	defer snapshotTicker.Stop()
 	snapshotC := snapshotTicker.C
+	// A22: before the first RunOnce, because that call runs the starvation gate
+	// itself -- priming afterwards would miss a gate that fired on the very
+	// first iteration. See SnapshotLoop.PrimeMetrics.
+	snapshotLoop.PrimeMetrics(ctx)
 	if err := snapshotLoop.RunOnce(ctx); err != nil {
 		log.Printf("control initial snapshot publish failed: %v", err)
 	}
