@@ -86,7 +86,38 @@
 > advisory lock、quota outbox 重试循环）、A12 / E2 / C6 三份文档全部规范性要求、
 > B5 的 §1–§6 全部条目。
 >
-> **下一步**：先取 A15（P0，钱包无法反向修正是账务硬伤），再取 A16。
+> ~~**下一步**：先取 A15，再取 A16。~~ —— A15/A16 已完成，但**第六次复盘在 A15 里找出一条丢钱路径**。
+>
+> **2026-09-20 第六次结构复盘（结构分析 + 对抗性代码复核）**：这次换了两个靶子——
+> ① 从未被逐条核对过的**总览 §4 契约正文**（约 70 个字段）；
+> ② §6.1 迁移 + `AUDIT-CONTEXT.md`（全仓最老、最少被扫的文档）；
+> ③ **对抗性复核 A15/A16 自己的新代码**——那是全仓唯一从未被任何人复核过的代码，
+> 而写它的人也是唯一读过它的人。
+>
+> 结果：§4 契约**无缺口**（约 70 个字段逐条一致；三个"零消费"字段都已在 TODO 列过或无行为要求，
+> 正确排除）。另外三处找出 **5 条**：
+>
+> - **A15 的 F1（阻断级，已修）**：重放误判导致**调整静默丢失并返回 200**。
+>   已用真实 PG 复现：一条 topup 占了 id `ticket-4711`，后续 `adjust -500` 复用该 id
+>   撞主键 → 兜底查到那条 **+500 的 topup** → 返回 `200 {"replayed":true,"kind":"topup"}`，
+>   余额纹丝不动。**请求扣钱、返回加钱、状态码 200。**
+>   根因：`replayMovement` 的 `WHERE id=$1 AND tenant_id=$2` 不校验 kind/amount，
+>   且调用点把**任意错误**都当重放。`wallet_transactions.id` 是全局主键、不按租户分命名空间。
+>   责任划分：「任意错误都兜底」与「不校验 amount」是 `replayTopup` 时代的既有结构；
+>   但**方向可反**、**跨端点碰撞**、**err 分支覆盖面更宽**这三点是 A15 新增的。
+> - **F2（已修）**：跨租户 id 碰撞返回不可诊断的 500，应为 409。
+> - **F3（已修）**：A15 新增的两个指标零消费方——**正是 A16 声称要堵的洞，在同一批提交里又开了一个**，
+>   而 `_replayed_total` 恰恰是 F1 的唯一可观测信号。根因是 A16 的 pin 是**手写表、没有自动性**。
+> - **A20（F4，未做）**、**A21（F7，未做）**：见下方条目。
+> - **A17 / A18 / A19（未做）**：见下方条目。
+>
+> **本次最值得记住的**：A16 刚刚补完「指标没有消费方」的反向校验，**下一个提交就又犯了同一件事**。
+> 手写清单不是机制。本轮把它改成了按指标族自动校验（`TestMoneyMetricsHaveAConsumer`），
+> 并反向验证过：新增一个无人消费的 `control_billing_*` / `control_console_*` 指标即刻变红。
+> 同理，「绿的断言未必是活的断言」在本轮再次应验——F1 能存在，正是因为 A15 的测试**全部止于 400/503**，
+> 没有一条覆盖 err 分支。
+>
+> **下一步**：A18（迁移能力集反转）优先，其余按 A17/A19/A20/A21 取。
 > §C 全部 `[live-gate]`，§D 为部署边界（D1 已完成）。
 > A12/E1/E2 不阻塞 B4，可并行取。P4（B4）在 A11 之前不进入编码——迁移来的用户还停在 staging，没有可扣费主体。
 
@@ -677,6 +708,99 @@ E1 任务块 `:820-860` 的 DoD 五个方向与「本轮未做」三项均不含
 
 **已知取舍**
 - 通知通道（谁收、怎么收）仍属部署侧，与 E1/A9 同一边界。
+
+---
+
+### A17 `[no-cred]` TLS profile 名字的跨包不变量没有任何 pin
+
+**状态：未开始（2026-09-20 第六次复盘发现）。P2。**
+
+总览 §5：「control 写下名字，gateway **必须真的实现**该 utls profile；profile 名字定死不改。」
+今天是对的——control 只写 `codex_rustls` / `node24`（`provider/profile.go:59,82`），
+gateway 恰好实现这两个（`tlsprofile.go:37-38`）。但**没有任何测试核对这个包含关系**：
+`tlsprofile_test.go` 是唯一引用 profile 表的测试，它不 import `internal/control/provider`。
+
+失败场景：新增 provider 写 `TLSFingerprint:"chrome131"` 却忘了加 gateway profile
+→ build / test / CI 全绿 → 运行时该渠道每请求 fail-closed 503，渠道静默死掉。
+压 P2 而非 P1：失败是 fail-closed（不会把不受控流量打上游），A7 已保证未知名拒绝出站。
+**形态同 A16/F3——不变量有，强制没有。**
+
+**DoD**：加一条跨包测试，断言 control 侧所有 `EndpointProfile.TLSFingerprint`
+都能在 gateway 的注册表里查到。TODO 零命中：`:249` 只覆盖 A7 的"未知名 fail-closed"（gateway 单侧）。
+
+---
+
+### A18 `[no-cred]` 迁移的「待人工确认」是没人读的布尔，账号反以无能力限制上线
+
+**状态：未开始（2026-09-20 第六次复盘发现）。P1。**
+
+总览 §6.1:236：「`channels.models` / model mapping → `accounts` 能力集合 →
+**未识别模型不丢弃账号，写入待人工确认状态**」。
+
+实际：`parseModels`（`plan.go:299-315`）在源 `models` 是 JSON 对象或数组解析失败时返回 `(nil, true)`。
+`plan.go:109-113` 只把 `conversion["manual_review"]=true` 写进一个 JSON blob，
+**`account.Status` 完全没被改动**（只有 per-key status 会改它），照常以 `active` 入库。
+`manual_review` 全仓命中 = 2 个写入点 + 1 处测试断言，**零生产读取方**。
+
+**方向是反的**：`chooser.go:301` 的 `len(account.Capabilities) == 0 { return true }`
+表示**匹配任意模型**。于是「模型列表没解析出来」的账号不是被挂起待确认，
+而是成为对所有模型都可调度的账号——比能力明确的账号更宽松。
+
+限定：生产迁移是独立上线闸门、尚未执行，**今天没有实际损害**；但 A5/A11 已完成，迁移是既定路径。
+TODO 零命中：`人工确认` 仅 1 处且是 B4 钱包 adjustment。
+
+**DoD**：`manual_review` 必须有生产消费方——或把账号落为非 `active` 的待确认状态，
+或至少进 `Summary` 计数使 dry-run 可见。不得让"解析失败"等价于"无限制"。
+
+---
+
+### A19 `[no-cred]` 迁移 staging 三态只实现了两态
+
+**状态：未开始（2026-09-20 第六次复盘发现）。P2。**
+
+总览 `:225` 与 `AUDIT-CONTEXT.md:37` 都要求 `imported / reconciled / rolled_back` 三态。
+`migration_records.Status` 的产生点只有 `plan.go:364` 的 `"rejected"` 与 `:370` 的 `"imported"`；
+迁移语境下 `reconciled` / `rolled_back` 全仓零命中，`001_initial.sql:111,129` 两个 status 列也无 CHECK。
+后果：已 apply 的迁移无法表达「已与源核对」或「已撤销」，重跑只原地覆盖为 `imported`。
+TODO 零命中：`rolled_back` 0 处。
+
+---
+
+### A20 `[no-cred]` 控制台钱包端点对合法格式输入返回 500
+
+**状态：未开始（2026-09-20 第六次复盘发现，原 F4）。P2。**
+
+`console_billing.go` 的注释承诺「零金额在 handler 拦下，调用方拿到指名字段的 400 而不是仓储的 500」，
+但 handler 只查 `Valid()` 与 `sign != 0`，没查 scale 与量级：
+- 13 位小数 → `checkMoney`（`moneyScale=12`）拒绝 → **500**；
+- `1e30` → 正则合法且 `moneyPlaces` 因指数抵消算成 0、`checkMoney` 放行 → PG `numeric field overflow` → **500**。
+
+钱没动（tx 回滚，已确认），但动钱端点对合法格式返回 500 会被误判为平台故障。
+`handleTopup` 有完全相同的两个缺口。**DoD**：两处都在 handler 内校验 scale 与量级，返回具名 400。
+
+---
+
+### A21 `[no-cred]` `increase()` 对惰性 counter 漏掉首次增量
+
+**状态：未开始（2026-09-20 第六次复盘发现，原 F7）。P2，需先定方案。**
+
+`BillingUnpricedRows`（A16）用 `increase(control_billing_rows_total{state="unpriced"}[1h]) > 0`。
+发射点 `billing_job.go:373` 有 `if rows > 0` 守卫，`observability` 的 Registry 是进程内 map，
+序列**第一次出现就直接是 N、不是 0→N**，且输出 text 0.0.4 无 `_created`。
+`increase()` = 窗口内 last − first，因此：
+
+- **单批次 unpriced（出现一次后不再发生）→ 序列平在 N → `increase` 恒为 0 → 规则永不触发**。
+  而这恰是 D6 最想抓的「上新模型忘配价」的低流量版本。
+- 首次出现时窗口内只有一个样本，最早要第二次抓取才可能响。
+- 进程重启后序列消失；再次出现时 Prometheus 判 reset 并补值，`$value` 被夸大（非误报，但数字错）。
+- `increase()` 外推到窗口边界，单次 +1 常报成 `1.0166…`，summary 里会出现小数条数。
+
+**公平说明**：`increase(惰性 counter) > 0` 是本仓库既有通行写法（`rules.yml` 多处同形状），
+底层缺陷是系统性的，A16 只是又用了一次；但 A16 把该规则作为「满足 D6 的即时告警」交付，
+这部分承诺不成立，属 A16 自己的。
+
+**两条候选解法（需先定）**：去掉 `billing_job.go:373` 的 `rows > 0` 守卫，让四个 state 序列从启动起即为 0；
+或为 unpriced 增一个存量 gauge，用 `> 0` 而非 `increase`。前者动生产代码，后者动指标形状——**未定，不擅自选**。
 
 ---
 

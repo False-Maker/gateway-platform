@@ -200,7 +200,19 @@ func (c Console) handleTopup(w http.ResponseWriter, r *http.Request) {
 		Note:   topupNote(operator(r), request.Note),
 	})
 	if err != nil {
-		if replay, ok := c.replayMovement(ctx, tenantID, request.ID); ok {
+		// Same rule as handleAdjust. A top-up cannot reverse direction the way
+		// an adjustment can -- the kind check keeps it positive -- but it could
+		// still report someone else's row, or a different amount under this
+		// tenant's own id, as "your retry succeeded".
+		if isUniqueViolation(err) {
+			replay, replayErr := c.confirmReplay(ctx, tenantID, request.ID, "topup", request.Amount)
+			if replayErr != nil {
+				c.metrics().AddCounter("control_console_topup_conflict_total", 1)
+				writeError(w, http.StatusConflict, fmt.Sprintf(
+					"top-up id %s cannot be reused: %s. Pick a new id; ids are global to wallet_transactions, not per tenant.",
+					request.ID, replayErr))
+				return
+			}
 			c.metrics().AddCounter("control_console_topup_replayed_total", 1)
 			writeJSON(w, http.StatusOK, map[string]any{"movement": replay, "replayed": true})
 			return
@@ -294,7 +306,18 @@ func (c Console) handleAdjust(w http.ResponseWriter, r *http.Request) {
 				fmt.Sprintf("no wallet for tenant %s: an adjustment corrects an existing wallet, top up to create one", tenantID))
 			return
 		}
-		if replay, ok := c.replayMovement(ctx, tenantID, request.ID); ok {
+		// Only a duplicate key may be read as a retry. Every other failure --
+		// a rejected amount, a lock timeout, a broken connection -- is a
+		// failure, and reporting it as a replay is how a correction gets lost.
+		if isUniqueViolation(err) {
+			replay, replayErr := c.confirmReplay(ctx, tenantID, request.ID, "adjustment", request.Amount)
+			if replayErr != nil {
+				c.metrics().AddCounter("control_console_adjustment_conflict_total", 1)
+				writeError(w, http.StatusConflict, fmt.Sprintf(
+					"adjustment id %s cannot be reused: %s. Pick a new id; ids are global to wallet_transactions, not per tenant.",
+					request.ID, replayErr))
+				return
+			}
 			c.metrics().AddCounter("control_console_adjustment_replayed_total", 1)
 			writeJSON(w, http.StatusOK, map[string]any{"movement": replay, "replayed": true})
 			return
@@ -311,6 +334,46 @@ func (c Console) handleAdjust(w http.ResponseWriter, r *http.Request) {
 		},
 		"replayed": false,
 	})
+}
+
+// A replay is only a replay when the journal already holds *this* movement.
+// These two say why it was not.
+var (
+	// The id collided on a primary key that spans every tenant, but the row
+	// carrying it is not this tenant's.
+	errReplayForeignTenant = errors.New("wallet transaction id is already used by another tenant")
+	// The id is this tenant's, but it names a different movement than the one
+	// being asked for.
+	errReplayMismatch = errors.New("wallet transaction id was already used for a different movement")
+)
+
+// confirmReplay decides what a duplicate-key failure on a wallet write means.
+//
+// The rule it enforces: a retry may only be reported as a successful replay if
+// the journal row it finds is the movement the caller actually asked for. The
+// first version of this code returned *any* row with a matching (id, tenant)
+// and treated *any* repository error as a replay, which had a money-losing
+// failure mode -- reproduced against PostgreSQL before this was written:
+// a top-up had taken the id "ticket-4711"; a later `adjust` of -500 reusing
+// that id collided on the primary key, found the +500 top-up, and returned
+// 200 {"replayed": true, "kind": "topup"}. The debit never happened and the
+// caller saw success. Direction reversed, silently.
+//
+// wallet_transactions.id is global, not per-tenant, so kind and amount both
+// have to be checked, and a collision with another tenant's row has to be
+// distinguishable from "this is your retry".
+func (c Console) confirmReplay(ctx context.Context, tenantID, id, kind string, amount contracts.Decimal) (walletMovementVw, error) {
+	replay, ok := c.replayMovement(ctx, tenantID, id)
+	if !ok {
+		// The caller is here because of a primary-key violation, so a row with
+		// this id exists somewhere; not finding it under this tenant means it
+		// belongs to another one. Reporting that beats the 500 this used to be.
+		return walletMovementVw{}, errReplayForeignTenant
+	}
+	if replay.Kind != kind || !sameMoney(replay.Amount, amount) {
+		return walletMovementVw{}, fmt.Errorf("%w: it holds a %s of %s", errReplayMismatch, replay.Kind, replay.Amount)
+	}
+	return replay, nil
 }
 
 // replayMovement returns an existing movement when a write failed because its

@@ -408,6 +408,61 @@ groups:
             取 >0 且 for=0m 由这条规则的**用途**推出：它是审计信号而不是故障信号，
             延迟一分钟看见它没有意义，所以不设 for。次数阈值本身不存在，故无需校准。
 
+      - alert: ConsoleWalletAdjustment
+        expr: increase(control_console_adjustment_total[5m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+          scope: console
+        annotations:
+          summary: "有运营对租户钱包做了显式调整（可正可负）"
+          description: >-
+            与 ConsoleWalletTopUp 同类的审计信号，但**级别更高**：调整是双向的、
+            金额任意，是平台上唯一能把钱人工扣出去的入口（A15，见 docs/B5-CONSOLE.md §4.4）。
+            操作者与 reason 记在 `wallet_transactions.note`——note 是这行唯一的审计凭据，
+            且 `X-Operator` 是自声明的，核对时要结合别的证据。
+            列为 warning 而非 info：充值只会让租户更能用，调整可以让租户少钱。
+          runbook: "docs/B5-CONSOLE.md §4.4；docs/B4-BILLING-MODEL.md D3"
+          threshold_source: >-
+            取 >0 且 for=0m 由**用途**推出：审计信号而非故障信号，延迟看见没有意义。
+            次数阈值本身不存在，故无需校准。
+
+      - alert: ConsoleWalletIdReuse
+        expr: increase(control_console_adjustment_conflict_total[1h]) > 0 or increase(control_console_topup_conflict_total[1h]) > 0
+        for: 0m
+        labels:
+          severity: warning
+          scope: console
+        annotations:
+          summary: "钱包写入因 id 复用被拒（{{ $value }} 次）"
+          description: >-
+            `wallet_transactions.id` 是**全局**主键，不按租户分命名空间。这条规则计的是
+            被 409 拒掉的复用：同一 id 换了 kind、换了金额，或者撞上别的租户的行。
+            这类请求**没有动钱**，但说明调用方的 id 生成规则有问题——在修好之前，
+            运营以为做成的修正实际上一次都没生效。
+            历史背景：这个路径曾经返回 200 `replayed:true` 并附上**另一条**流水
+            （一次 -500 的调整拿回一条 +500 的充值），调整静默丢失。现在是 409。
+          runbook: "docs/B5-CONSOLE.md §4.4"
+          threshold_source: >-
+            取 >0 由语义推出：一次 id 复用就意味着调用方的假设是错的，可容忍次数为 0。
+            次数阈值本身不存在，故无需校准。
+
+      - alert: ConsoleWalletReplay
+        expr: increase(control_console_adjustment_replayed_total[1h]) > 0 or increase(control_console_topup_replayed_total[1h]) > 0
+        for: 0m
+        labels:
+          severity: info
+          scope: console
+        annotations:
+          summary: "钱包调整被作为重放返回（{{ $value }} 次）"
+          description: >-
+            同 id、同 kind、同金额的重复提交，返回原流水且不重复动钱——这是幂等键
+            在正常工作。列为 info。但它也是"调用方在重试"的信号：若与
+            ConsoleWalletIdReuse 同时升高，说明重试逻辑在拿同一个 id 试不同的内容。
+          runbook: "docs/B5-CONSOLE.md §4.4"
+          threshold_source: >-
+            取 >0 由用途推出：可见性信号，不是故障阈值，无需校准。
+
       - alert: ConsoleHeldUnpricedResolution
         expr: increase(control_console_held_unpriced_total[1h]) > 0
         for: 0m

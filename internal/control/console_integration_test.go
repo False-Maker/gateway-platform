@@ -1279,3 +1279,105 @@ func TestConsoleAdjustRequiresAnExistingWallet(t *testing.T) {
 		t.Fatalf("adjust on a walletless tenant: got %d (%s), want 404", response.Code, response.Body.String())
 	}
 }
+
+// F1/F2: a reused wallet_transactions id must never be reported as a
+// successful replay of a movement the caller did not make.
+//
+// The regression this pins was reproduced against PostgreSQL: a top-up held
+// the id "ticket-4711", a later adjust of -500 reusing that id collided on the
+// primary key, and the handler answered 200 {"replayed":true,"kind":"topup"}.
+// The debit never happened and the caller saw success.
+func TestConsoleWalletIdReuseIsAConflictNotAReplay(t *testing.T) {
+	ctx, db, console := newConsoleTestConsole(t)
+	tenantID, _ := b5Fixture(t, ctx, db, "idreuse")
+	other, _ := b5Fixture(t, ctx, db, "idreuse-other")
+
+	sharedID := tenantID + "-ticket-4711"
+	topup := `{"id":"` + sharedID + `","amount":"500","note":"invoice"}`
+	if r := b5Request(t, console, http.MethodPost, "/v1/billing/wallets/"+tenantID+"/topup", topup); r.Code != http.StatusCreated {
+		t.Fatalf("seed top-up: %d %s", r.Code, r.Body.String())
+	}
+	balanceAfterSeed, _, err := (PGBillingRepository{DB: db}).Balance(ctx, tenantID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cases := map[string]struct {
+		target, body string
+	}{
+		// The money-losing one: opposite direction, same id.
+		"adjust reusing a top-up id": {
+			"/v1/billing/wallets/" + tenantID + "/adjust",
+			`{"id":"` + sharedID + `","amount":"-500","reason":"incident reversal"}`,
+		},
+		// Same kind, same id, different amount: the correction that would
+		// otherwise be silently replaced by the earlier, smaller one.
+		"top-up reusing its own id with a new amount": {
+			"/v1/billing/wallets/" + tenantID + "/topup",
+			`{"id":"` + sharedID + `","amount":"900"}`,
+		},
+		// F2: the id exists, but under another tenant. Used to be a bare 500.
+		"adjust reusing another tenant's id": {
+			"/v1/billing/wallets/" + other + "/adjust",
+			`{"id":"` + sharedID + `","amount":"-1","reason":"wrong tenant"}`,
+		},
+	}
+	for name, test := range cases {
+		t.Run(name, func(t *testing.T) {
+			response := b5Request(t, console, http.MethodPost, test.target, test.body)
+			if response.Code != http.StatusConflict {
+				t.Fatalf("got %d, want 409 (body %s)", response.Code, response.Body.String())
+			}
+			if !strings.Contains(response.Body.String(), "cannot be reused") {
+				t.Errorf("409 body does not explain the id reuse: %s", response.Body.String())
+			}
+		})
+	}
+
+	// The decisive assertion: none of the above moved money.
+	after, _, err := (PGBillingRepository{DB: db}).Balance(ctx, tenantID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after != balanceAfterSeed {
+		t.Errorf("balance moved from %s to %s while every request was rejected", balanceAfterSeed, after)
+	}
+}
+
+// A genuine retry -- same id, same kind, same amount -- must still replay.
+// Tightening the rule above must not break idempotency, which is the whole
+// reason the id is required in the first place.
+func TestConsoleGenuineRetryStillReplays(t *testing.T) {
+	ctx, db, console := newConsoleTestConsole(t)
+	tenantID, _ := b5Fixture(t, ctx, db, "retry")
+
+	body := `{"id":"` + tenantID + `-adj","amount":"-2.5","reason":"late price entry"}`
+	target := "/v1/billing/wallets/" + tenantID + "/adjust"
+	if first := b5Request(t, console, http.MethodPost, target, body); first.Code != http.StatusCreated {
+		t.Fatalf("first adjustment: %d %s", first.Code, first.Body.String())
+	}
+	second := b5Request(t, console, http.MethodPost, target, body)
+	if second.Code != http.StatusOK {
+		t.Fatalf("identical retry: got %d, want 200 (%s)", second.Code, second.Body.String())
+	}
+	var replay struct {
+		Replayed bool             `json:"replayed"`
+		Movement walletMovementVw `json:"movement"`
+	}
+	if err := json.Unmarshal(second.Body.Bytes(), &replay); err != nil {
+		t.Fatal(err)
+	}
+	if !replay.Replayed || replay.Movement.Kind != "adjustment" {
+		t.Errorf("retry returned %+v, want a replayed adjustment", replay)
+	}
+	if !sameMoney(replay.Movement.Amount, "-2.5") {
+		t.Errorf("replay returned amount %s, want the -2.5 that was actually recorded", replay.Movement.Amount)
+	}
+	balance, _, err := (PGBillingRepository{DB: db}).Balance(ctx, tenantID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if balance != "7.500000000000" {
+		t.Errorf("balance %s after 10 - 2.5 applied twice, want 7.500000000000", balance)
+	}
+}

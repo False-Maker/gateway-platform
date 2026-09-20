@@ -154,6 +154,70 @@ func TestEveryRuleDocumentsItsThreshold(t *testing.T) {
 	}
 }
 
+// moneyMetricPrefixes are the metric families where "emitted but nobody reads
+// it" is a real operational hole rather than a dashboard nicety: they describe
+// money moving and operators moving it.
+var moneyMetricPrefixes = []string{"control_billing_", "control_console_"}
+
+// knownUnconsumedMoneyMetrics are the money-family metrics that deliberately
+// have no alert rule, each with the reason. Adding a metric here is a decision;
+// the point of the test below is that it cannot happen by accident.
+var knownUnconsumedMoneyMetrics = map[string]string{
+	"control_billing_reconcile_runs_total":     "对账是否在跑由 control_billing_reconcile_last_success_seconds 告警（BillingReconciliationNotRunning），这个计数器是看板用量",
+	"control_billing_reconcile_unsettled_rows": "未结算行按状态分别告警（held / unpriced 两条规则），这是聚合值，看板用",
+	"control_console_held_resolved_total":      "裁定本身是正常运营动作；有收入后果的那一半由 ConsoleHeldUnpricedResolution 覆盖",
+	"control_console_price_total":              "录入单价是配置动作，只向未来生效且不可改价，无失败后果需要告警",
+	"control_console_throttled_total":          "B5.1 的控制台限流；被限流是设计内行为，是否值得告警**尚未决定**——记在此处而不是假装它有消费方",
+}
+
+// TestMoneyMetricsHaveAConsumer is the automatic half of the lesson A16 was
+// supposed to teach.
+//
+// TestAlertRulesOnlyReferenceEmittedMetrics checks rules against metrics. It
+// cannot see the opposite hole -- a metric nobody reads -- and A16 closed one
+// instance of that hole by adding a hand-written entry to the table below.
+// A hand-written table has no automation, and the very next commit proved it:
+// A15 shipped control_console_adjustment_total and
+// control_console_adjustment_replayed_total with no consumer at all, and the
+// replayed counter was the only observable signal of a wallet correction being
+// silently dropped. This test makes the check structural for the metric
+// families where it matters, so the next one cannot slip through unnoticed.
+func TestMoneyMetricsHaveAConsumer(t *testing.T) {
+	rules := loadRules(t)
+	referenced := make(map[string]struct{})
+	for _, group := range rules.Groups {
+		for _, rule := range group.Rules {
+			for _, metric := range referencedMetrics(rule.Expr) {
+				referenced[metric] = struct{}{}
+			}
+		}
+	}
+	for metric := range emittedMetrics(t) {
+		inFamily := false
+		for _, prefix := range moneyMetricPrefixes {
+			if strings.HasPrefix(metric, prefix) {
+				inFamily = true
+				break
+			}
+		}
+		if !inFamily {
+			continue
+		}
+		if _, ok := referenced[metric]; ok {
+			if reason, listed := knownUnconsumedMoneyMetrics[metric]; listed {
+				t.Errorf("%s now has an alert rule, so remove it from knownUnconsumedMoneyMetrics (listed reason: %s)",
+					metric, reason)
+			}
+			continue
+		}
+		if _, ok := knownUnconsumedMoneyMetrics[metric]; ok {
+			continue
+		}
+		t.Errorf("%s is emitted but no alert rule reads it. Either add a rule, or add it to knownUnconsumedMoneyMetrics with the reason it does not need one.",
+			metric)
+	}
+}
+
 // E1's DoD names five areas the rules must cover. This pins them so a later
 // edit cannot quietly drop one.
 func TestRequiredCoverageIsPresent(t *testing.T) {

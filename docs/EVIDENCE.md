@@ -7,6 +7,65 @@
 > 阅读规则：本文的每一条都是**对已发生事实的描述**。不要从本文推断"项目是否可以继续开发"——
 > 那个问题由 `docs/TODO.md` 和 `AGENTS.md` §0 回答。
 
+## A15 的丢钱路径修复：重放误判（F1/F2/F3，2026-09-20）
+
+**这是 A15 交付几小时后由第六次复盘的对抗性代码复核发现的，缺陷由我引入。**
+
+**复现（真实 PostgreSQL，修复前）**
+一条 topup 占用 id `ticket-4711`（+500）。随后对同一工单发 `adjust -500` 复用该 id：
+
+```
+STATUS=200  replayed=true  returned kind="topup"
+balance before=510.000000000000  after=510.000000000000   (requested -500)
+```
+
+**请求扣钱、返回加钱、状态码 200。** 扣款从未发生，调用方拿到 2xx。
+
+**根因**：`replayMovement` 的 SQL 是 `WHERE id=$1 AND tenant_id=$2`——不校验 kind、不校验 amount；
+而调用点把**任意**非 `ErrWalletNotFound` 的错误都当作"重放成功"。
+`wallet_transactions.id` 是**全局**主键，两个端点共享同一 id 空间。
+
+**责任划分**：「任意错误都兜底走重放」与「不校验 amount」是 `replayTopup` 时代的既有结构；
+**方向可反**（topup 受 CHECK 约束恒正，adjustment 双向）、**跨端点碰撞成为可能**、
+**err 分支覆盖面更宽**（adjust 不做 `EnsureWallet`）这三点是 A15 新增的。
+即：把「可能重复加钱」升级成了「请求扣钱、返回加钱、200」。
+
+**改动**
+- `console_billing.go` 新增 `confirmReplay` + 两个哨兵错误（`errReplayForeignTenant` /
+  `errReplayMismatch`）。只有 `isUniqueViolation(err)`（23505，仓库既有工具）才走重放；
+  找到的行必须 kind 相同且 `sameMoney` 金额相同，否则 **409**。
+  主键冲突却查不到本租户的行 ⇒ 该 id 属于别的租户 ⇒ **409**（原为不可诊断的 500，即 F2）。
+- 同一修法**同时应用到 `handleTopup`**：它方向不可反，但仍可静默返回错金额或别人的行。
+- 规则文件新增三条（F3）：`ConsoleWalletAdjustment`（warning，对标 topup 的 info——
+  调整双向且是唯一能人工扣钱的入口）、`ConsoleWalletIdReuse`、`ConsoleWalletReplay`。
+  规则总数 23 → 26。
+- `alertrules_test.go` 新增 `TestMoneyMetricsHaveAConsumer`：对
+  `control_billing_*` / `control_console_*` 两个指标族**自动**校验"必须有消费方"，
+  例外须显式登记并写明理由（当前 5 条，含一条诚实标注"是否告警尚未决定"）。
+
+**为什么加自动校验而不是再补一条 pin**
+A16 刚刚补完「指标没有消费方」的反向校验，**下一个提交（A15）就又犯了同一件事**——
+新增的 `control_console_adjustment_total` 与 `_replayed_total` 零消费方，
+而 `_replayed_total` 恰是 F1 的唯一可观测信号。根因是 A16 的 pin 是**手写表，没有自动性**。
+手写清单不是机制。
+
+**本轮执行并通过（真实 PG/Redis/ClickHouse）**
+- `go test -count=1 -p 1 ./...` 24 个包全过；`go vet`、`gofmt`、`-race` 均通过。
+- 新增集成测试 `TestConsoleWalletIdReuseIsAConflictNotAReplay`（三子例：
+  adjust 复用 topup 的 id、topup 复用自身 id 换金额、adjust 复用他租户 id），全部 409，
+  并断言**全过程余额未移动**；`TestConsoleGenuineRetryStillReplays` 确认同 id/同 kind/同金额
+  的真重试仍返回 200 且余额只动一次（幂等未被收紧破坏）。
+- **反向验证新守卫承重**：临时加一个无人消费的 `control_billing_brand_new_unwatched_total`，
+  `TestMoneyMetricsHaveAConsumer` 即 FAIL 并指名该指标；移除后转绿，文件已还原。
+
+**未修（已立为编号任务）**：A20（scale/量级超限返回 500，原 F4）、
+A21（`increase()` 对惰性 counter 漏首次增量，单批次 unpriced 永不触发，原 F7——
+两条候选解法都动生产代码或指标形状，未定，不擅自选）。
+
+**同时记下的既有软肋（非本轮引入，未改）**：`reason` 无长度上限，只受 64KB body 限制；
+`operator(r)` 取自自声明的 `X-Operator` header，不经认证——在"note 是这行唯一审计凭据"
+的定位下，`ConsoleWalletAdjustment` 的规则描述里已写明核对时需结合其他证据。
+
 ## A15 钱包 `adjustment` 冲正/退款入口（2026-09-20）
 
 **背景**：第五次结构复盘发现设计把 `adjustment` 定为已扣费行的唯一修正手段
