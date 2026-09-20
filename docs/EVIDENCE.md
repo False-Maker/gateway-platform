@@ -7,6 +7,35 @@
 > 阅读规则：本文的每一条都是**对已发生事实的描述**。不要从本文推断"项目是否可以继续开发"——
 > 那个问题由 `docs/TODO.md` 和 `AGENTS.md` §0 回答。
 
+## A19 迁移 staging 的 `reconciled` 状态（2026-09-20）
+
+**缺陷**：keyhive §4:126 与总览 §6.1:225 都要求 `imported / reconciled / rolled_back` 三态，
+而 `migration_records.Status` 的产生点只有 `"rejected"` 与 `"imported"`。
+重跑只把行原地覆盖回 `imported`，因此**已与源核对过的记录与首次导入的记录无法区分**。
+
+**改动**（`internal/migration/newapi/apply.go`）
+- upsert 的 `ON CONFLICT ... DO UPDATE` 用 `CASE` 收敛状态：原状态为 `imported`/`reconciled`、
+  本次传入 `imported`、且 `target_id IS NOT DISTINCT FROM EXCLUDED.target_id`，才转 `reconciled`。
+  语义直接取自 keyhive §4:135「重跑只产生**同一 target ID** 的 `reconciled` 记录」。
+- 转移刻意收窄：**target ID 漂移不是核对成功**，保留传入状态而不伪装成已确认；
+  `rejected` 行不参与——没导入过的东西谈不上重新核对。
+
+**`rolled_back` 有意未做（这是本条的主要判断）**
+文档只给了状态名，**从未定义其语义**，且仓库中不存在任何回滚操作
+（`internal/migration/newapi/` 下除 `tx.Rollback` 外无回滚入口，Apply 失败即整事务回滚、不留痕）。
+加一个没有写入方的状态、或只加一条含 `rolled_back` 的 CHECK 约束，**正是 A15
+（`adjustment` 有枚举/有约束/零写入方）与 A16（指标零消费方）刚刚修过两次的反模式**。
+因此改为把三份设计文档写成与代码一致，并注明待回滚操作落地后再引入：
+`keyhive/docs/architecture.md:126`、`docs/fluxgate-keyhive-overview.md:225`、`docs/AUDIT-CONTEXT.md:37`。
+改的是"未实现"的事实陈述，不是设计决策变更。
+
+**本轮执行并通过（真实 PG/Redis/ClickHouse）**
+- `go test -count=1 -p 1 ./...` 24 包全过；`build`/`vet`/`gofmt` 干净。
+- 新增 `TestApplyMarksReRunRecordsReconciled`：断言首次导入**不得**产出 `reconciled`
+  （防空跑——若初始就是 reconciled，后面的断言毫无意义）、二次 apply 后全部转 `reconciled`
+  且 `imported` 归零、`rejected` 计数不变、**第三次 apply 保持 reconciled 不回摆**，
+  并核对所有 `reconciled` 的 account 记录其 `target_id` 仍指向真实存在的账号。
+
 ## A17 TLS profile 跨包 pin + A20 金额上限（2026-09-20）
 
 ### A17：总览 §5 的跨包不变量第一次有了强制

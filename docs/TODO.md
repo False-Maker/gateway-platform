@@ -778,13 +778,30 @@ health 转移与两份设计文档的状态词汇表——**代价大于收益**
 
 ### A19 `[no-cred]` 迁移 staging 三态只实现了两态
 
-**状态：未开始（2026-09-20 第六次复盘发现）。P2。**
+**状态：已完成（2026-09-20）。** 证据见 `docs/EVIDENCE.md` 同名小节。
+**交付 `reconciled`；`rolled_back` 有意不做**——理由见下方 DoD。
 
 总览 `:225` 与 `AUDIT-CONTEXT.md:37` 都要求 `imported / reconciled / rolled_back` 三态。
 `migration_records.Status` 的产生点只有 `plan.go:364` 的 `"rejected"` 与 `:370` 的 `"imported"`；
 迁移语境下 `reconciled` / `rolled_back` 全仓零命中，`001_initial.sql:111,129` 两个 status 列也无 CHECK。
 后果：已 apply 的迁移无法表达「已与源核对」或「已撤销」，重跑只原地覆盖为 `imported`。
 TODO 零命中：`rolled_back` 0 处。
+
+**DoD（交付情况）**
+- ✅ `reconciled` 落地：`apply.go` 的 upsert 用 `CASE` 收敛——原状态为
+  `imported`/`reconciled`、本次传入 `imported`、且 `target_id` **未漂移**，才转 `reconciled`。
+  语义直接取自 keyhive §4:135「重跑只产生同一 target ID 的 `reconciled` 记录」。
+- ✅ 转移刻意收窄：target ID 变了**不是**核对成功，保留传入状态而不伪装成已确认
+  （`accounts` 上另有硬断言直接报错，本 CASE 覆盖没有该保护的其余 record kind）；
+  `rejected` 行不参与——没有导入过的东西谈不上重新核对。
+- ❌ **`rolled_back` 有意不做**：文档只给了状态名，**从未定义语义**，且仓库中不存在任何回滚操作。
+  加一个没有写入方的状态，正是 A15（`adjustment` 有枚举无写入方）与 A16（指标无消费方）
+  刚刚修过两次的反模式。**改为把三份设计文档写成与代码一致**，并注明
+  `rolled_back` 待回滚操作落地后再引入。
+- ✅ 未加 CHECK 约束：同理——约束里有、代码里无写入方，就是 A15 的形状。
+
+**文档同步**（三处，改的是"未实现"的事实陈述，非设计变更）：
+`keyhive/docs/architecture.md:126`、`docs/fluxgate-keyhive-overview.md:225`、`docs/AUDIT-CONTEXT.md:37`。
 
 ---
 

@@ -473,3 +473,85 @@ func TestApplyPromotesTenantsPrincipalsAndTokensIdempotently(t *testing.T) {
 		t.Errorf("re-apply moved revoked_at from %v to %v", firstRevokedAt, secondRevokedAt)
 	}
 }
+
+// A19: keyhive §4 says a re-run "只产生同一 target ID 的 reconciled 记录".
+// Before this the second apply overwrote the row as `imported` again, so the
+// staging table could not tell a record that had been re-checked against the
+// source from one imported for the first time -- which is the whole reason the
+// three-state vocabulary exists.
+func TestApplyMarksReRunRecordsReconciled(t *testing.T) {
+	ctx, db := openTargetTestPool(t)
+	cipher := testCipher(t)
+	plan := applyTestPlan(t)
+
+	if err := Apply(ctx, db, cipher, plan, "a19-run-1"); err != nil {
+		t.Fatalf("first Apply: %v", err)
+	}
+	statuses := recordStatusCounts(t, ctx, db)
+	if statuses["reconciled"] != 0 {
+		t.Fatalf("a first import must not produce reconciled rows: %v", statuses)
+	}
+	if statuses["imported"] == 0 {
+		t.Fatalf("first import produced no imported rows: %v", statuses)
+	}
+	importedFirst := statuses["imported"]
+
+	if err := Apply(ctx, db, cipher, plan, "a19-run-2"); err != nil {
+		t.Fatalf("second Apply: %v", err)
+	}
+	after := recordStatusCounts(t, ctx, db)
+	if after["reconciled"] != importedFirst {
+		t.Errorf("re-run reconciled %d records, want all %d", after["reconciled"], importedFirst)
+	}
+	if after["imported"] != 0 {
+		t.Errorf("%d records stayed imported after a re-run", after["imported"])
+	}
+	// Rejected rows are not reconciles: nothing was imported to re-check.
+	if after["rejected"] != statuses["rejected"] {
+		t.Errorf("rejected count changed from %d to %d", statuses["rejected"], after["rejected"])
+	}
+
+	// A third run must stay reconciled rather than flapping back to imported.
+	if err := Apply(ctx, db, cipher, plan, "a19-run-3"); err != nil {
+		t.Fatalf("third Apply: %v", err)
+	}
+	third := recordStatusCounts(t, ctx, db)
+	if third["reconciled"] != importedFirst || third["imported"] != 0 {
+		t.Errorf("third run produced %v, want the same reconciled set", third)
+	}
+
+	// The target ids must be the ones the first run wrote -- "同一 target ID"
+	// is half the sentence, and a reconcile that silently retargeted would be
+	// worse than no status at all.
+	var drifted int
+	if err := db.QueryRow(ctx, `SELECT count(*) FROM migration_records r
+		WHERE r.source_system=$1 AND r.status='reconciled' AND r.record_kind='account'
+		  AND NOT EXISTS (SELECT 1 FROM accounts a WHERE a.id=r.target_id)`, SourceSystem).Scan(&drifted); err != nil {
+		t.Fatal(err)
+	}
+	if drifted != 0 {
+		t.Errorf("%d reconciled account records point at a target that does not exist", drifted)
+	}
+}
+
+func recordStatusCounts(t *testing.T, ctx context.Context, db *pgxpool.Pool) map[string]int {
+	t.Helper()
+	rows, err := db.Query(ctx, `SELECT status, count(*) FROM migration_records WHERE source_system=$1 GROUP BY status`, SourceSystem)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	counts := map[string]int{}
+	for rows.Next() {
+		var status string
+		var count int
+		if err := rows.Scan(&status, &count); err != nil {
+			t.Fatal(err)
+		}
+		counts[status] = count
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return counts
+}

@@ -183,7 +183,35 @@ func applyRecord(ctx context.Context, tx pgx.Tx, runID, sourceSystem string, rec
 	if record.RejectionReason != "" {
 		rejection = record.RejectionReason
 	}
-	_, err = tx.Exec(ctx, `INSERT INTO migration_records (run_id,source_system,source_id,record_kind,source_digest,raw_summary,conversion_result,target_id,rejection_reason,status) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT (source_system,source_id,record_kind) DO UPDATE SET run_id=EXCLUDED.run_id,source_digest=EXCLUDED.source_digest,raw_summary=EXCLUDED.raw_summary,conversion_result=EXCLUDED.conversion_result,target_id=EXCLUDED.target_id,rejection_reason=EXCLUDED.rejection_reason,status=EXCLUDED.status,updated_at=now()`, runID, sourceSystem, record.SourceID, record.RecordKind, record.SourceDigest, raw, conversion, targetID, rejection, status)
+	// A19: keyhive §4 defines the re-run outcome exactly -- "重跑只产生同一
+	// target ID 的 reconciled 记录". Before this, a second apply overwrote the
+	// row as `imported` again, so a record that had been confirmed against the
+	// source was indistinguishable from one imported for the first time, and
+	// the staging table could not answer "has this been re-checked?".
+	//
+	// The transition is deliberately narrow: only an `imported` or already
+	// `reconciled` row, being re-applied as `imported`, with a target id that
+	// has not moved. A row whose target id changed is not a reconcile -- it is
+	// an anomaly, and it keeps the incoming status rather than being dressed up
+	// as confirmed. (`accounts` already refuses that case outright above; this
+	// covers the record kinds that have no such guard.)
+	_, err = tx.Exec(ctx, `INSERT INTO migration_records (run_id,source_system,source_id,record_kind,source_digest,raw_summary,conversion_result,target_id,rejection_reason,status)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+		ON CONFLICT (source_system,source_id,record_kind) DO UPDATE SET
+			run_id=EXCLUDED.run_id,
+			source_digest=EXCLUDED.source_digest,
+			raw_summary=EXCLUDED.raw_summary,
+			conversion_result=EXCLUDED.conversion_result,
+			target_id=EXCLUDED.target_id,
+			rejection_reason=EXCLUDED.rejection_reason,
+			status=CASE
+				WHEN migration_records.status IN ('imported','reconciled')
+				 AND EXCLUDED.status='imported'
+				 AND migration_records.target_id IS NOT DISTINCT FROM EXCLUDED.target_id
+				THEN 'reconciled'
+				ELSE EXCLUDED.status
+			END,
+			updated_at=now()`, runID, sourceSystem, record.SourceID, record.RecordKind, record.SourceDigest, raw, conversion, targetID, rejection, status)
 	if err != nil {
 		return fmt.Errorf("write migration record %s/%s: %w", record.RecordKind, record.SourceID, err)
 	}

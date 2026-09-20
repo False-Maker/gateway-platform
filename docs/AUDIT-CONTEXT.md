@@ -34,7 +34,7 @@
 - **三个易丢字段**:`setting.proxy`(codex 刷新流程本身用,丢了搞坏 refresh)、codex `client_id`(new-api 硬编码常量,不在库,新系统自供)、多 key 数组→N 账号。
 - **可质疑点**:字段映射须按 provider 分别定,不一把梭。
 
-**新系统首次迁移模型(已定)**:从 new-api 的 `channels + users + tokens + quota/balance + group` 建立新系统记录,`logs` 历史明细不进入 P1 运行链路。一个 new-api user 映射为一个 tenant 和默认 principal;所有迁移记录保留 `source_system + source_id` 幂等键。使用新系统的 `migration_runs` / `migration_records` staging 追踪原始摘要、转换结果、target ID、拒绝原因和回滚状态;线上遗留 `elucid_*_migration_map` 仅作事实参考,不作为新系统迁移模型。
+**新系统首次迁移模型(已定)**:从 new-api 的 `channels + users + tokens + quota/balance + group` 建立新系统记录,`logs` 历史明细不进入 P1 运行链路。一个 new-api user 映射为一个 tenant 和默认 principal;所有迁移记录保留 `source_system + source_id` 幂等键。使用新系统的 `migration_runs` / `migration_records` staging 追踪原始摘要、转换结果、target ID、拒绝原因和记录状态(`imported / reconciled / rejected`,A19 2026-09-20;`rolled_back` 待回滚操作落地后再引入);线上遗留 `elucid_*_migration_map` 仅作事实参考,不作为新系统迁移模型。
 
 ### 1.4 计费:按 token,计量/计费分离 + usage 完整性策略(v2 强化)
 - **选的**:P0 只采集用量(Release 带 tokens + model + account + tenant + **UsageSource + Partial**),计费逻辑推迟 P4。

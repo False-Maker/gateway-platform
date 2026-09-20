@@ -222,7 +222,10 @@ P1 的网关请求 deadline 为 120s,`attempt_lease` 至少为 300s,回收器不
 **新系统首次迁移模型(不复用线上旧 migration map)**:
 - 首批迁移覆盖 `channels + users + tokens + quota/balance + group`; `logs` 历史明细不进入 P1 运行链路。
 - 一个 new-api user 映射为一个新系统 tenant 和一个默认 principal;该用户的 tokens 归属该 tenant。保留 `source_system + source_id` 作为幂等来源标识。
-- 迁移通过 staging 记录源快照时间、原始字段摘要、转换结果、target ID、拒绝原因和 `imported / reconciled / rolled_back` 状态。线上旧的 `elucid_*_migration_map` 仅作事实参考,不作为新系统契约。
+- 迁移通过 staging 记录源快照时间、原始字段摘要、转换结果、target ID、拒绝原因和状态。
+  **状态当前为 `imported / reconciled / rejected`**(A19,2026-09-20);v1 列过的 `rolled_back`
+  待回滚操作落地后再引入,不先建一个无写入方的状态词。
+  线上旧的 `elucid_*_migration_map` 仅作事实参考,不作为新系统契约。
 - P1 只使用合成数据验证技术闭环;允许生产只读 schema/数据核对和 dry-run,不允许生产写入、部署或流量切换。
 
 首次迁移的语义映射固定如下,具体列名以 dry-run 的 `information_schema` 结果为准,不在脚本中硬编码未核实的列:

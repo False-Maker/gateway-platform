@@ -123,7 +123,11 @@ v2 用**每账号 fencing token** 替代 v1 的全局单 leader:
 
 **迁移 staging(新系统首次设计,不复用线上旧 migration map)**
 - `migration_runs` —— 源库快照时间、批次状态、校验摘要、dry-run/正式导入标记。
-- `migration_records` —— `source_system + source_id` 幂等键、原始字段摘要、转换结果、target ID、拒绝原因和 `imported / reconciled / rolled_back` 状态。
+- `migration_records` —— `source_system + source_id` 幂等键、原始字段摘要、转换结果、target ID、拒绝原因和状态。
+  **状态当前为 `imported / reconciled / rejected` 三值**(A19,2026-09-20):首次导入 `imported`,
+  重跑且 target ID 未变转 `reconciled`,无法映射的进 `rejected`。
+  v1 还列过 `rolled_back`,但**回滚操作本身未排期**;不引入一个没有写入方的状态词,
+  待回滚落地后再加(缺口形状同 A15 的 `adjustment`,该错误本项目已犯过两次)。
 - 首批覆盖 `channels + users + tokens + quota/balance + group`; `logs` 历史明细不进入 P1 运行链路。
 
 P0 索引与回收约束固定为:
