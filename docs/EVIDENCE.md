@@ -7,6 +7,66 @@
 > 阅读规则：本文的每一条都是**对已发生事实的描述**。不要从本文推断"项目是否可以继续开发"——
 > 那个问题由 `docs/TODO.md` 和 `AGENTS.md` §0 回答。
 
+## A28 收掉 `for:` 与注解两块剩余空白（2026-09-21）
+
+A25/A26 明确列出两处未覆盖：`for:` 时长与注解模板渲染。本条收掉它们。
+
+**`for:` 方向**：新增 9 个 `..._is_pending_not_firing_before_for_elapses` 场景——
+序列从第一个样本起就让表达式为真，在 `for:` 走完之前求值，断言处于 pending 而非 firing。
+其余 7 条带 `for:` 的规则进 `knownForDurationsWithoutAPendingScenario` 并附理由：
+它们基于 `increase()` / `rate()` / `time()`，为真的起点取决于序列形状而非规则本身，
+钉死一个 `eval_time` 等于在测 fixture。
+
+**注解方向**：promtool 按完全相等比较注解，抄进 fixture 会让每次措辞改动都弄红测试。
+改测真正值得抓的缺陷且不需要 promtool——`TestEveryAnnotationLabelReferenceIsProducedByTheAlert`：
+注解里每个 `{{ $labels.X }}` 的 X 必须真的出现在该告警的输出标签上（取自正向场景的实测标签）。
+引用不存在的标签会渲染成空串，运维看到的 summary 悄悄丢掉「是哪个 provider / 租户 / 原因」。
+
+**它当场抓到一个真问题，就在 A26 刚写的 fixture 里**
+
+`PlatformTransportRejection` 与 `PlatformTransportRejectionSpread` 的注解引用
+`{{ $labels.provider }}`，`health.go:160,165` 也确实打的是 `provider`。
+但 A26 为这两条写的场景编了一个 `platform` 标签——**`promql_expr_test` 只拿 fixture 跟它自己比，
+自洽但不反映现实**。已改正。这条检查同时覆盖两个方向：注解引用不存在的标签，
+以及 fixture 编造发射端从不设置的标签。
+
+**两个空跑陷阱，已固化为守卫**
+
+1. `TestScenarioEvalTimesStayInsideTheirSeries`：promtool 在序列最后一个样本之后几分钟判 stale，
+   **在 `values:` 末尾之后求值会让规则因为"数据跑完了"而沉默**，`exp_alerts: []` 照样满足。
+   第一次验证 `for:` 场景是否为活断言时就踩了这个——拿 30m 去打一条到 20m 结束的序列，
+   看到绿色，差点把一条死断言记成活的。改用 10m（仍在序列内、已越过 `for: 5m`）后立即变红。
+2. `TestPendingScenariosEvaluateBeforeTheirForDuration`：pending 场景的全部主张就是
+   `eval_time` 落在 `for:` 窗口内；有人缩短 `for:` 会让它悄悄退化成一条恰好通过的 firing 测试。
+
+**不引入 Prometheus 依赖**：时长解析用 `time.ParseDuration`，规则文件只用到 `m`/`h`；
+写成 `1d` 会在这里响亮失败而不是被误读。理由写在 `parseRuleDuration` 的注释里。
+
+**本轮执行并通过**
+
+```
+gofmt -l internal/  → 无输出
+go build ./...      → build OK
+go vet ./internal/... → vet OK
+go test ./...                                          → 24 包 ok
+GATEWAY_TEST_PROMTOOL_IMAGE=prom/prometheus:latest go test ./...  → 24 包 ok
+promtool 场景数：47（28 条规则全覆盖）
+```
+
+**反向校验（四条守卫逐条验）**
+
+```
+注解引用 $labels.nonexistent_label        → FAIL: StarvationGateFired ... interpolates $labels.nonexistent_label
+把 stream_pending_backlog_fires 推到 40m  → FAIL: ... evaluates at 40m but control_stream_pending ends at 20m
+把 BillingHeldRows 的 for: 改成 10m       → FAIL: ... evaluates at 25m but ... only holds for 10m0s
+新增一条带 for: 但无场景无理由的规则      → FAIL: BrandNewWaitingRule waits 7m before firing but nothing shows it waits
+```
+
+四条各自 FAIL 并指名问题，还原后全绿。
+
+**仍未覆盖，明确判定不做**：注解**渲染后的文本**本身（本条只验标签引用的存在性）。
+验文本要把多段式 description 抄进 fixture，每次措辞改动都会弄红测试，代价大于收益。
+
 ## A27 对账看门狗查不出「从来没跑起来过」（2026-09-21）
 
 **发现方式**：A26 为 `BillingReconciliationUnbalanced` 写场景时注意到它是 `== 0` 而非 `> 0`，

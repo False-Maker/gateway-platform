@@ -4,8 +4,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 // A25 closes the one gap A21 through A24 all had to declare and none could
@@ -164,22 +167,22 @@ func promtoolScenarios() []scenario {
 			name:  "egress_platform_transport_rejection_fires",
 			claim: "平台级 transport 拒绝判定置位即触发（critical）",
 			series: []inputSeries{
-				{selector: `control_platform_alert{platform="anthropic",reason="transport_rejections"}`, values: `1+0x20`},
+				{selector: `control_platform_alert{provider="anthropic",reason="transport_rejections"}`, values: `1+0x20`},
 			},
 			alert:      "PlatformTransportRejection",
 			evalTime:   "10m",
-			wantLabels: `{__name__="control_platform_alert",platform="anthropic",reason="transport_rejections"}`,
+			wantLabels: `{__name__="control_platform_alert",provider="anthropic",reason="transport_rejections"}`,
 			wantValue:  "1",
 		},
 		{
 			name:  "egress_transport_rejection_spread_fires",
 			claim: "拒绝波及的账号数超过 3 个即触发（看广度而非单账号）",
 			series: []inputSeries{
-				{selector: `control_platform_transport_rejections_accounts{platform="anthropic"}`, values: `5+0x20`},
+				{selector: `control_platform_transport_rejections_accounts{provider="anthropic"}`, values: `5+0x20`},
 			},
 			alert:      "PlatformTransportRejectionSpread",
 			evalTime:   "15m",
-			wantLabels: `{__name__="control_platform_transport_rejections_accounts",platform="anthropic"}`,
+			wantLabels: `{__name__="control_platform_transport_rejections_accounts",provider="anthropic"}`,
 			wantValue:  "5",
 		},
 		{
@@ -457,6 +460,87 @@ func promtoolScenarios() []scenario {
 			wantLabels: `{}`,
 			wantValue:  "60",
 		},
+		{
+			name:  "egress_platform_transport_rejection_is_pending_not_firing_before_for_elapses",
+			claim: "表达式从第一个样本起就为真，但 `for:` 还没走完，因此必须处于 pending 而不是 firing。这是本装置唯一覆盖 `for:` 的方向",
+			series: []inputSeries{
+				{selector: `control_platform_alert{provider="anthropic",reason="transport_rejections"}`, values: `1+0x20`},
+			},
+			alert:    "PlatformTransportRejection",
+			evalTime: "3m",
+		},
+		{
+			name:  "egress_transport_rejection_spread_is_pending_not_firing_before_for_elapses",
+			claim: "表达式从第一个样本起就为真，但 `for:` 还没走完，因此必须处于 pending 而不是 firing。这是本装置唯一覆盖 `for:` 的方向",
+			series: []inputSeries{
+				{selector: `control_platform_transport_rejections_accounts{provider="anthropic"}`, values: `5+0x20`},
+			},
+			alert:    "PlatformTransportRejectionSpread",
+			evalTime: "7m",
+		},
+		{
+			name:  "stream_pending_backlog_is_pending_not_firing_before_for_elapses",
+			claim: "表达式从第一个样本起就为真，但 `for:` 还没走完，因此必须处于 pending 而不是 firing。这是本装置唯一覆盖 `for:` 的方向",
+			series: []inputSeries{
+				{selector: `control_stream_pending`, values: `1500+0x20`},
+			},
+			alert:    "StreamPendingBacklog",
+			evalTime: "7m",
+		},
+		{
+			name:  "usage_trust_attempt_open_age_is_pending_not_firing_before_for_elapses",
+			claim: "表达式从第一个样本起就为真，但 `for:` 还没走完，因此必须处于 pending 而不是 firing。这是本装置唯一覆盖 `for:` 的方向",
+			series: []inputSeries{
+				{selector: `request_attempt_open_age_seconds`, values: `1200+0x20`},
+			},
+			alert:    "AttemptOpenAgeHigh",
+			evalTime: "3m",
+		},
+		{
+			name:  "billing_held_rows_accumulating_is_pending_not_firing_before_for_elapses",
+			claim: "表达式从第一个样本起就为真，但 `for:` 还没走完，因此必须处于 pending 而不是 firing。这是本装置唯一覆盖 `for:` 的方向",
+			series: []inputSeries{
+				{selector: `control_billing_held_rows{usage_source="missing"}`, values: `4+0x40`},
+			},
+			alert:    "BillingHeldRowsAccumulating",
+			evalTime: "25m",
+		},
+		{
+			name:  "billing_uncapped_wallet_tenants_is_pending_not_firing_before_for_elapses",
+			claim: "表达式从第一个样本起就为真，但 `for:` 还没走完，因此必须处于 pending 而不是 firing。这是本装置唯一覆盖 `for:` 的方向",
+			series: []inputSeries{
+				{selector: `control_billing_uncapped_wallet_tenants`, values: `2+0x25`},
+			},
+			alert:    "BillingUncappedWalletTenants",
+			evalTime: "12m",
+		},
+		{
+			name:  "billing_blocked_tenants_is_pending_not_firing_before_for_elapses",
+			claim: "表达式从第一个样本起就为真，但 `for:` 还没走完，因此必须处于 pending 而不是 firing。这是本装置唯一覆盖 `for:` 的方向",
+			series: []inputSeries{
+				{selector: `control_billing_blocked_tenants`, values: `3+0x40`},
+			},
+			alert:    "BillingBlockedTenantsSpike",
+			evalTime: "25m",
+		},
+		{
+			name:  "billing_reconciliation_unbalanced_is_pending_not_firing_before_for_elapses",
+			claim: "表达式从第一个样本起就为真，但 `for:` 还没走完，因此必须处于 pending 而不是 firing。这是本装置唯一覆盖 `for:` 的方向",
+			series: []inputSeries{
+				{selector: `control_billing_reconcile_balanced`, values: `0+0x40`},
+			},
+			alert:    "BillingReconciliationUnbalanced",
+			evalTime: "25m",
+		},
+		{
+			name:  "billing_reconciliation_discrepancy_kind_is_pending_not_firing_before_for_elapses",
+			claim: "表达式从第一个样本起就为真，但 `for:` 还没走完，因此必须处于 pending 而不是 firing。这是本装置唯一覆盖 `for:` 的方向",
+			series: []inputSeries{
+				{selector: `control_billing_reconcile_discrepancies{kind="orphan_debit"}`, values: `2+0x40`},
+			},
+			alert:    "BillingReconciliationDiscrepancyKind",
+			evalTime: "25m",
+		},
 	}
 }
 
@@ -618,3 +702,193 @@ func TestEveryNegativeScenarioHasAPositiveTwin(t *testing.T) {
 		}
 	}
 }
+
+// seriesEnd returns the minute of the last sample a promtool `values:`
+// expression produces, given the 1m interval every scenario here uses.
+// "0+1x20" is a first sample plus twenty more, so the last one is at minute 20.
+func seriesEnd(values string) int {
+	last := 0
+	for _, part := range strings.Fields(values) {
+		last++ // the part's own first sample
+		if index := strings.LastIndex(part, "x"); index >= 0 {
+			repeat, err := strconv.Atoi(part[index+1:])
+			if err == nil {
+				last += repeat
+			}
+		}
+	}
+	return last - 1
+}
+
+// parseRuleDuration accepts the subset of Prometheus duration syntax this rules
+// file uses (m and h). Deliberately time.ParseDuration rather than
+// prometheus/common/model: the units beyond hours are not used here, and a
+// whole Prometheus dependency for one parser is not worth it. A rule written
+// with "1d" would fail loudly here rather than be misread.
+func parseRuleDuration(t *testing.T, value string) time.Duration {
+	t.Helper()
+	duration, err := time.ParseDuration(value)
+	if err != nil {
+		t.Fatalf("duration %q is not one this test can parse (only m and h are used in this rules file): %v", value, err)
+	}
+	return duration
+}
+
+func evalMinutes(t *testing.T, evalTime string) int {
+	t.Helper()
+	return int(parseRuleDuration(t, evalTime).Minutes())
+}
+
+// TestScenarioEvalTimesStayInsideTheirSeries guards a way a negative scenario
+// passes while proving nothing, found the hard way: promtool marks a series
+// stale a few minutes after its last sample, so evaluating past the end of
+// `values:` makes the rule silent because the data ran out, not because the
+// rule is silent. `exp_alerts: []` is satisfied either way.
+//
+// The first attempt at proving the `for:` scenarios were live did exactly this
+// -- pushed eval_time to 30m against a series ending at 20m, saw green, and
+// nearly recorded a dead assertion as a live one.
+func TestScenarioEvalTimesStayInsideTheirSeries(t *testing.T) {
+	for _, sc := range promtoolScenarios() {
+		eval := evalMinutes(t, sc.evalTime)
+		for _, series := range sc.series {
+			if end := seriesEnd(series.values); eval > end {
+				t.Errorf("%s evaluates at %dm but %s ends at %dm: the rule would be silent because the data ran out",
+					sc.name, eval, series.selector, end)
+			}
+		}
+	}
+}
+
+// TestPendingScenariosEvaluateBeforeTheirForDuration ties the "pending, not
+// firing" scenarios to the rule file. Their whole claim is that eval_time falls
+// inside the rule's `for:` window; if someone shortened the `for:` the scenario
+// would silently become a plain firing test that happens to pass.
+func TestPendingScenariosEvaluateBeforeTheirForDuration(t *testing.T) {
+	forByAlert := make(map[string]string)
+	for _, group := range loadRules(t).Groups {
+		for _, rule := range group.Rules {
+			forByAlert[rule.Alert] = rule.For
+		}
+	}
+	found := 0
+	for _, sc := range promtoolScenarios() {
+		if !strings.Contains(sc.name, "_is_pending_") {
+			continue
+		}
+		found++
+		held := parseRuleDuration(t, forByAlert[sc.alert])
+		if eval := evalMinutes(t, sc.evalTime); eval >= int(held.Minutes()) {
+			t.Errorf("%s evaluates at %dm but %s only holds for %s: this is no longer a pending test",
+				sc.name, eval, sc.alert, held)
+		}
+	}
+	if found == 0 {
+		t.Error("no pending scenarios found; the for: direction is not covered at all")
+	}
+}
+
+// knownForDurationsWithoutAPendingScenario records the rules whose `for:` has
+// no "pending, not firing" scenario, with the reason. The same shape as
+// knownUnconsumedMetrics: the gap is allowed, skipping the decision is not.
+var knownForDurationsWithoutAPendingScenario = map[string]string{
+	"UsageSourceMissingRatioHigh":     "表达式基于 rate()，为真的起点取决于两条序列的累积速度而非规则本身；钉死一个 eval_time 等于在测 fixture",
+	"BillingReconciliationNotRunning": "表达式是 time() 减时间戳，为真的时刻由阈值 3600s 决定而非序列；pending 窗口落在 1h 之后，场景成本远高于收益",
+	"DetailWriteFailing":              "increase() 需要窗口累积才为真，起点取决于序列形状",
+	"DetailBufferSaturated":           "同 DetailWriteFailing",
+	"ConsoleAuthRejections":           "increase() 且阈值为 >5，为真的起点取决于序列形状",
+	"QuotaSnapshotNotDraining":        "increase() 需要窗口累积才为真，起点取决于序列形状",
+	"StreamDLQGrowing":                "for: 0m，没有可测的 pending 窗口",
+}
+
+// TestEveryForDurationIsCoveredOrExcused is the A24/A26 pattern applied to the
+// `for:` direction: a rule that waits before firing must either have a scenario
+// showing it waits, or a written reason why not.
+func TestEveryForDurationIsCoveredOrExcused(t *testing.T) {
+	pendingFor := make(map[string]bool)
+	for _, sc := range promtoolScenarios() {
+		if strings.Contains(sc.name, "_is_pending_") {
+			pendingFor[sc.alert] = true
+		}
+	}
+	declared := make(map[string]struct{})
+	for _, group := range loadRules(t).Groups {
+		for _, rule := range group.Rules {
+			declared[rule.Alert] = struct{}{}
+			if parseRuleDuration(t, rule.For) == 0 {
+				continue
+			}
+			if pendingFor[rule.Alert] {
+				if reason, listed := knownForDurationsWithoutAPendingScenario[rule.Alert]; listed {
+					t.Errorf("%s now has a pending scenario, so remove it from knownForDurationsWithoutAPendingScenario (listed reason: %s)", rule.Alert, reason)
+				}
+				continue
+			}
+			if reason, ok := knownForDurationsWithoutAPendingScenario[rule.Alert]; ok {
+				if strings.TrimSpace(reason) == "" {
+					t.Errorf("%s is excused with an empty reason, which is the same as not deciding", rule.Alert)
+				}
+				continue
+			}
+			t.Errorf("%s waits %s before firing but nothing shows it waits. Add a pending scenario, or excuse it in knownForDurationsWithoutAPendingScenario.", rule.Alert, rule.For)
+		}
+	}
+	for alert := range knownForDurationsWithoutAPendingScenario {
+		if _, ok := declared[alert]; !ok {
+			t.Errorf("knownForDurationsWithoutAPendingScenario lists %q, which the rules file does not define", alert)
+		}
+	}
+}
+
+// TestEveryAnnotationLabelReferenceIsProducedByTheAlert closes the annotation
+// half. promtool compares annotations by exact equality, so asserting rendered
+// text would mean copying multi-paragraph descriptions into fixtures and
+// breaking on every wording edit. The defect worth catching is narrower and
+// checkable without promtool: an annotation that interpolates a label the alert
+// does not carry renders as an empty string, so the summary silently loses the
+// one piece of information an operator needs to know which provider, tenant or
+// reason is affected.
+//
+// The label set comes from the measured output of the positive scenarios, so
+// this also catches the inverse mistake -- a fixture that invents a label the
+// emitter never sets. That is not hypothetical: the first version of the two
+// platform scenarios used `platform`, while health.go emits `provider`, and
+// promql_expr_test happily compared the fixture against itself.
+func TestEveryAnnotationLabelReferenceIsProducedByTheAlert(t *testing.T) {
+	produced := make(map[string]map[string]bool)
+	for _, sc := range promtoolScenarios() {
+		if sc.wantLabels == "" {
+			continue
+		}
+		set := produced[sc.alert]
+		if set == nil {
+			set = make(map[string]bool)
+			produced[sc.alert] = set
+		}
+		for _, pair := range labelNamePattern.FindAllStringSubmatch(sc.wantLabels, -1) {
+			set[pair[1]] = true
+		}
+	}
+	for _, group := range loadRules(t).Groups {
+		for _, rule := range group.Rules {
+			for key, annotation := range rule.Annotations {
+				for _, ref := range labelRefPattern.FindAllStringSubmatch(annotation, -1) {
+					name := ref[1]
+					if rule.Labels[name] != "" || name == "alertname" {
+						continue
+					}
+					if produced[rule.Alert][name] {
+						continue
+					}
+					t.Errorf("%s annotation %q interpolates $labels.%s, but no scenario shows that label on the alert (it would render empty). Known scenario labels: %v",
+						rule.Alert, key, name, produced[rule.Alert])
+				}
+			}
+		}
+	}
+}
+
+var (
+	labelRefPattern  = regexp.MustCompile(`\$labels\.([A-Za-z_][A-Za-z0-9_]*)`)
+	labelNamePattern = regexp.MustCompile(`([A-Za-z_][A-Za-z0-9_]*)=`)
+)

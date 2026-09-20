@@ -123,9 +123,9 @@
 > §C 全部 `[live-gate]`、§D 为部署边界。
 > A25 补上 promtool 规则测试装置，A26 把它扩到**全部 28 条规则**，并加了
 > "每条新规则必须有场景"的结构性门禁（该门禁不需要 promtool，任何环境都跑）。
-> 剩余空白：`for:` 时长与注解模板渲染未覆盖。
-> A26 补场景的过程中发现并修掉了 **A27**（对账看门狗查不出"从来没跑起来过"）——
-> 这是新装置产出的第一个真缺口，而不是对已知问题的复述。
+> A27（对账看门狗查不出"从来没跑起来过"）是新装置产出的第一个真缺口；
+> A28 收掉了 `for:` 与注解两块剩余空白，并在过程中抓出 A26 自己 fixture 里编造的标签。
+> **§A 当前没有未完成条目。** 注解渲染后的文本本身有意不验，理由见 A28。
 > §C 全部 `[live-gate]`，§D 为部署边界（D1 已完成）。
 > A12/E1/E2 不阻塞 B4，可并行取。P4（B4）在 A11 之前不进入编码——迁移来的用户还停在 staging，没有可扣费主体。
 
@@ -1201,6 +1201,60 @@ A22 曾把 8 条规则判为"只丢首次增量、可容忍"，并在更正里�
 
 **未处理**：`RunOnce` 在 lag 配置错误时连 `runs_total{result="error"}` 都不记（`:78`）。
 本条只保证「从未成功」可见，没有让那条早退路径本身可观测。
+
+---
+
+### A28 `[no-cred]` 收掉 `for:` 时长与注解模板两块剩余空白
+
+**状态：已完成（2026-09-21）。** 证据见 `docs/EVIDENCE.md` 同名小节。
+
+A25/A26 明确列出两处未覆盖：`for:` 时长与注解模板渲染。本条收掉它们，
+并把过程中踩到的两个空跑陷阱固化成守卫。
+
+**`for:` 方向**
+
+新增 9 个 `..._is_pending_not_firing_before_for_elapses` 场景：序列从第一个样本起就让表达式为真，
+在 `for:` 走完之前求值，断言**处于 pending 而非 firing**。
+覆盖 9 条 gauge 型规则；其余 7 条带 `for:` 的规则进
+`knownForDurationsWithoutAPendingScenario` 并附理由——它们基于 `increase()` / `rate()` / `time()`，
+为真的起点取决于序列形状而非规则本身，钉死一个 `eval_time` 等于在测 fixture。
+
+**注解方向**
+
+promtool 按**完全相等**比较注解，抄进 fixture 会让每次措辞改动都弄红测试。
+所以改测那个真正值得抓的缺陷、且不需要 promtool：
+`TestEveryAnnotationLabelReferenceIsProducedByTheAlert` —— 注解里每个
+`{{ $labels.X }}` 的 X 必须真的出现在该告警的输出标签上（取自正向场景的实测标签）。
+引用一个不存在的标签会渲染成空串，运维看到的 summary 会**悄悄丢掉「是哪个 provider/租户/原因」**。
+
+**它当场抓到一个真问题——在我自己刚写的 fixture 里**
+
+`PlatformTransportRejection` 与 `PlatformTransportRejectionSpread` 的注解引用
+`{{ $labels.provider }}`，而 `health.go:160,165` 确实打的是 `provider`。
+但 A26 写的那两个场景编了一个 `platform` 标签。**`promql_expr_test` 只拿 fixture 跟它自己比，
+自洽但不反映现实。** 已改正。这条检查同时抓正反两个方向：注解引用不存在的标签，
+以及 fixture 编造发射端从不设置的标签。
+
+**两个空跑陷阱，已固化**
+
+1. `TestScenarioEvalTimesStayInsideTheirSeries` —— promtool 在序列最后一个样本之后几分钟就判 stale，
+   **在 `values:` 末尾之后求值会让规则因为「数据跑完了」而沉默**，`exp_alerts: []` 照样满足。
+   第一次验证 `for:` 场景是否为活断言时就踩了这个：拿 30m 去打一条到 20m 就结束的序列，
+   看到绿色，差点把一条死断言记成活的。
+2. `TestPendingScenariosEvaluateBeforeTheirForDuration` —— pending 场景的全部主张就是
+   `eval_time` 落在 `for:` 窗口内；有人缩短了 `for:`，它会悄悄退化成一条恰好通过的 firing 测试。
+
+**不引入 Prometheus 依赖**：时长解析用 `time.ParseDuration`，规则文件只用到 `m`/`h`。
+写成 `1d` 会在这里响亮地失败而不是被误读。
+
+**现状**：47 个场景、28 条规则全覆盖，`for:` 方向 9 条有实测、7 条有书面理由。
+
+**反向校验（四条守卫逐条验）**：注解引用不存在的标签、场景求值越过序列末尾、
+缩短某规则的 `for:`、新增一条带 `for:` 但无场景无理由的规则——四条各自 FAIL 并指名问题；
+还原后全绿。
+
+**仍未覆盖**：注解**渲染后的文本**本身（只验了标签引用的存在性）。
+要验文本就得把多段式 description 抄进 fixture，代价大于收益，已如此判定。
 
 ---
 
