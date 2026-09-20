@@ -106,24 +106,50 @@ func BuildPlan(snapshot SourceSnapshot) (Plan, error) {
 					account.Profile.Proxy = proxy
 					account.Profile.Metadata["source_proxy"] = proxy
 				}
-				capabilities, manualReview := parseModels(channel.Models)
+				capabilities, modelsUnparsed := parseModels(channel.Models)
 				account.Capabilities = capabilities
 				conversion := map[string]any{"source_channel_id": channel.ID, "key_index": keyIndex, "auth_mode": authMode}
-				if manualReview {
-					conversion["manual_review"] = true
-				}
 				if keyStatus, ok := keyStatuses[keyIndex]; ok {
 					account.Status, _ = mapStatus(keyStatus)
 					conversion["per_key_status"] = keyStatus
 				}
 				modelMapping := json.RawMessage(`{}`)
+				mappingInvalid := false
 				if strings.TrimSpace(channel.ModelMapping) != "" {
 					if !json.Valid([]byte(channel.ModelMapping)) {
-						conversion["manual_review"] = true
+						mappingInvalid = true
 						conversion["model_mapping_invalid"] = true
 					} else {
 						modelMapping = json.RawMessage(channel.ModelMapping)
 					}
+				}
+				// A18: an account whose capability set could not be read must not go
+				// live. Overview 6.1 says such a channel is parked for a human rather
+				// than dropped; until this existed the opposite happened -- it was
+				// imported active with a nil Capabilities slice, and supports() in
+				// internal/gateway/chooser.go reads an empty capability set as
+				// "matches every model". The one account nobody could describe became
+				// the most permissive account in the pool.
+				//
+				// Parked as disabled rather than a new status word: console and A9
+				// enumerate active/disabled, and console_accounts.go warns that a
+				// third leaves an account "neither schedulable nor visibly broken".
+				// control publishes only status=active, so this keeps it out of every
+				// snapshot. What separates it from a channel that was disabled
+				// upstream is recorded here and counted in the dry-run summary.
+				if modelsUnparsed || mappingInvalid {
+					reasons := make([]string, 0, 2)
+					if modelsUnparsed {
+						reasons = append(reasons, "models_unparsed")
+					}
+					if mappingInvalid {
+						reasons = append(reasons, "model_mapping_invalid")
+					}
+					conversion["manual_review"] = true
+					conversion["disabled_because"] = strings.Join(reasons, "+")
+					conversion["source_status"] = account.Status
+					account.Status = "disabled"
+					plan.Summary.ManualReviewCount++
 				}
 				raw := channelRawSummary(channel)
 				raw["key_index"] = keyIndex

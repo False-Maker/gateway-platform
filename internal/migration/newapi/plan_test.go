@@ -253,6 +253,78 @@ func TestBuildPlanMarksInvalidModelDataForReview(t *testing.T) {
 	}
 }
 
+// A18: the flag above is not enough on its own. An account whose model list
+// could not be read must also be kept out of the pool, because gateway reads
+// an empty capability set as "matches every model" -- so before this, the
+// channel nobody could describe was schedulable for everything.
+func TestBuildPlanParksUnreadableCapabilitiesInsteadOfWideningThem(t *testing.T) {
+	cases := map[string]struct {
+		channel SourceChannel
+		reason  string
+	}{
+		"models is an object": {
+			SourceChannel{ID: 1, Type: 14, Key: "key", Status: 1, Models: "{"},
+			"models_unparsed",
+		},
+		"model mapping is not json": {
+			SourceChannel{ID: 2, Type: 14, Key: "key", Status: 1, Models: "gpt-4", ModelMapping: "not-json"},
+			"model_mapping_invalid",
+		},
+		"both": {
+			SourceChannel{ID: 3, Type: 14, Key: "key", Status: 1, Models: "{", ModelMapping: "not-json"},
+			"models_unparsed+model_mapping_invalid",
+		},
+	}
+	for name, test := range cases {
+		t.Run(name, func(t *testing.T) {
+			plan, err := BuildPlan(SourceSnapshot{Channels: []SourceChannel{test.channel}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(plan.Accounts) != 1 {
+				t.Fatalf("want the account kept, not dropped; got %d", len(plan.Accounts))
+			}
+			account := plan.Accounts[0]
+			// The load-bearing assertion: control only publishes status='active',
+			// so anything else keeps this account out of every snapshot.
+			if account.Account.Status != "disabled" {
+				t.Errorf("status = %q, want disabled; an active account with no capabilities matches every model",
+					account.Account.Status)
+			}
+			if account.Conversion["disabled_because"] != test.reason {
+				t.Errorf("disabled_because = %v, want %q", account.Conversion["disabled_because"], test.reason)
+			}
+			// Why it was parked must survive, or it is indistinguishable from a
+			// channel that was simply disabled upstream.
+			if account.Conversion["source_status"] != "active" {
+				t.Errorf("source_status = %v, want the pre-parking active", account.Conversion["source_status"])
+			}
+			if plan.Summary.ManualReviewCount != 1 {
+				t.Errorf("ManualReviewCount = %d, want 1; a dry-run has to show these",
+					plan.Summary.ManualReviewCount)
+			}
+		})
+	}
+}
+
+// The parking must not fire for channels whose models simply were not listed.
+// An empty model list is how an apikey channel says "no restriction", and
+// turning that into a disabled account would break every such migration.
+func TestBuildPlanLeavesUnrestrictedChannelsAlone(t *testing.T) {
+	plan, err := BuildPlan(SourceSnapshot{Channels: []SourceChannel{
+		{ID: 1, Type: 14, Key: "key", Status: 1, Models: ""},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Accounts) != 1 || plan.Accounts[0].Account.Status != "active" {
+		t.Fatalf("an unlisted model set must stay active: %#v", plan.Accounts)
+	}
+	if plan.Summary.ManualReviewCount != 0 {
+		t.Errorf("ManualReviewCount = %d, want 0", plan.Summary.ManualReviewCount)
+	}
+}
+
 func TestBuildPlanReportsDuplicateSourceKeys(t *testing.T) {
 	plan, err := BuildPlan(SourceSnapshot{Channels: []SourceChannel{
 		{ID: 1, Type: 14, Key: "same-key", Status: 1},

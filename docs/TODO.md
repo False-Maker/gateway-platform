@@ -732,7 +732,7 @@ gateway 恰好实现这两个（`tlsprofile.go:37-38`）。但**没有任何测�
 
 ### A18 `[no-cred]` 迁移的「待人工确认」是没人读的布尔，账号反以无能力限制上线
 
-**状态：未开始（2026-09-20 第六次复盘发现）。P1。**
+**状态：已完成（2026-09-20）。** 证据见 `docs/EVIDENCE.md` 同名小节。
 
 总览 §6.1:236：「`channels.models` / model mapping → `accounts` 能力集合 →
 **未识别模型不丢弃账号，写入待人工确认状态**」。
@@ -749,8 +749,23 @@ gateway 恰好实现这两个（`tlsprofile.go:37-38`）。但**没有任何测�
 限定：生产迁移是独立上线闸门、尚未执行，**今天没有实际损害**；但 A5/A11 已完成，迁移是既定路径。
 TODO 零命中：`人工确认` 仅 1 处且是 B4 钱包 adjustment。
 
-**DoD**：`manual_review` 必须有生产消费方——或把账号落为非 `active` 的待确认状态，
-或至少进 `Summary` 计数使 dry-run 可见。不得让"解析失败"等价于"无限制"。
+**DoD（交付情况）**
+- ✅ 解析失败（`models` 不可解析 或 `model_mapping` 非法）的账号落 `status="disabled"`，
+  不进快照（control 只发布 `status='active'`），**不再等价于"无限制"**。
+- ✅ 留证：`conversion` 记 `manual_review` / `disabled_because`
+  （`models_unparsed` / `model_mapping_invalid` / 两者 `+` 连接）/ `source_status`（停放前的原状态），
+  否则与"源渠道本来就禁用"无法区分。
+- ✅ dry-run 可见：新增 `Summary.ManualReviewCount`。
+- ✅ 运营转正走既有 `POST /v1/accounts/{id}/status` → `active`（强制 reason、已审计）。
+- ✅ 反向保护：**空模型列表必须保持 `active`**——那是 apikey 渠道表达"无限制"的方式，
+  把它也停放会打断每一次此类迁移。已由 `TestBuildPlanLeavesUnrestrictedChannelsAlone` 锁住。
+
+**状态词汇的选择（有意，非疏忽）**
+停放用既有的 `disabled` 而不是新造 `manual_review` 状态：`console_accounts.go:61-63` 明确警告
+「发明一个快照查询与 A9 release 处理器从未听说过的状态，会让账号既不可调度也不显式可见地坏掉」，
+且控制台改状态端点只接受 `active` / `disabled`（`:79`）。新增第三个状态需同步白名单、
+health 转移与两份设计文档的状态词汇表——**代价大于收益**，区分信息放在迁移记录上即可。
+代价：`accounts` 表上与"源渠道本来就禁用"看起来一样，靠 `conversion.source_status` 区分。
 
 ---
 

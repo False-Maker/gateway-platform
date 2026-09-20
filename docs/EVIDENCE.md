@@ -7,6 +7,43 @@
 > 阅读规则：本文的每一条都是**对已发生事实的描述**。不要从本文推断"项目是否可以继续开发"——
 > 那个问题由 `docs/TODO.md` 和 `AGENTS.md` §0 回答。
 
+## A18 迁移「待人工确认」落地：解析失败不再等价于无限制（2026-09-20）
+
+**缺陷**：总览 §6.1:236 要求「未识别模型不丢弃账号，写入待人工确认状态」。
+实际上 `manual_review` 只是写进 `conversion` JSON 的一个布尔，**零生产读取方**
+（2 个写入点 + 1 处测试断言），`account.Status` 完全没被改动，照常以 `active` 入库。
+而 `chooser.go` 的 `supports()` 把**空能力集读作"匹配任意模型"**——
+于是「模型列表没解析出来」的账号成了池子里**最宽松**的账号。方向是反的。
+
+**改动**（`internal/migration/newapi/plan.go` / `types.go`）
+- `models` 不可解析 或 `model_mapping` 非法 → `account.Status = "disabled"`。
+  control 只发布 `status='active'`（`snapshot_loop.go:77`），所以它不进任何快照。
+- 留证：`conversion` 记 `manual_review`、`disabled_because`
+  （`models_unparsed` / `model_mapping_invalid` / 两者 `+` 连接）、
+  `source_status`（停放前的原状态）——否则与「源渠道本来就禁用」无法区分。
+- 新增 `Summary.ManualReviewCount`，使 dry-run 在导入前就能看见。
+- 停放判定移到 per-key status 之后，因此**停放优先于 per-key 的 active**。
+
+**状态词汇的选择（有意）**
+用既有的 `disabled` 而非新造 `manual_review`：`console_accounts.go:61-63` 明确警告
+「发明一个快照查询与 A9 release 处理器从未听说过的状态，会让账号既不可调度也不显式可见地坏掉」，
+控制台改状态端点也只接受 `active`/`disabled`。运营转正走既有的
+`POST /v1/accounts/{id}/status`（强制 reason、写 `account_actions` 审计）。
+**代价已知并记录**：`accounts` 表上与"源渠道本来就禁用"看起来一样，靠 `conversion.source_status` 区分。
+
+**本轮执行并通过（真实 PG/Redis/ClickHouse）**
+- `go test -count=1 -p 1 ./...` 24 个包全过；`go build`、`go vet`、`gofmt` 干净。
+- 新增 `TestBuildPlanParksUnreadableCapabilitiesInsteadOfWideningThem`（三子例：
+  models 是对象、model_mapping 非 JSON、两者同时），逐例断言 `status=="disabled"`、
+  `disabled_because` 取值正确、`source_status` 保留、`ManualReviewCount==1`。
+- **反向保护**：`TestBuildPlanLeavesUnrestrictedChannelsAlone` 锁住「空模型列表保持 `active`」——
+  那是 apikey 渠道表达"无限制"的方式，误停放会打断每一次此类迁移。
+  没有这条，本次修复本身就会变成一个更大的回归。
+
+**未验证**
+- 未对真实 new-api 库执行迁移（属上线闸门，且 `GATEWAY_NEW_API_DATABASE_URL` 未指向真实库）。
+  本条只交付转换逻辑与本地 fixture 验证。
+
 ## A15 的丢钱路径修复：重放误判（F1/F2/F3，2026-09-20）
 
 **这是 A15 交付几小时后由第六次复盘的对抗性代码复核发现的，缺陷由我引入。**

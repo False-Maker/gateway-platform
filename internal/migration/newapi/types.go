@@ -153,16 +153,22 @@ type Plan struct {
 }
 
 type Summary struct {
-	SourceSystem        string         `json:"source_system"`
-	SourceSnapshotAt    time.Time      `json:"source_snapshot_at"`
-	SourceDigest        string         `json:"source_digest"`
-	RecordCount         int            `json:"record_count"`
-	AccountCount        int            `json:"account_count"`
-	TenantCount         int            `json:"tenant_count"`
-	PrincipalCount      int            `json:"principal_count"`
-	TenantTokenCount    int            `json:"tenant_token_count"`
-	ImportedCount       int            `json:"imported_count"`
-	RejectedCount       int            `json:"rejected_count"`
+	SourceSystem     string    `json:"source_system"`
+	SourceSnapshotAt time.Time `json:"source_snapshot_at"`
+	SourceDigest     string    `json:"source_digest"`
+	RecordCount      int       `json:"record_count"`
+	AccountCount     int       `json:"account_count"`
+	TenantCount      int       `json:"tenant_count"`
+	PrincipalCount   int       `json:"principal_count"`
+	TenantTokenCount int       `json:"tenant_token_count"`
+	ImportedCount    int       `json:"imported_count"`
+	RejectedCount    int       `json:"rejected_count"`
+	// ManualReviewCount is how many accounts were parked as `disabled` because
+	// their capability set could not be read (A18). They are imported, not
+	// rejected, and a human has to confirm them before they can serve traffic
+	// -- so a dry-run has to show them, or the operator finds out only when a
+	// migrated channel silently serves nothing.
+	ManualReviewCount   int            `json:"manual_review_count"`
 	ProviderCounts      map[string]int `json:"provider_counts"`
 	StatusCounts        map[string]int `json:"status_counts"`
 	UnknownChannelTypes map[string]int `json:"unknown_channel_types"`
