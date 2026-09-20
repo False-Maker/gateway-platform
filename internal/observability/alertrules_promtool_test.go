@@ -343,6 +343,24 @@ func promtoolScenarios() []scenario {
 			wantValue:  "7200",
 		},
 		{
+			name:  "A27_reconciliation_not_running_is_silent_while_its_gauge_has_never_been_published",
+			claim: "A27 的缺陷本体：对账的所有 gauge 都只在一次**成功**运行之后才写，在那之前序列不存在，time() 减一个缺失的序列得到空向量。于是这条看门狗在它唯一该管的状态——\"对账从来没跑起来过\"——上完全沉默。跑到 3 小时仍然无结果。ReconciliationLoop.PrimeMetrics 在启动时把它种上进程启动时刻，就是为了这个",
+			series: []inputSeries{
+				{selector: `control_billing_held_rows{usage_source="missing"}`, values: `0+0x200`},
+			},
+			alert:    "BillingReconciliationNotRunning",
+			evalTime: "3h",
+		},
+		{
+			name:  "A27_reconciliation_unbalanced_is_silent_while_its_gauge_has_never_been_published",
+			claim: "同一形状，且这条是 critical。balanced 有意**不**预置：种 1 等于断言一本从没核过的账是平的，种 0 等于每次启动都报 critical。它的缺失由 BillingReconciliationNotRunning 的时间戳兜底——这个依赖已写进该规则的 threshold_source",
+			series: []inputSeries{
+				{selector: `control_billing_held_rows{usage_source="missing"}`, values: `0+0x200`},
+			},
+			alert:    "BillingReconciliationUnbalanced",
+			evalTime: "3h",
+		},
+		{
 			name:  "detail_write_failing_fires",
 			claim: "明细持续写入失败时触发（for=10m，目标就是“持续”）",
 			series: []inputSeries{

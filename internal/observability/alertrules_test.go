@@ -167,7 +167,7 @@ func TestEveryRuleDocumentsItsThreshold(t *testing.T) {
 // So the scope is now every emitted metric -- there is no family to get wrong.
 var knownUnconsumedMetrics = map[string]string{
 	// 计费与控制台（A16 起的既有条目）
-	"control_billing_reconcile_runs_total":     "对账是否在跑由 control_billing_reconcile_last_success_seconds 告警（BillingReconciliationNotRunning），这个计数器是看板用量",
+	"control_billing_reconcile_runs_total":     "对账是否在跑由 control_billing_reconcile_last_success_seconds 告警（BillingReconciliationNotRunning），这个计数器是看板用量。A27 补充：该豁免依赖那个 gauge 在进程启动时被 ReconciliationLoop.PrimeMetrics 种上——在 A27 之前它只在一次成功对账后才存在，于是持续失败（runs_total{result=\"error\"} 在涨）的进程两边都看不见",
 	"control_billing_reconcile_unsettled_rows": "未结算行按状态分别告警（held / unpriced 两条规则），这是聚合值，看板用",
 	"control_console_held_resolved_total":      "裁定本身是正常运营动作；有收入后果的那一半由 ConsoleHeldUnpricedResolution 覆盖",
 	"control_console_price_total":              "录入单价是配置动作，只向未来生效且不可改价，无失败后果需要告警",

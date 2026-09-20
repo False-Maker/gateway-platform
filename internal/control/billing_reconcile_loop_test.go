@@ -6,9 +6,12 @@ import (
 	"go/parser"
 	"go/token"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/elucid/gateway-platform/internal/observability"
 )
 
 // reconciliationKinds decides which gauges exist. If a new Discrepancy* kind is
@@ -110,4 +113,46 @@ func TestReconciliationDefaultsOverlapAndClearTheBillingWindow(t *testing.T) {
 	if reconcileWindow <= reconcileRunInterval {
 		t.Errorf("reconcileWindow %s must exceed reconcileRunInterval %s so consecutive runs overlap", reconcileWindow, reconcileRunInterval)
 	}
+}
+
+// A27: BillingReconciliationNotRunning reads a gauge that publish() only writes
+// after a successful run, and a rule whose operand is missing produces no
+// result. Measured with promtool: three hours in, with the gauge never
+// published, the watchdog reports nothing -- silent in the one state it exists
+// to catch. This pins the seed that closes it.
+func TestPrimeMetricsSeedsTheLastSuccessGaugeBeforeAnyRun(t *testing.T) {
+	metrics := observability.NewRegistry()
+	loop := ReconciliationLoop{Metrics: metrics}
+	start := time.Date(2026, 9, 21, 10, 0, 0, 0, time.UTC)
+
+	// Without this the assertions below could pass on a gauge some other code
+	// had already written.
+	if before := scrape(t, metrics); strings.Contains(before, "control_billing_reconcile_last_success_seconds") {
+		t.Fatalf("the gauge existed before priming: %s", before)
+	}
+
+	loop.PrimeMetrics(start)
+	primed := scrape(t, metrics)
+	// The registry exposes values with %g, so a large unix timestamp comes out
+	// in scientific notation. Match what is actually served rather than what a
+	// decimal formatter would produce.
+	want := "control_billing_reconcile_last_success_seconds " + strconv.FormatFloat(float64(start.Unix()), 'g', -1, 64)
+	if !strings.Contains(primed, want) {
+		t.Errorf("missing seeded gauge %q; got:\n%s", want, primed)
+	}
+
+	// Process start, not the epoch: at the epoch the alert would be true from
+	// boot and fire on every restart before the first tick could clear it.
+	if strings.Contains(primed, "control_billing_reconcile_last_success_seconds 0\n") {
+		t.Error("the gauge was seeded at the epoch, which fires the alert on every start")
+	}
+
+	// A real run must still move it forward.
+	loop.publish(ReconciliationRunResult{Balanced: true, Discrepancies: map[string]int{}})
+	if after := scrape(t, metrics); strings.Contains(after, want) {
+		t.Errorf("a successful run did not refresh the gauge past the seed; got:\n%s", after)
+	}
+
+	// Metrics is optional on this struct, so priming must be a no-op, not a panic.
+	ReconciliationLoop{}.PrimeMetrics(start)
 }

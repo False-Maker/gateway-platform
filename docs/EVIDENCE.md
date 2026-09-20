@@ -7,6 +7,74 @@
 > 阅读规则：本文的每一条都是**对已发生事实的描述**。不要从本文推断"项目是否可以继续开发"——
 > 那个问题由 `docs/TODO.md` 和 `AGENTS.md` §0 回答。
 
+## A27 对账看门狗查不出「从来没跑起来过」（2026-09-21）
+
+**发现方式**：A26 为 `BillingReconciliationUnbalanced` 写场景时注意到它是 `== 0` 而非 `> 0`，
+与 A23 的 StreamPendingStuck 同形状；顺着查发现问题比那条更重。
+**这是 A25/A26 那套装置产出的第一个真缺口，不是对已知问题的复述。**
+
+**缺陷**：`ReconciliationLoop` 发布的每一个 gauge 都写在 `publish()` 里，
+而 `publish()` 只在一次**成功**对账之后才执行（`billing_reconcile_loop.go:101`）。
+在那之前序列不存在，操作数缺失的规则不产生任何结果：
+
+- `BillingReconciliationNotRunning`（warning）：`time() - 缺失序列` → 空向量 → 沉默。
+  **这条规则的全部职责就是发现对账没在跑，而它查不出「从来没跑起来过」。**
+- `BillingReconciliationUnbalanced`（critical）：`== 0`，同样沉默。
+
+**promtool 实测**（先于修复做的）：
+
+```
+alert_rule_test @ 3h，两条规则 exp_alerts: []  → SUCCESS
+```
+
+跑到 3 小时，两条规则都无结果。
+
+**三件加重它的事**
+
+1. `reconcileRunInterval = 15m`，且**启动时没有首跑**（不像 `snapshotLoop` / `tokenLoop`
+   在 `run.go` 里都有一次 initial RunOnce），第一次成功最早在 T+15m。
+2. `RunOnce` 的两条错误路径都到不了 `publish()`：查询失败只记
+   `runs_total{result="error"}`（`:88`）；**lag 配置错误（`:78`）连那个计数器都不记**，直接返回。
+3. `control_billing_reconcile_runs_total` 的豁免理由写的是「对账是否在跑由
+   `last_success_seconds` 告警」——**在本条之前这个理由是假的**：持续失败的进程里
+   error 计数器在涨却无人消费，它指望的那条告警又是沉默的，两边都看不见。
+
+**改动**
+
+- `ReconciliationLoop.PrimeMetrics(now)`：把 `last_success_seconds` 种为**进程启动时刻**；
+  `run.go` 在构造后立即调用。
+  **不种 epoch**——种 epoch 会让告警从开机起为真、在首个 tick 清掉它之前就误报。
+  种启动时刻给告警一个恰好等于自身阈值的宽限期：从未成功对账的进程 1 小时后告警，
+  正常启动不误报。该值是「没有比本进程更早的成功」的代理。
+- **`balanced` 有意不预置**：种 1 等于断言一本从没核过的账是平的，种 0 等于每次启动报 critical。
+  改由上面的时间戳兜底，该依赖已写进 `BillingReconciliationUnbalanced` 的 `threshold_source`。
+- 两条规则的 `threshold_source` 补记失效机制与实测结果；
+  `knownUnconsumedMetrics` 里 `runs_total` 的豁免理由更新为「依赖这次预置」。
+
+**本轮执行并通过**
+
+```
+gofmt -l internal/  → 无输出
+go build ./...      → build OK
+go vet ./internal/... → vet OK
+go test ./internal/control/ -run TestPrimeMetricsSeedsTheLastSuccess -v
+  --- PASS: TestPrimeMetricsSeedsTheLastSuccessGaugeBeforeAnyRun
+go test ./...                                          → 24 包 ok
+GATEWAY_TEST_PROMTOOL_IMAGE=prom/prometheus:latest go test ./...  → 24 包 ok（38 场景全跑）
+```
+
+**测试里最要紧的四条断言**：预置前该 gauge 不得存在（防空跑）；种子值正确；
+**种子不得是 epoch**（否则每次重启误报）；一次真实运行必须把它推到种子之后
+（否则预置会掩盖"对账其实没在更新"）。
+
+**反向校验**：去掉 `PrimeMetrics` 里的 `SetGauge` → 单元测试 FAIL 并指名缺失的 gauge；还原后转绿。
+
+**一处与实现相关的细节**：`observability.Registry` 用 `%g` 输出，
+大的 unix 时间戳会写成 `1.7899848e+09`。断言按实际服务的文本写，不按十进制格式化器的产物写。
+
+**未处理**：`RunOnce` 在 lag 配置错误时连 `runs_total{result="error"}` 都不记（`:78`）。
+本条只保证「从未成功」可见，没有让那条早退路径本身可观测。
+
 ## A26 补完全部 28 条规则的 promtool 场景（2026-09-21）
 
 **缺口**：A25 只覆盖了 A21–A24 动过或新增的 6 条告警。其余 22 条共享同样的

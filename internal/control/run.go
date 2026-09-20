@@ -174,6 +174,11 @@ func Run(cfg Config) error {
 	// it on a schedule, so "the books do not balance" stayed a question someone
 	// had to think to ask. This is the periodic consumer; it is read-only.
 	reconcileLoop := ReconciliationLoop{Reconciliation: Reconciliation{DB: db}, Metrics: observability.Default}
+	// A27: the first tick is reconcileRunInterval away and every gauge this
+	// loop publishes only appears after a successful run, so without this the
+	// "reconciliation is not running" watchdog cannot see "it never started".
+	// See ReconciliationLoop.PrimeMetrics.
+	reconcileLoop.PrimeMetrics(time.Now())
 	reconcileTicker := time.NewTicker(reconcileRunInterval)
 	defer reconcileTicker.Stop()
 	ticker := time.NewTicker(time.Second)

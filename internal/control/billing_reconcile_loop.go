@@ -103,6 +103,39 @@ func (l ReconciliationLoop) RunOnce(ctx context.Context, now time.Time) (Reconci
 	return result, nil
 }
 
+// PrimeMetrics gives BillingReconciliationNotRunning something to read before
+// the first run has happened.
+//
+// A27: every gauge this loop publishes is written inside publish(), which only
+// runs after a *successful* reconciliation. Until then the series do not exist,
+// and a rule whose operand is missing produces no result at all -- so the
+// watchdog for "reconciliation is not running" was silent in the one state it
+// exists to catch, "reconciliation has never run". Measured with promtool: at
+// three hours in, with the gauges never published, both
+// BillingReconciliationNotRunning and BillingReconciliationUnbalanced report
+// nothing. The loop's own first tick is reconcileRunInterval after start, and
+// the two error paths in RunOnce (a lag misconfiguration, and a failing query)
+// never reach publish at all.
+//
+// Seeding the timestamp with process start rather than the epoch is deliberate:
+// at the epoch the alert would be true from boot and fire on every restart
+// before the first tick could clear it. Process start gives the alert a grace
+// period exactly equal to its own threshold -- it goes off an hour after a
+// process that has never reconciled successfully, and never during a normal
+// start. The value is a proxy for "no success is older than this process", not
+// a claim that a run succeeded at boot.
+//
+// `balanced` is deliberately not primed: seeding it 1 would assert books that
+// were never checked, and seeding it 0 would fire a critical alert on every
+// start. Its absence is covered by this timestamp instead, which is recorded in
+// that rule's threshold_source.
+func (l ReconciliationLoop) PrimeMetrics(now time.Time) {
+	if l.Metrics == nil {
+		return
+	}
+	l.Metrics.SetGauge("control_billing_reconcile_last_success_seconds", float64(now.Unix()))
+}
+
 // publish reports every discrepancy kind on every run, including the kinds
 // that found nothing.
 //

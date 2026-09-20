@@ -124,6 +124,8 @@
 > A25 补上 promtool 规则测试装置，A26 把它扩到**全部 28 条规则**，并加了
 > "每条新规则必须有场景"的结构性门禁（该门禁不需要 promtool，任何环境都跑）。
 > 剩余空白：`for:` 时长与注解模板渲染未覆盖。
+> A26 补场景的过程中发现并修掉了 **A27**（对账看门狗查不出"从来没跑起来过"）——
+> 这是新装置产出的第一个真缺口，而不是对已知问题的复述。
 > §C 全部 `[live-gate]`，§D 为部署边界（D1 已完成）。
 > A12/E1/E2 不阻塞 B4，可并行取。P4（B4）在 A11 之前不进入编码——迁移来的用户还停在 staging，没有可扣费主体。
 
@@ -1148,6 +1150,57 @@ A22 曾把 8 条规则判为"只丢首次增量、可容忍"，并在更正里�
 - 往规则文件里加一条没有场景的规则 → `TestEveryAlertHasAPromtoolScenario` FAIL 并指名它。
 - 把某条正向场景的期望值改错 → 对应场景 FAIL。
 - 还原后全绿。
+
+---
+
+### A27 `[no-cred]` 对账看门狗查不出「从来没跑起来过」
+
+**状态：已完成（2026-09-21，A26 补场景时顺带发现）。P1——critical + warning 两条规则同时失效。**
+证据见 `docs/EVIDENCE.md` 同名小节。
+
+`ReconciliationLoop` 发布的**每一个 gauge 都写在 `publish()` 里，而 `publish()` 只在一次
+成功对账之后才执行**（`billing_reconcile_loop.go:101`）。在那之前序列不存在，
+而操作数缺失的规则不产生任何结果。于是：
+
+- `BillingReconciliationNotRunning`（warning）：`time() - 缺失序列` → 空向量 → 沉默。
+  **这条规则的全部职责就是发现对账没在跑，而它查不出「从来没跑起来过」。**
+- `BillingReconciliationUnbalanced`（critical）：`== 0` 与 A23 的 StreamPendingStuck 同形状，
+  同样沉默。
+
+**promtool 实测**：跑到 **3 小时**，两条规则都无结果。
+
+加重这一点的三件事：
+
+1. 对账循环 `reconcileRunInterval = 15m`，且**启动时没有首跑**（不像 snapshotLoop / tokenLoop），
+   第一次成功最早在 T+15m。
+2. `RunOnce` 的两条错误路径都不到 `publish()`：查询失败只记
+   `runs_total{result="error"}`（`:88`）；而 lag 配置错误（`:78`）**连那个计数器都不记**，
+   直接返回错误。
+3. `control_billing_reconcile_runs_total` 在 `knownUnconsumedMetrics` 里的豁免理由是
+   「对账是否在跑由 `last_success_seconds` 告警」——**在本条之前那个理由是假的**：
+   一个持续失败的进程，error 计数器在涨却无人消费，而它指望的那条告警又是沉默的，两边都看不见。
+
+**改动**
+
+- ✅ 新增 `ReconciliationLoop.PrimeMetrics(now)`，把 `last_success_seconds` 种为**进程启动时刻**，
+  `run.go` 在构造 `reconcileLoop` 后立即调用。
+  **不种 epoch**：种 epoch 会让告警从开机起为真、在首个 tick 清掉它之前就误报。
+  种启动时刻给了告警一个恰好等于自身阈值的宽限期——从未成功对账的进程在 1 小时后告警，
+  正常启动不误报。该值是「没有比本进程更早的成功」的代理，不是「启动时成功过一次」的断言。
+- ✅ `balanced` **有意不预置**：种 1 等于断言一本从没核过的账是平的，
+  种 0 等于每次启动都报 critical。它的缺失改由上面那个时间戳兜底，
+  **这个依赖已写进 `BillingReconciliationUnbalanced` 的 `threshold_source`**。
+- ✅ 两条规则的 `threshold_source` 都补记了失效机制与实测结果。
+- ✅ 更新 `knownUnconsumedMetrics` 里 `runs_total` 的豁免理由，写明它依赖这次预置。
+- ✅ 新增 `TestPrimeMetricsSeedsTheLastSuccessGaugeBeforeAnyRun`（无需 docker）：
+  防空跑断言 + 种子值正确 + **不得是 epoch** + 一次真实运行必须把它推到种子之后。
+- ✅ 新增两个 promtool 反向场景，把「3 小时仍沉默」固定成绿色断言。
+
+**反向校验**：去掉 `PrimeMetrics` 里的那行 `SetGauge` → 单元测试 FAIL 并指名缺失的 gauge；
+还原后转绿。
+
+**未处理**：`RunOnce` 在 lag 配置错误时连 `runs_total{result="error"}` 都不记（`:78`）。
+本条只保证「从未成功」可见，没有让那条早退路径本身可观测。
 
 ---
 
