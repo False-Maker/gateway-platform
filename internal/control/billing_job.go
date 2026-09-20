@@ -356,12 +356,18 @@ func lineAmount(row billableRow, price ModelPrice) (*big.Rat, error) {
 	return total.Quo(total, new(big.Rat).SetInt64(price.UnitScale)), nil
 }
 
-// publishSignals exports the B4.3 buckets. The DoD requires `missing` usage to
-// be separately queryable and separately alertable, so the held backlog is a
-// gauge broken down by usage_source -- a rising `missing` gauge is lost revenue
-// on served requests, which is a different alert from a rising `unpriced`
-// count (our own pricing gap) and must not be summed with it.
-func (j BillingJob) publishSignals(ctx context.Context, result BillingRunResult) {
+// PrimeMetrics publishes the four B4.3 row counters at zero before the job has
+// ever run. A21: the registry creates a series on first AddCounter and the text
+// 0.0.4 exposition carries no _created, so a series born at N rather than 0
+// makes increase() -- last minus first inside the window -- permanently 0 for a
+// one-shot batch, and BillingUnpricedRows could never fire on exactly the case
+// D6 cares about (a new model shipped without a price). Priming at startup
+// rather than on the first completed run matters because RunOnce returns early
+// when the price table is empty, which is the deployment order that produces
+// that first unpriced batch.
+func (j BillingJob) PrimeMetrics() { j.publishRowCounts(BillingRunResult{}) }
+
+func (j BillingJob) publishRowCounts(result BillingRunResult) {
 	if j.Metrics == nil {
 		return
 	}
@@ -371,10 +377,21 @@ func (j BillingJob) publishSignals(ctx context.Context, result BillingRunResult)
 		"held":         result.RowsHeld,
 		"not_billable": result.RowsNotBillable,
 	} {
-		if rows > 0 {
-			j.Metrics.AddCounter("control_billing_rows_total", float64(rows), "state", state)
-		}
+		// Zeroes are published deliberately; see PrimeMetrics.
+		j.Metrics.AddCounter("control_billing_rows_total", float64(rows), "state", state)
 	}
+}
+
+// publishSignals exports the B4.3 buckets. The DoD requires `missing` usage to
+// be separately queryable and separately alertable, so the held backlog is a
+// gauge broken down by usage_source -- a rising `missing` gauge is lost revenue
+// on served requests, which is a different alert from a rising `unpriced`
+// count (our own pricing gap) and must not be summed with it.
+func (j BillingJob) publishSignals(ctx context.Context, result BillingRunResult) {
+	if j.Metrics == nil {
+		return
+	}
+	j.publishRowCounts(result)
 	if result.RowsUnknownClass > 0 {
 		// A class the policy table does not cover. Never expected to be
 		// non-zero; if it is, the policy is behind the contract.

@@ -7,6 +7,64 @@
 > 阅读规则：本文的每一条都是**对已发生事实的描述**。不要从本文推断"项目是否可以继续开发"——
 > 那个问题由 `docs/TODO.md` 和 `AGENTS.md` §0 回答。
 
+## A21 `increase()` 对惰性 counter 漏掉首次增量（2026-09-21）
+
+**缺陷**：A16 把 `BillingUnpricedRows`（`configs/alerts/gateway-platform.rules.yml:214`）
+作为「满足 B4-BILLING-MODEL D6『出现 unpriced 行即告警』」交付，但该规则**永远不可能对单批次
+unpriced 触发**。`internal/observability/metrics.go` 的 `Registry` 是进程内 map，序列在首次
+`AddCounter` 时才诞生，输出 text 0.0.4 无 `_created`；而发射点带 `if rows > 0` 守卫，
+于是序列**诞生即为 N、不是 0→N**。`increase()` 取窗口内 last−first，序列平在 N ⇒ 恒为 0。
+漏掉的恰是 D6 最想抓的「上新模型忘配价」的低流量形态。
+
+**改动**
+- `internal/control/billing_job.go`：把四个 state 的计数器发射抽成 `publishRowCounts`，
+  去掉 `rows > 0` 守卫；新增 `BillingJob.PrimeMetrics()` 发射四条 0。
+  `AddCounter("control_billing_rows_total", ...)` 的**字符串字面量保持在非测试源码里**——
+  `alertrules_test.go:54` 的 `emittedMetrics` 用正则扫源码，改成常量会让该指标从扫描结果里消失，
+  连带使 `TestAlertRulesOnlyReferenceEmittedMetrics` 与 `TestRequiredCoverageIsPresent` 失效。
+- `internal/control/run.go`：构造 `billingJob` 后、首次 tick 前调用 `PrimeMetrics()`。
+  **光去掉守卫不够**：`RunOnce` 在 `priceCount == 0` 时早退并绕过 `publishSignals`
+  （`billing_job.go:96-103`），而「价表刚装好、某模型漏配价」正是第一次完成的 run 就带 unpriced
+  的场景，那时序列仍会诞生即为 N。
+- `configs/alerts/gateway-platform.rules.yml:214`：`round(increase(...)) > 0`，
+  消去外推到窗口边界产生的小数条数（单次 +1 常算成 `1.0166…`），不改变触发条件。
+  `threshold_source` 补记：可触发性依赖启动预置；重启导致 `$value` 夸大属固有行为。
+
+**存量 gauge 方案被排除**：`unpriced` 是终态且永不清除（写入点只有 `billing_job.go:270` 与
+`console_held.go:322`，全仓无迁出语句，`usage_ledger` 无保留期清理，钱包 `adjustment` 不改行状态），
+`unpriced_rows > 0` 一旦点亮永不熄灭。与 `control_billing_held_rows`（托盘 `resolve` 可清回 0）
+不是一回事，不能照搬。
+
+**本轮执行并通过**
+
+```
+gofmt -l internal/        → 无输出
+go build ./...            → build OK
+go vet ./internal/control/... ./internal/observability/...  → vet OK
+go test ./internal/control/ -run TestPrimeMetrics -v
+  --- PASS: TestPrimeMetricsCreatesZeroSeriesForEveryBillingState (0.00s)
+go test ./internal/observability/  → ok
+go test ./...             → 24 个包全部 ok（真实 PG/Redis/ClickHouse）
+```
+
+**反向校验（确认断言是活的）**：把 `publishRowCounts` 里的 `if rows > 0` 守卫改回去，
+`TestPrimeMetricsCreatesZeroSeriesForEveryBillingState` FAIL（报四条 0 序列缺失、
+且只发布 unpriced 时其余三条也消失）；还原后转绿，`git diff --stat` 确认文件已复原。
+
+测试的首条断言是**预置前 registry 里不得出现 `control_billing_rows_total`**——
+没有这条，后面「四条序列都在且为 0」可能什么都没证明。
+
+**免责边界（本条未能实证）**：`increase()` 在真实 Prometheus 上对「0→3 后平稳」序列返回 3。
+仓库没有 promtool/Prometheus 测试装置——`alertrules_test.go:14-17` 明确说这组测试是 promtool 的
+无 Docker 替代品、不求值 PromQL。**本次交付的保证止于「序列从 0 开始」这一前提条件**，
+PromQL 求值本身依据 Prometheus 文档语义，未做实证。
+
+**有意不做**：进程重启后 Prometheus 按 counter reset 补值导致 `$value` 夸大。
+文本 0.0.4 无 `_created`，在当前指标端点形状下无法解决。
+
+**范围外（已立 A22）**：`rules.yml` 里 `increase(...)` 共 15 处，本条只修了 `:214`。
+其余 14 条共享同一漏报形状，含同一函数下方 4 行的 `control_billing_unknown_usage_class_total`（`:251`）。
+
 ## A19 迁移 staging 的 `reconciled` 状态（2026-09-20）
 
 **缺陷**：keyhive §4:126 与总览 §6.1:225 都要求 `imported / reconciled / rolled_back` 三态，

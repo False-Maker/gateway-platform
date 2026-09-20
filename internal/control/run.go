@@ -157,6 +157,9 @@ func Run(cfg Config) error {
 		log.Printf("control initial token publish failed: %v", err)
 	}
 	billingJob := BillingJob{DB: db, Metrics: observability.Default}
+	// A21: the row counters must exist at zero before the first run, or a
+	// single unpriced batch is invisible to increase(). See PrimeMetrics.
+	billingJob.PrimeMetrics()
 	billingTicker := time.NewTicker(billingRunInterval)
 	defer billingTicker.Stop()
 	// B4.5 shipped the algorithm and B5 an on-demand endpoint, but nothing ran

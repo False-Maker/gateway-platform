@@ -2,8 +2,10 @@ package control
 
 import (
 	"math/big"
+	"strings"
 	"testing"
 
+	"github.com/elucid/gateway-platform/internal/observability"
 	"github.com/elucid/gateway-platform/pkg/contracts"
 )
 
@@ -72,3 +74,48 @@ func TestLineAmountRejectsUnusablePricesAndCounts(t *testing.T) {
 
 // The UsageSource policy this job used to hard-code as a single narrow
 // constant now lives in billing_policy.go and is tested there.
+
+// A21: increase() is last-minus-first inside the window, so a series that is
+// born at N instead of 0 makes a one-shot unpriced batch permanently invisible
+// to BillingUnpricedRows -- the exact case B4-BILLING-MODEL D6 asks to alert on.
+// The guarantee this test pins is the precondition for that rule: the four row
+// series exist at zero before anything has been billed.
+func TestPrimeMetricsCreatesZeroSeriesForEveryBillingState(t *testing.T) {
+	metrics := observability.NewRegistry()
+	job := BillingJob{Metrics: metrics}
+
+	// Guard against an empty assertion: if the series already existed here,
+	// everything below would pass without proving that priming does anything.
+	if before := scrape(t, metrics); strings.Contains(before, "control_billing_rows_total") {
+		t.Fatalf("the registry already carried the row counters before priming: %s", before)
+	}
+
+	job.PrimeMetrics()
+	primed := scrape(t, metrics)
+	// All four, not just unpriced: the `rows > 0` guard suppressed the whole
+	// map, and every one of these states is read by a rule or a dashboard.
+	for _, state := range []string{"billed", "unpriced", "held", "not_billable"} {
+		want := `control_billing_rows_total{state="` + state + `"} 0`
+		if !strings.Contains(primed, want) {
+			t.Errorf("missing primed series %s; got:\n%s", want, primed)
+		}
+	}
+
+	// The transition a zero-start buys: 0 -> 3 is what increase() can see.
+	job.publishRowCounts(BillingRunResult{RowsUnpriced: 3})
+	after := scrape(t, metrics)
+	if !strings.Contains(after, `control_billing_rows_total{state="unpriced"} 3`) {
+		t.Errorf("unpriced did not advance to 3; got:\n%s", after)
+	}
+	// The other three must not be dragged along by the shared metric name.
+	for _, state := range []string{"billed", "held", "not_billable"} {
+		want := `control_billing_rows_total{state="` + state + `"} 0`
+		if !strings.Contains(after, want) {
+			t.Errorf("%s moved when only unpriced was published; got:\n%s", state, after)
+		}
+	}
+
+	// Metrics is optional on this struct (every integration test builds the job
+	// without one), so priming must stay a no-op rather than panic.
+	BillingJob{}.PrimeMetrics()
+}

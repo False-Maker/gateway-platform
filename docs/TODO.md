@@ -108,8 +108,8 @@
 > - **F2（已修）**：跨租户 id 碰撞返回不可诊断的 500，应为 409。
 > - **F3（已修）**：A15 新增的两个指标零消费方——**正是 A16 声称要堵的洞，在同一批提交里又开了一个**，
 >   而 `_replayed_total` 恰恰是 F1 的唯一可观测信号。根因是 A16 的 pin 是**手写表、没有自动性**。
-> - **A20（F4，未做）**、**A21（F7，未做）**：见下方条目。
-> - **A17 / A18 / A19（未做）**：见下方条目。
+> - **A20（F4）、A21（F7）**：均已完成，见下方条目。A21 的修复同时暴露出 **A22**（同形状规则的系统性漏报）。
+> - **A17 / A18 / A19**：均已完成，见下方条目。
 >
 > **本次最值得记住的**：A16 刚刚补完「指标没有消费方」的反向校验，**下一个提交就又犯了同一件事**。
 > 手写清单不是机制。本轮把它改成了按指标族自动校验（`TestMoneyMetricsHaveAConsumer`），
@@ -117,7 +117,8 @@
 > 同理，「绿的断言未必是活的断言」在本轮再次应验——F1 能存在，正是因为 A15 的测试**全部止于 400/503**，
 > 没有一条覆盖 err 分支。
 >
-> **下一步**：A18（迁移能力集反转）优先，其余按 A17/A19/A20/A21 取。
+> **下一步**：第六次复盘条目（A17–A21）已全部收口。剩余新条目是 **A22**（15 条
+> `increase(惰性 counter)` 规则共享同一漏报形状，A21 只修了其中一条），P2。
 > §C 全部 `[live-gate]`，§D 为部署边界（D1 已完成）。
 > A12/E1/E2 不阻塞 B4，可并行取。P4（B4）在 A11 之前不进入编码——迁移来的用户还停在 staging，没有可扣费主体。
 
@@ -831,7 +832,8 @@ TODO 零命中：`rolled_back` 0 处。
 
 ### A21 `[no-cred]` `increase()` 对惰性 counter 漏掉首次增量
 
-**状态：未开始（2026-09-20 第六次复盘发现，原 F7）。P2，需先定方案。**
+**状态：已完成（2026-09-21）。** 证据见 `docs/EVIDENCE.md` 同名小节。
+**只修了 `control_billing_rows_total` 一个指标**；同形状的其余 14 条规则另立 A22。
 
 `BillingUnpricedRows`（A16）用 `increase(control_billing_rows_total{state="unpriced"}[1h]) > 0`。
 发射点 `billing_job.go:373` 有 `if rows > 0` 守卫，`observability` 的 Registry 是进程内 map，
@@ -848,8 +850,54 @@ TODO 零命中：`rolled_back` 0 处。
 底层缺陷是系统性的，A16 只是又用了一次；但 A16 把该规则作为「满足 D6 的即时告警」交付，
 这部分承诺不成立，属 A16 自己的。
 
-**两条候选解法（需先定）**：去掉 `billing_job.go:373` 的 `rows > 0` 守卫，让四个 state 序列从启动起即为 0；
-或为 unpriced 增一个存量 gauge，用 `> 0` 而非 `increase`。前者动生产代码，后者动指标形状——**未定，不擅自选**。
+**存量 gauge 方案被排除的理由**（规划期核实）：`unpriced` 是终态且永不清除——写入点只有
+`billing_job.go:270` 与 `console_held.go:322`，全仓无任何把 `unpriced` 迁出的语句，
+`usage_ledger` 也无保留期清理（`run.go` 的 `trimTicker` 是 stream 的），文档给的补救是钱包
+`adjustment` 而它不改 ledger 行状态。因此 `unpriced_rows > 0` 一旦点亮**永不熄灭**。
+这与 `control_billing_held_rows`（控制台托盘 `resolve` 能清回 0）不是一回事，不能照搬那个形状。
+
+**DoD（已全部满足）**
+
+- ✅ 去掉 `publishRowCounts` 里的 `rows > 0` 守卫，四个 state 一律发射（含 0）。
+- ✅ 新增 `BillingJob.PrimeMetrics()`，`run.go` 在构造 `billingJob` 后、首次 tick 前调用一次。
+  **光去掉守卫不够**：`RunOnce` 在 `priceCount == 0` 时早退、绕过 `publishSignals`
+  （`billing_job.go:96-103`），而「价表刚装好、某模型漏配价」正是第一次完成的 run 就带 unpriced 的场景，
+  那时序列仍会诞生即为 N。预置必须发生在进程启动，不是第一次 run。
+- ✅ 规则改为 `round(increase(...)) > 0`，消去 `increase()` 外推产生的小数条数；不改变触发条件。
+  `alertrules_test.go` 的 `referencedMetrics` 按命名空间前缀识别指标名，`round` 不受影响。
+- ✅ `threshold_source` 写明：可触发性依赖启动预置；重启导致 `$value` 夸大是无 `_created`
+  计数器的固有行为，不是误报。
+- ✅ 新增 `TestPrimeMetricsCreatesZeroSeriesForEveryBillingState`（`billing_job_test.go`，无需 DB）。
+  首条断言是**预置前 registry 里不得有该指标**——否则后面「四条都在且为 0」什么都没证明。
+  反向校验：把守卫改回去该测试 FAIL，还原后转绿。
+
+**有意不做**：进程重启后 `$value` 被夸大。文本 0.0.4 无 `_created`，在当前指标端点形状下无法解决，
+只作说明不作修复。
+
+**本条未能实证的部分**：`increase()` 在真实 Prometheus 上对「0→3 后平稳」序列返回 3。
+仓库没有 promtool/Prometheus 装置（`alertrules_test.go:14-17` 明确说这些测试是无 Docker 的替代品、
+不求值 PromQL）。交付保证止于「序列从 0 开始」这一前提条件。
+
+---
+
+### A22 `[no-cred]` 15 条 `increase(惰性 counter)` 规则共享同一漏报形状
+
+**状态：未开始（2026-09-21 做 A21 时确认）。P2，需逐条确认阈值语义后再动。**
+
+A21 的根因不是 `billing_job.go` 独有的：`internal/observability/metrics.go` 的 `Registry` 是
+进程内 map，**序列在首次 `AddCounter` 时才诞生**，输出 text 0.0.4 无 `_created`。任何
+「发射点带 `if x > 0` 守卫 + 规则用 `increase()`」的组合都会漏掉首次增量。
+
+`configs/alerts/gateway-platform.rules.yml` 里 `increase(...)` 共 15 处，A21 只修了 `:214` 一条，
+其余 14 条待查：`:57 :77 :106 :121 :161 :251 :338 :354 :376 :394 :412 :431 :451 :467`。
+
+**为什么不在 A21 里一起做**：涉及 control / stream / detail / console / platform 多个包的启动路径，
+且**阈值语义逐条不同**——`:121` 是 `> 10`、`:376` 是 `> 5`，漏掉首次增量对它们的影响与 `> 0` 的不同，
+不能机械套用同一个修法。其中 `:251`（`control_billing_unknown_usage_class_total`）就在 A21 改动点
+下方 4 行的同一函数里、带着一模一样的守卫，仍被刻意留在本条。
+
+**DoD**：逐条判定该规则是否真的依赖首次增量；对需要的指标，在各自进程启动时预置 0 序列
+（可复用 `BillingJob.PrimeMetrics` 的做法）；每条都要有一个「预置前不存在」的防空跑断言。
 
 ---
 
