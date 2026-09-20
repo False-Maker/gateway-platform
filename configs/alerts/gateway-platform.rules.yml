@@ -166,6 +166,29 @@ groups:
             uncalibrated。1% 是"任何一点计量缺口都值得追"的保守取值；
             clamp_min 防止零流量时除零。真实基线未知。
 
+      - alert: SnapshotAccountsDropped
+        expr: increase(control_snapshot_accounts_dropped_total[15m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+          scope: usage-trust
+        annotations:
+          summary: "{{ $value }} 个账号因未声明 usage_integrity 被排除出快照（provider={{ $labels.provider }}）"
+          description: >-
+            总览 §6.2 的 fail-closed 强制：provider 未声明 usage_integrity 的账号不会进入快照，
+            网关从此看不到它们。这是**静默的容量损失**——
+            `stampUsageIntegrity` 的注释说得很直接："一个未注册的 provider 悄悄清空一个桶，
+            看起来和『没配账号』一模一样"。在这条规则之前，唯一的可见性是一行日志。
+            处置：给该 provider 注册 usage_integrity 策略，或确认这些账号本就不该启用。
+          runbook: "docs/fluxgate-keyhive-overview.md §6.2；internal/control/snapshot_loop.go stampUsageIntegrity"
+          threshold_source: >-
+            取 >0 由 fail-closed 的语义推出：被丢弃的账号数可容忍为 0。
+            窗口 15m 对齐快照循环的 1 分钟周期。
+            A22 说明：这里用 `increase()` 是安全的，因为快照循环**每分钟重复发射**——
+            配置错误持续存在时序列会持续增长，第二个 tick 起 `increase` 即可见。
+            它不属于 A22 的"一次性事件"那一类，故不需要预置零序列；
+            `provider` 标签的取值恰恰是**未注册的** provider，本来也无法枚举。
+
       - alert: SyntheticTerminalStateSpike
         expr: increase(request_attempt_recovered_total{source="synthetic"}[15m]) > 0
         for: 0m
@@ -496,3 +519,24 @@ groups:
           threshold_source: >-
             取 >0 由 unpriced 的**语义**推出：它的定义就是"我们的定价配置有缺口"，
             可容忍存量为 0，与 held 桶同一口径；数值本身无待校准的余量。
+
+  - name: gateway-platform-quota
+    rules:
+      - alert: QuotaSnapshotNotDraining
+        expr: increase(quota_snapshot_reconcile_total{result="retry"}[30m]) > 0 or increase(quota_snapshot_reconcile_total{result="stale"}[30m]) > 0
+        for: 15m
+        labels:
+          severity: warning
+          scope: quota
+        annotations:
+          summary: "quota 快照对账没有正常排干（result={{ $labels.result }}，{{ $value }} 次）"
+          description: >-
+            `retry` 是一次对账失败后被排进重试，`stale` 是发布时发现 epoch 已被别人推进。
+            偶发各有正当原因，持续出现意味着 quota outbox 没在排干——
+            网关的选号读的是快照里的 quota，排不干就是在用**过期的余量**选账号。
+            这个族此前在规则文件里一次都没出现（第七次复盘 F3）。
+          runbook: "internal/control/quota_refresh.go QuotaReconciler"
+          threshold_source: >-
+            uncalibrated。`for: 15m` 是"偶发可容忍、持续不可容忍"的取值，对账周期为 1 分钟，
+            故 15m 意味着连续多轮未排干；真实基线未知，需上线后回看。
+            用 `or` 而非正则匹配器：本规则文件此前没有任何 `=~` 先例。

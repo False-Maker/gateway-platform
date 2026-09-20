@@ -106,7 +106,14 @@ func NewRouter(server *Server, auth *Authenticator) *gin.Engine {
 		// usage_ledger row is written. The decision is read off the snapshot
 		// the authenticator already had in memory -- no PostgreSQL, no control.
 		if authCtx.BillingBlocked {
-			observability.Default.AddCounter("gateway_billing_rejected_total", 1, "tenant", authCtx.TenantID)
+			// No tenant label: observability.Registry is a map that is never
+			// evicted, so a per-tenant label grows the series set and the
+			// /metrics payload for the life of the process and never shrinks.
+			// This was the only unbounded label in the repository (the rest are
+			// provider / platform / reason / state / source / path, all bounded
+			// sets). Which tenants are blocked is answered by
+			// control_billing_blocked_tenants and the console, not here.
+			observability.Default.AddCounter("gateway_billing_rejected_total", 1)
 			c.AbortWithStatusJSON(http.StatusPaymentRequired, gin.H{
 				"error": ErrBillingBlocked.Error(), "tenant": authCtx.TenantID,
 			})

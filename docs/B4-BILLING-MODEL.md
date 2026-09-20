@@ -151,7 +151,15 @@ wallet_transactions(
 
    同一 tenant 的多个 token 携带相同的值。值由 control 这个单写者一次性算出，不存在 token 之间不一致的可能。
 3. gateway 在鉴权时**已经**拿到了 `TokenRecord`（它就是 `AuthContext` 的来源，`internal/gateway/auth.go:19`）。`BillingBlocked=true` 时直接拒绝，**不产生任何额外的读**。
-4. 被拒请求返回 **HTTP 402 Payment Required**，错误文案标明 tenant（与 A10 的 429 限流文案同风格）。它**不打上游**，因此**不产生 Release 事件、不写 `usage_ledger`**，只计一个指标 `gateway_billing_rejected_total{tenant}`。
+4. 被拒请求返回 **HTTP 402 Payment Required**，错误文案标明 tenant（与 A10 的 429 限流文案同风格）。它**不打上游**，因此**不产生 Release 事件、不写 `usage_ledger`**，只计一个指标 `gateway_billing_rejected_total`。
+
+   > **修订（2026-09-21，第七次复盘 F4）**：该指标原定带 `tenant` 标签，现已去掉。
+   > `observability.Registry` 是一个**从不淘汰**的进程内 map，按租户打标签会让序列集与
+   > `/metrics` 响应在进程生命周期内只增不减；它是全仓唯一一个无界标签（其余是
+   > provider / platform / reason / state / source / path，都是有界集合）。
+   > **被拒请求的 402 响应文案仍然带 tenant，本条未变**；"哪些租户处于停用态"由
+   > `control_billing_blocked_tenants`（`BillingBlockedTenantsSpike`）与控制台回答。
+   > 改的是指标的标签维度，不是 402 的行为。
 5. 已经通过准入、正在进行中的请求**不受影响**，跑完为止。半途掐断一个流式响应既不会省下已经付出的上游成本，又会把一次已经发生的用量变成 `Partial`（污染 B4.3 的可信度口径）。
 
 ### 透支上界（必须写明，不得只说"一个快照周期"）

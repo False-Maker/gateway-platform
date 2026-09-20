@@ -112,14 +112,17 @@
 > - **A17 / A18 / A19**：均已完成，见下方条目。
 >
 > **本次最值得记住的**：A16 刚刚补完「指标没有消费方」的反向校验，**下一个提交就又犯了同一件事**。
-> 手写清单不是机制。本轮把它改成了按指标族自动校验（`TestMoneyMetricsHaveAConsumer`），
+> 手写清单不是机制。本轮把它改成了按指标族自动校验（A24 起已扩到全量指标，
+> 现名 `TestEveryEmittedMetricHasAConsumerOrARecordedReason`），
 > 并反向验证过：新增一个无人消费的 `control_billing_*` / `control_console_*` 指标即刻变红。
 > 同理，「绿的断言未必是活的断言」在本轮再次应验——F1 能存在，正是因为 A15 的测试**全部止于 400/503**，
 > 没有一条覆盖 err 分支。
 >
-> **下一步**：第六次复盘条目（A17–A21）已全部收口；**A22**（堆 1 五条已修、堆 2 八条判定可容忍）
-> 与 **A23**（StreamPendingStuck 空向量）亦已收口。**§A 当前没有未完成条目**，
+> **下一步**：第六次复盘条目（A17–A21）与 A22/A23 已全部收口；
+> 第七次复盘（A24，指标消费方反向校验）亦已收口。**§A 当前没有未完成条目**，
 > §C 全部 `[live-gate]`、§D 为部署边界。
+> 唯一已知的系统性空白：仓库没有 promtool/Prometheus 规则测试装置，
+> A21–A24 的保证都止于"序列形状正确"，"规则确实会响"始终未端到端验证。
 > §C 全部 `[live-gate]`，§D 为部署边界（D1 已完成）。
 > A12/E1/E2 不阻塞 B4，可并行取。P4（B4）在 A11 之前不进入编码——迁移来的用户还停在 staging，没有可扣费主体。
 
@@ -987,6 +990,68 @@ min_over_time(control_stream_pending[30m]) > 0 and increase(control_stream_recla
 
 ---
 
+### A24 `[no-cred]` 指标消费方反向校验只覆盖两个族，网关角色完全在外
+
+**状态：已完成（2026-09-21，第七次复盘）。** 证据见 `docs/EVIDENCE.md` 同名小节。
+
+第七次复盘只查一件事：**已发射但无人消费的指标**。理由是前三轮（A16、A21、A22/A23）
+连续在告警与指标的连接处出错。全仓 43 个已发射指标中，14 个未被任何规则引用。
+
+**F1（结构性）** `internal/observability/alertrules_test.go` 的 `moneyMetricPrefixes` 只含
+`control_billing_` 与 `control_console_`。而 **`gateway_` 在整个规则文件里出现 0 次**——
+网关角色发射 3 个指标，零规则、零豁免记录。A16 的教训是「手写清单不是机制」，
+于是改成按指标族自动校验；但**族的定义本身是手写的，而且漏了整个网关角色**。
+
+公平说明：三条 gateway 指标的*后果*都另有规则覆盖（`BillingBlockedTenantsSpike`、
+`UsageSourceMissingRatioHigh`、`PlatformTransportRejection`），所以当下不是告警盲区。
+风险在于下一个 gateway 侧 money 指标会像 A15 的 `adjustment_replayed_total` 一样静默，
+而没有任何东西会变红。
+
+**F2** `control_snapshot_accounts_dropped_total`（`snapshot_loop.go:332`）无人消费，
+且因为前缀是 `control_snapshot_` 而落在两个 money 族之外，连豁免记录都没有。
+总览 §6.2 的 fail-closed 强制会把未声明 `usage_integrity` 的账号踢出快照——
+**静默的容量损失**，此前唯一可见性是 `:330` 的一行日志。
+`stampUsageIntegrity` 的注释自己写着「一个未注册的 provider 悄悄清空一个桶，
+看起来和『没配账号』一模一样」。**这是本轮唯一没有替代覆盖的一条。**
+
+**F3** `quota_` 族在规则文件里一次都没出现。`quota_snapshot_reconcile_total`
+（`quota_refresh.go:490`）有 5 个 `result` 取值，其中 `retry` 与 `stale`
+意味着 quota outbox 没在排干，而网关选号读的正是快照里的 quota。
+
+**F4** `observability.Registry` 的 `samples` map **全文件无任何 `delete`**，
+而 `gateway_billing_rejected_total` 带 `tenant` 标签——每个被拒过一次的租户在进程生命周期内
+永久占一条序列。这是全仓唯一一个无界标签（其余是 provider / platform / reason / state /
+source / path，全是有界集合）。
+
+**改动**
+
+- ✅ `TestMoneyMetricsHaveAConsumer` → `TestEveryEmittedMetricHasAConsumerOrARecordedReason`：
+  取消族的概念，**43 个指标每一个都必须要么被规则引用、要么在 `knownUnconsumedMetrics`
+  里带一条理由**。空理由也报错——空理由等于没决定。
+  新增反向条目检查：白名单里列了一个已无人发射的指标同样报错，避免过期决策读起来像有效决策。
+- ✅ 新增规则 `SnapshotAccountsDropped`（F2，usage-trust 组，warning）。
+- ✅ 新增规则组 `gateway-platform-quota` 与规则 `QuotaSnapshotNotDraining`（F3，warning，`for: 15m`）。
+- ✅ 去掉 `gateway_billing_rejected_total` 的 `tenant` 标签（F4）。
+- ✅ 其余 9 条无人消费的指标逐条写入 `knownUnconsumedMetrics` 并附理由。
+
+**F4 改了一条已记录的设计决策**：`docs/B4-BILLING-MODEL.md:154` 原文明确指定
+`gateway_billing_rejected_total{tenant}`。已在该处留带日期的修订说明（而不是让文档与代码
+悄悄分叉），并写明 **402 响应文案仍然带 tenant，本条未变**——改的是指标的标签维度，
+不是 402 的行为。
+
+**两条新规则为什么不需要 A22 的预置**
+
+两者的发射方都是**周期性重复**的，不是一次性事件：快照循环每分钟重跑 `stampUsageIntegrity`，
+quota 对账每分钟一轮。配置错误持续存在时序列会持续增长，第二个 tick 起 `increase()` 即可见。
+`SnapshotAccountsDropped` 的 `provider` 标签取值恰恰是**未注册的** provider，本来也无法枚举。
+
+**本轮查过但不算缺口**：5 条 money 族无人消费的指标在 `knownUnconsumedMoneyMetrics` 里
+都有条目且写了理由，机制健全；核对了其中引用的 `control_billing_reconcile_last_success_seconds`
+确实存在（`billing_reconcile_loop.go:138`）且有 `BillingReconciliationNotRunning` 规则。
+`control_platform_error_total` 与三个 `detail_*` 计量指标后果均有规则覆盖，看板用途。
+
+---
+
 ## §B 功能扩展（不阻塞 §A，全部 `[no-cred]` 除非另注）
 
 - **B1** `[no-cred]` 非 OpenAI 入站到其他协议的跨协议 streaming。当前只有 OpenAI Chat 入站
@@ -1079,7 +1144,7 @@ min_over_time(control_stream_pending[30m]) > 0 and increase(control_stream_recla
     **不允许 gateway 在热路径同步查 PG 或调用 control**。
     结论摘要：`snapshot.TokenRecord` 增加 `BillingBlocked`，control 在 15s publish tick 上
     用 `LEFT JOIN tenant_wallets` 算出 `balance <= 0`（**无钱包行的租户永不被拦**）；
-    gateway 在鉴权中间件里返回 **402**，文案带 tenant，计 `gateway_billing_rejected_total{tenant}`，
+    gateway 在鉴权中间件里返回 **402**，文案带 tenant，计 `gateway_billing_rejected_total`（`tenant` 标签已于第七次复盘 F4 去掉，见 A24），
     因为拦在 handler 之前，所以结构性地**不打上游、不产生 Release 事件、不写 `usage_ledger`**。
     "未查 PG / 未调 control"由 import 闭包断言证明（覆盖所有代码路径，不止被测到的那些）。
     在途请求不杀；敞口上界 ≈ `峰值花费速率 × (快照周期 + 扣费周期 + 在途时长)`。

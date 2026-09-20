@@ -154,35 +154,53 @@ func TestEveryRuleDocumentsItsThreshold(t *testing.T) {
 	}
 }
 
-// moneyMetricPrefixes are the metric families where "emitted but nobody reads
-// it" is a real operational hole rather than a dashboard nicety: they describe
-// money moving and operators moving it.
-var moneyMetricPrefixes = []string{"control_billing_", "control_console_"}
-
-// knownUnconsumedMoneyMetrics are the money-family metrics that deliberately
-// have no alert rule, each with the reason. Adding a metric here is a decision;
-// the point of the test below is that it cannot happen by accident.
-var knownUnconsumedMoneyMetrics = map[string]string{
+// knownUnconsumedMetrics are the metrics that deliberately have no alert rule,
+// each with the reason it does not need one. Adding a metric here is a decision
+// that someone wrote down; the point of the test below is that the decision
+// cannot be skipped.
+//
+// A16 built this check for two metric families ("control_billing_", "control_console_")
+// on the theory that money metrics are where an unread metric is a real hole.
+// The seventh review found the family list was itself the weak point: the whole
+// gateway role emitted three metrics and the word "gateway_" appeared zero
+// times in the rules file, invisible to a check that only looked at control_.
+// So the scope is now every emitted metric -- there is no family to get wrong.
+var knownUnconsumedMetrics = map[string]string{
+	// 计费与控制台（A16 起的既有条目）
 	"control_billing_reconcile_runs_total":     "对账是否在跑由 control_billing_reconcile_last_success_seconds 告警（BillingReconciliationNotRunning），这个计数器是看板用量",
 	"control_billing_reconcile_unsettled_rows": "未结算行按状态分别告警（held / unpriced 两条规则），这是聚合值，看板用",
 	"control_console_held_resolved_total":      "裁定本身是正常运营动作；有收入后果的那一半由 ConsoleHeldUnpricedResolution 覆盖",
 	"control_console_price_total":              "录入单价是配置动作，只向未来生效且不可改价，无失败后果需要告警",
 	"control_console_throttled_total":          "B5.1 的控制台限流；被限流是设计内行为，是否值得告警**尚未决定**——记在此处而不是假装它有消费方",
+
+	// 网关角色（第七次复盘 F1 逼出的三条决定）
+	"gateway_billing_rejected_total":         "拒绝欠费租户是 B4.4 的设计内行为；值得告警的是\"有租户处于停用态\"，那个由 control_billing_blocked_tenants（BillingBlockedTenantsSpike）覆盖。本计数器此前带 tenant 标签，已在第七次复盘 F4 去掉——Registry 从不淘汰，无界标签会让序列集只增不减",
+	"gateway_usage_integrity_failover_total": "它的后果是把 Release 标成 ErrorUsageMissing，占比由 UsageSourceMissingRatioHigh 覆盖；这条是按 provider 归因的看板维度",
+	"gateway_egress_short_circuit_total":     "egress 拒绝的平台级后果由 PlatformTransportRejection 与 PlatformTransportRejectionBreadth 覆盖；这条是单账号短路的看板维度",
+
+	// 其余（第七次复盘逐条核对）
+	"control_platform_error_total": "平台错误的告警走判定结果 control_platform_alert 与 control_platform_transport_rejections_accounts，这条是按 provider/class 的归因维度",
+	"detail_buffer_depth":          "A12 明细缓冲深度；饱和由 DetailBufferSaturated 按丢弃计数告警，深度本身是看板量",
+	"detail_records_total":         "A12 明细写入量，看板量；写入失败由 DetailWriteFailing 覆盖",
+	"detail_written_total":         "同上，成功写入量",
 }
 
-// TestMoneyMetricsHaveAConsumer is the automatic half of the lesson A16 was
-// supposed to teach.
+// TestEveryEmittedMetricHasAConsumerOrARecordedReason is the automatic half of
+// the lesson A16 was supposed to teach.
 //
 // TestAlertRulesOnlyReferenceEmittedMetrics checks rules against metrics. It
 // cannot see the opposite hole -- a metric nobody reads -- and A16 closed one
-// instance of that hole by adding a hand-written entry to the table below.
+// instance of that hole by adding a hand-written entry to the table above.
 // A hand-written table has no automation, and the very next commit proved it:
 // A15 shipped control_console_adjustment_total and
 // control_console_adjustment_replayed_total with no consumer at all, and the
 // replayed counter was the only observable signal of a wallet correction being
-// silently dropped. This test makes the check structural for the metric
-// families where it matters, so the next one cannot slip through unnoticed.
-func TestMoneyMetricsHaveAConsumer(t *testing.T) {
+// silently dropped.
+//
+// A16 made the check structural but scoped it to two families, which left the
+// gateway role entirely outside it. The scope is now every emitted metric: a
+// new metric must either be read by a rule or carry a written reason.
+func TestEveryEmittedMetricHasAConsumerOrARecordedReason(t *testing.T) {
 	rules := loadRules(t)
 	referenced := make(map[string]struct{})
 	for _, group := range rules.Groups {
@@ -192,29 +210,30 @@ func TestMoneyMetricsHaveAConsumer(t *testing.T) {
 			}
 		}
 	}
-	for metric := range emittedMetrics(t) {
-		inFamily := false
-		for _, prefix := range moneyMetricPrefixes {
-			if strings.HasPrefix(metric, prefix) {
-				inFamily = true
-				break
-			}
-		}
-		if !inFamily {
-			continue
-		}
+	emitted := emittedMetrics(t)
+	for metric := range emitted {
 		if _, ok := referenced[metric]; ok {
-			if reason, listed := knownUnconsumedMoneyMetrics[metric]; listed {
-				t.Errorf("%s now has an alert rule, so remove it from knownUnconsumedMoneyMetrics (listed reason: %s)",
+			if reason, listed := knownUnconsumedMetrics[metric]; listed {
+				t.Errorf("%s now has an alert rule, so remove it from knownUnconsumedMetrics (listed reason: %s)",
 					metric, reason)
 			}
 			continue
 		}
-		if _, ok := knownUnconsumedMoneyMetrics[metric]; ok {
+		if reason, ok := knownUnconsumedMetrics[metric]; ok {
+			if strings.TrimSpace(reason) == "" {
+				t.Errorf("%s is listed in knownUnconsumedMetrics with an empty reason, which is the same as not deciding", metric)
+			}
 			continue
 		}
-		t.Errorf("%s is emitted but no alert rule reads it. Either add a rule, or add it to knownUnconsumedMoneyMetrics with the reason it does not need one.",
+		t.Errorf("%s is emitted but no alert rule reads it. Either add a rule, or add it to knownUnconsumedMetrics with the reason it does not need one.",
 			metric)
+	}
+	// The table must not outlive the metrics it excuses: an entry for a metric
+	// nobody emits any more is a stale decision that reads as a live one.
+	for metric := range knownUnconsumedMetrics {
+		if _, ok := emitted[metric]; !ok {
+			t.Errorf("knownUnconsumedMetrics lists %q, which no code emits any more: remove the entry", metric)
+		}
 	}
 }
 

@@ -7,6 +7,82 @@
 > 阅读规则：本文的每一条都是**对已发生事实的描述**。不要从本文推断"项目是否可以继续开发"——
 > 那个问题由 `docs/TODO.md` 和 `AGENTS.md` §0 回答。
 
+## A24 指标消费方反向校验只覆盖两个族（2026-09-21，第七次复盘）
+
+**本轮范围**：只查「已发射但无人消费的指标」。理由是前三轮（A16、A21、A22/A23）连续在
+告警与指标的连接处出错。未重读已复盘过的设计文档，未碰 §C/§D。
+
+**核对方法**：按 `alertrules_test.go` 的 `emittedMetrics` 同款正则扫 `internal/ cmd/ pkg/`
+的非测试源码得到 43 个已发射指标，与规则文件里所有 `expr` 的指标引用求差集，得 14 条无人消费。
+逐条读发射点判定，不按名字猜。
+
+**F1（结构性）**：`moneyMetricPrefixes` 只含 `control_billing_` 与 `control_console_`，
+而 `gateway_` 在整个规则文件里出现 **0 次**。网关角色的三个指标
+（`gateway_billing_rejected_total` `run.go:109`、`gateway_usage_integrity_failover_total`
+`server.go:1343`、`gateway_egress_short_circuit_total` `server.go:1801`）零规则、零豁免。
+A16 的教训是"手写清单不是机制"，于是改成按族自动校验——**但族的定义本身是手写的，漏了整个网关角色**。
+
+公平说明：三者的后果都另有规则覆盖（`BillingBlockedTenantsSpike` `:280`、
+`UsageSourceMissingRatioHigh` `:151`、`PlatformTransportRejection` `:27`/`:43`），
+当下不是告警盲区。风险是下一个 gateway 侧 money 指标会像 A15 的
+`adjustment_replayed_total` 一样静默，而没有任何东西会变红。
+
+**F2**：`control_snapshot_accounts_dropped_total`（`snapshot_loop.go:332`）无人消费，
+前缀 `control_snapshot_` 落在两个 money 族之外，连豁免记录都没有。总览 §6.2 的 fail-closed
+强制把未声明 `usage_integrity` 的账号踢出快照——静默的容量损失，此前唯一可见性是一行日志。
+**本轮唯一没有替代覆盖的一条。**
+
+**F3**：`quota_` 族零规则。`quota_snapshot_reconcile_total`（`quota_refresh.go:490`）
+5 个 result 取值中 `retry` / `stale` 意味着 outbox 没在排干，而网关选号读的正是快照里的 quota。
+
+**F4**：`observability.Registry` 的 `samples` map 全文件无任何 `delete`，
+而 `gateway_billing_rejected_total` 带 `tenant` 标签——全仓唯一的无界标签。
+
+**改动**
+
+- `internal/observability/alertrules_test.go`：`TestMoneyMetricsHaveAConsumer` →
+  `TestEveryEmittedMetricHasAConsumerOrARecordedReason`。取消族的概念，43 个指标每一个都必须
+  要么被规则引用、要么在 `knownUnconsumedMetrics` 里带理由；**空理由也报错**（空理由等于没决定）。
+  新增反向条目检查：白名单列了已无人发射的指标同样报错——过期决策读起来像有效决策。
+- `configs/alerts/gateway-platform.rules.yml`：新增 `SnapshotAccountsDropped`（usage-trust 组）
+  与新组 `gateway-platform-quota` 下的 `QuotaSnapshotNotDraining`。
+- `internal/gateway/run.go`：去掉 `gateway_billing_rejected_total` 的 `tenant` 标签。
+- 其余 9 条无人消费的指标逐条写入 `knownUnconsumedMetrics` 并附理由。
+
+**两条新规则为什么不用 A22 的预置**：发射方都是周期性重复的（快照循环与 quota 对账各 1 分钟一轮），
+不是一次性事件，配置错误持续存在时序列持续增长，第二个 tick 起 `increase()` 即可见。
+`SnapshotAccountsDropped` 的 `provider` 标签取值恰恰是**未注册的** provider，本来也无法枚举。
+理由已写进两条规则各自的 `threshold_source`。
+
+**F4 改了一条已记录的设计决策**：`docs/B4-BILLING-MODEL.md:154` 原文明确指定
+`gateway_billing_rejected_total{tenant}`。已在该处留带日期的修订说明，而不是让文档与代码悄悄分叉。
+**402 响应文案仍然带 tenant，该行为未变**——改的是指标的标签维度。
+`docs/TODO.md` 与本文的历史条目加了前向指针，历史陈述本身未改写。
+
+**本轮执行并通过**
+
+```
+gofmt -l internal/  → 无输出
+go build ./...      → build OK
+go vet ./internal/... → vet OK
+go test ./...       → 24 个包全部 ok（真实 PG/Redis/ClickHouse）
+```
+
+**反向校验（双向都验了）**
+- 在 `run.go` 加一个 `gateway_brand_new_unwatched_total` 发射点 →
+  `TestEveryEmittedMetricHasAConsumerOrARecordedReason` FAIL 并指名该指标。
+- 在 `knownUnconsumedMetrics` 里加一条 `control_metric_that_no_longer_exists` →
+  同一测试 FAIL 并要求移除该条目。
+- 两者还原后转绿。
+
+**本轮查过但不算缺口**：5 条 money 族无人消费的指标在白名单里都有条目且写了理由，机制健全；
+核对了其中引用的 `control_billing_reconcile_last_success_seconds` 确实存在
+（`billing_reconcile_loop.go:138`）且有 `BillingReconciliationNotRunning` 规则（`:331`）。
+`control_platform_error_total` 与三个 `detail_*` 计量指标后果均有规则覆盖，属看板维度。
+
+**免责边界**：与 A21–A23 同——仓库没有 promtool/Prometheus 装置，两条新规则的 PromQL
+未做实证求值。本轮保证的是"每个指标都有消费方或有书面理由"这一结构性质。
+
 ## A23 StreamPendingStuck 在「完全停摆」时必然沉默（2026-09-21）
 
 **缺陷**：`configs/alerts/gateway-platform.rules.yml:106`
@@ -326,7 +402,8 @@ balance before=510.000000000000  after=510.000000000000   (requested -500)
 - 规则文件新增三条（F3）：`ConsoleWalletAdjustment`（warning，对标 topup 的 info——
   调整双向且是唯一能人工扣钱的入口）、`ConsoleWalletIdReuse`、`ConsoleWalletReplay`。
   规则总数 23 → 26。
-- `alertrules_test.go` 新增 `TestMoneyMetricsHaveAConsumer`：对
+- `alertrules_test.go` 新增 `TestMoneyMetricsHaveAConsumer`（A24 已扩到全量指标并改名为
+  `TestEveryEmittedMetricHasAConsumerOrARecordedReason`，见本文 A24 小节）：对
   `control_billing_*` / `control_console_*` 两个指标族**自动**校验"必须有消费方"，
   例外须显式登记并写明理由（当前 5 条，含一条诚实标注"是否告警尚未决定"）。
 
@@ -1711,6 +1788,7 @@ set -a; source configs/test-infra/test.env; set +a; go test -count=1 -p 1 ./...
 - `internal/gateway/auth.go` / `run.go`：`AuthContext` 增加 `BillingBlocked`，
   `NewRouter` 的鉴权中间件在 `AuthenticateRequest` 成功之后、其余一切之前返回
   **402 Payment Required**，错误文案带 tenant，并计 `gateway_billing_rejected_total{tenant}`。
+  （`tenant` 标签已于 2026-09-21 第七次复盘 F4 去掉，理由见本文 A24 小节；402 行为未变。）
   放在中间件里是结构性保证，不是约定：被拦的请求根本到不了 handler，
   因此**不打上游、不产生 Release 事件、不写 `usage_ledger`**。
   402 与 401 严格分开：凭据是好的，钱不在。
